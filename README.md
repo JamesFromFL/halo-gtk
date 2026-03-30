@@ -39,7 +39,7 @@ yay -S libayatana-appindicator
 
 ### Python dependencies (managed by uv)
 
-- [`ring-doorbell[listen]`](https://github.com/tchellomello/python-ring-doorbell) ≥ 0.8
+- [`ring-doorbell`](https://github.com/tchellomello/python-ring-doorbell) ≥ 0.8
 
 ## Installation
 
@@ -48,21 +48,23 @@ yay -S libayatana-appindicator
 git clone https://github.com/JamesFromFL/ring-gtk
 cd ring-gtk
 
-# Expose system-installed PyGObject to the uv virtualenv
-uv sync --system-site-packages
+# Create venv with access to system-installed PyGObject, then install deps
+uv venv --system-site-packages
+uv sync
 
 # Run
 uv run ring-gtk
 ```
 
-> `--system-site-packages` is required so the virtualenv can find
-> `gi` (PyGObject) and the GObject introspection libraries installed
-> via pacman. Without it, `import gi` will fail at runtime.
+> `uv venv --system-site-packages` is required so the virtualenv can find
+> `gi` (PyGObject) and the GObject introspection libraries installed via
+> pacman. `--system-site-packages` is a venv creation flag, not a sync flag.
 
 ## Development
 
 ```bash
-uv sync --system-site-packages --dev
+uv venv --system-site-packages
+uv sync
 uv run ruff check src tests
 uv run pytest
 ```

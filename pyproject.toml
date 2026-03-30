@@ -8,8 +8,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     # Pure-Python packages — managed by uv
-    # Ring API — >=0.8 ships the websocket listener for real-time events
-    "ring-doorbell[listen]>=0.8",
+    # Ring API — websocket listener is built-in since 0.8
+    "ring-doorbell>=0.8",
     # HTTP session used by ring-doorbell
     "requests>=2.32",
 ]
@@ -19,7 +19,8 @@ dependencies = [
 # Systray (optional): yay -S libayatana-appindicator
 #
 # These are GObject introspection libraries that must come from pacman.
-# Pass --system-site-packages to uv sync so the venv can find `gi`.
+# Create the venv with system site-packages so `gi` is visible:
+#   uv venv --system-site-packages && uv sync
 # ---------------------------------------------------------------------------
 
 [project.scripts]
@@ -36,8 +37,8 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/ring_gtk"]
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "ruff>=0.9",
     "pytest>=8",
     "pytest-asyncio>=0.24",
