@@ -13,7 +13,7 @@ Native GTK4 + libadwaita Linux desktop client for [Ring](https://ring.com) home 
 - [x] Project scaffold — GTK4 + libadwaita, system tray, .desktop file, GNOME light/dark theme support
 - [x] App icon — full hicolor set (256×256 down to 32×32), displayed in README
 - [x] Ring API authentication — email, password, 2FA, token cache, device list, FCM real-time event listener
-- [x] Camera snapshot thumbnails — loads on startup, auto-refreshes on FCM motion/ding event, click to expand full size
+- [x] Camera snapshot thumbnails — loads on startup, auto-refreshes on FCM motion/ding event
 - [ ] Live camera feed playback via WebRTC
 - [ ] Two-way audio through camera speakers from PC
 - [ ] Event history timeline with recorded clip playback
