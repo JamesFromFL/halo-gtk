@@ -1,4 +1,4 @@
 """ring-gtk — Native GTK4 + libadwaita desktop client for Ring home security."""
 
-APP_ID      = "io.github.JamesFromFL.RingGtk"
+APP_ID = "io.github.JamesFromFL.RingGtk"
 APP_VERSION = "0.1.0"

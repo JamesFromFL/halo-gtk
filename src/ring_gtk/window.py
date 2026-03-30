@@ -134,9 +134,7 @@ class RingWindow(Adw.ApplicationWindow):
 
         if not devices:
             self._status_page.set_title("No devices found")
-            self._status_page.set_description(
-                "No Ring devices are linked to your account."
-            )
+            self._status_page.set_description("No Ring devices are linked to your account.")
             return GLib.SOURCE_REMOVE
 
         for device in devices:

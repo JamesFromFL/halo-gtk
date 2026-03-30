@@ -79,7 +79,6 @@ class SystemTray:
             except (ValueError, AttributeError, ImportError):
                 continue
         _log.warning(
-            "Neither AyatanaAppIndicator3 nor AppIndicator3 found; "
-            "systray icon will not be shown."
+            "Neither AyatanaAppIndicator3 nor AppIndicator3 found; systray icon will not be shown."
         )
         return None

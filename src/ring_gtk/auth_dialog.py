@@ -163,8 +163,8 @@ class AuthDialog(Adw.Dialog):
 
     def _set_loading(self, loading: bool) -> None:
         self._sign_in_btn.set_sensitive(not loading)
-        self._sign_in_btn.set_label("Signing in…" if loading else (
-            "Verify" if self._otp_group.get_visible() else "Sign In"
-        ))
+        self._sign_in_btn.set_label(
+            "Signing in…" if loading else ("Verify" if self._otp_group.get_visible() else "Sign In")
+        )
         self._email_row.set_sensitive(not loading)
         self._password_row.set_sensitive(not loading)

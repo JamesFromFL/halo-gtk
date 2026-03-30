@@ -1,7 +1,6 @@
 """Tests for config load/save round-trip."""
 
 
-
 def test_load_defaults(tmp_path, monkeypatch):
     monkeypatch.setattr("ring_gtk.config.CONFIG_FILE", tmp_path / "config.json")
     from ring_gtk import config

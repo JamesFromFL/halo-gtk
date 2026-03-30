@@ -63,6 +63,7 @@ _APP_USER_AGENT = "android:com.ringapp"
 # Module-level helpers
 # ---------------------------------------------------------------------------
 
+
 def get_client() -> RingClient | None:
     """Return the active RingClient, or None if not yet initialised."""
     return _client
@@ -116,6 +117,7 @@ def init_client_from_cache() -> RingClient | None:
 # Client
 # ---------------------------------------------------------------------------
 
+
 class RingClient:
     """Thin synchronous wrapper around the async ring-doorbell Ring object."""
 
@@ -160,9 +162,7 @@ class RingClient:
     # Authentication
     # ------------------------------------------------------------------
 
-    def authenticate(
-        self, username: str, password: str, otp_code: str | None = None
-    ) -> None:
+    def authenticate(self, username: str, password: str, otp_code: str | None = None) -> None:
         """Authenticate with Ring.
 
         Raises ``Requires2FAError`` if 2FA is required; call again with the
@@ -174,9 +174,7 @@ class RingClient:
         """Restore session from cached token.  Raises if cache is missing/invalid."""
         self._run(self._async_authenticate_from_cache())
 
-    async def _async_authenticate(
-        self, username: str, password: str, otp_code: str | None
-    ) -> None:
+    async def _async_authenticate(self, username: str, password: str, otp_code: str | None) -> None:
         from ring_doorbell import Auth, Ring
 
         # Always do a fresh OAuth exchange — never shortcut via the cache on an
@@ -190,7 +188,8 @@ class RingClient:
         self._ring = Ring(auth)
         _log.debug(
             "OAuth token obtained — hardware_id=%s user_agent=%s",
-            auth.get_hardware_id(), _APP_USER_AGENT,
+            auth.get_hardware_id(),
+            _APP_USER_AGENT,
         )
         await self._ring.async_update_data()
         _log.info(
@@ -252,9 +251,7 @@ class RingClient:
 
         if self._loop and not self._loop.is_closed():
             try:
-                asyncio.run_coroutine_threadsafe(
-                    self._async_close(), self._loop
-                ).result(timeout=5)
+                asyncio.run_coroutine_threadsafe(self._async_close(), self._loop).result(timeout=5)
             except Exception as exc:
                 _log.debug("Error during async close: %s", exc)
             self._loop.call_soon_threadsafe(self._loop.stop)
@@ -309,6 +306,7 @@ class RingClient:
 # ---------------------------------------------------------------------------
 # Token persistence (module-level so they can be passed as plain callbacks)
 # ---------------------------------------------------------------------------
+
 
 def _load_token() -> dict | None:
     if TOKEN_CACHE_PATH.exists():
