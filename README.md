@@ -8,21 +8,19 @@ Native GTK4 + libadwaita Linux desktop client for [Ring](https://ring.com) home 
 
 > **Status:** Early development — authentication and device listing work; camera feeds and arm/disarm controls are planned.
 
-## Features
+## Roadmap
 
-- Sign in with your Ring account (email + password + 2FA)
-- View all Ring devices (doorbells, cameras, chimes, base stations)
-- Real-time doorbell and motion notifications via desktop libnotify
-- System tray icon (AyatanaAppIndicator3)
-- Persistent token cache — only sign in once
-- Follows GNOME HIG; adapts to light/dark system theme
-
-## Planned
-
-- [ ] Live camera feeds (GStreamer / WebRTC)
+- [x] Project scaffold — GTK4 + libadwaita, system tray, .desktop file, GNOME light/dark theme support
+- [x] App icon — full hicolor set (256×256 down to 32×32), displayed in README
+- [x] Ring API authentication — email, password, 2FA, token cache, device list, FCM real-time event listener
+- [x] Camera snapshot thumbnails — loads on startup, auto-refreshes on FCM motion/ding event, click to expand full size
+- [ ] Live camera feed playback via WebRTC
+- [ ] Two-way audio through camera speakers from PC
+- [ ] Event history timeline with recorded clip playback
+- [ ] Snapshot feature of Live/Recorded feed to local storage
+- [ ] Desktop notifications — wire FCM events to libnotify
+- [ ] Ring Alarm sensor status panel — contact sensors, motion sensors
 - [ ] Arm / disarm Ring Alarm
-- [ ] Event history timeline
-- [ ] Flatpak packaging
 
 ## Requirements
 
@@ -32,13 +30,7 @@ PyGObject and the GTK/GNOME introspection libraries must be installed from
 pacman — they cannot be installed via pip.
 
 ```bash
-sudo pacman -S python-gobject gtk4 libadwaita libnotify
-```
-
-The systray icon requires `libayatana-appindicator`, which is in the AUR:
-
-```bash
-yay -S libayatana-appindicator
+sudo pacman -S python-gobject gtk4 libadwaita libnotify libayatana-appindicator
 ```
 
 ### Python dependencies (managed by uv)

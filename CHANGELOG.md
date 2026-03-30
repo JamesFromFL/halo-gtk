@@ -6,16 +6,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-03-29
+## [0.1.0] - 2026-03-30
 
 ### Added
-- Initial project scaffold: GTK4 + libadwaita application shell
-- `RingClient` — authentication, token caching, device enumeration
-- Real-time event listener via `ring-doorbell[listen]` websocket
-- `AuthDialog` — email/password + OTP two-factor flow
-- `SystemTray` — AyatanaAppIndicator3 / AppIndicator3 systray icon
-- Desktop notifications via libnotify (`gi.repository.Notify`)
-- `.desktop` file and GSettings schema for `io.github.JamesFromFL.RingGtk`
-- JSON config fallback (`~/.config/ring-gtk/config.json`)
-- uv package management; ruff linting; pytest test suite
-- GitHub Actions CI (lint + test)
+- Project scaffold — GTK4 + libadwaita application shell, system tray (AyatanaAppIndicator3), `.desktop` file, GNOME light/dark theme support, uv package management, ruff linting, pytest, GitHub Actions CI
+- App icon — full hicolor set at 256×256, 128×128, 64×64, 48×48, and 32×32
+- Ring API authentication — email/password login, 2FA/OTP dialog, token caching to `~/.local/share/ring-gtk/token.cache`, session restore on startup, device list populated after sign-in, FCM real-time event listener via firebase-messaging
+- Camera snapshot thumbnails — 80×45 thumbnails loaded on startup via `async_get_snapshot()`; auto-refresh on FCM ding/motion event (no polling); click row to expand full size in an `Adw.Dialog`
