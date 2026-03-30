@@ -1,5 +1,9 @@
 # ring-gtk
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/JamesFromFL/ring-gtk/main/data/icons/hicolor/256x256/apps/io.github.JamesFromFL.RingGtk.png" width="256" alt="ring-gtk icon"/>
+</p>
+
 Native GTK4 + libadwaita Linux desktop client for [Ring](https://ring.com) home security.
 
 > **Status:** Early development — authentication and device listing work; camera feeds and arm/disarm controls are planned.

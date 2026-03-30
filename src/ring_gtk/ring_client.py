@@ -9,7 +9,13 @@ A single asyncio event loop runs in a persistent daemon thread.  All
 ring-doorbell coroutines are submitted to that loop via
 ``asyncio.run_coroutine_threadsafe`` and awaited synchronously from the
 calling thread.  The FCM event listener also runs as a long-lived async
-task on the same loop so it shares the aiohttp ClientSession.
+task on the same loop.
+
+ring-doorbell manages its own aiohttp ClientSession internally (created
+lazily in Auth._session on first use).  We do not inject a custom session —
+doing so caused 406 Not Acceptable on /clients_api/session because the
+default Accept header we were adding conflicted with Ring's CDN/load balancer
+behaviour on that endpoint.
 
 Usage
 -----
@@ -46,6 +52,12 @@ _client: RingClient | None = None
 # XDG data home — matches the path documented in README / pyproject comment.
 TOKEN_CACHE_PATH = Path.home() / ".local" / "share" / "ring-gtk" / "token.cache"
 
+# Ring validates device_model in the session POST body, which ring-doorbell
+# constructs as "ring-doorbell:<user_agent>".  Ring's backend only accepts
+# Android-style identifiers here — any custom UA produces an unrecognised
+# device_model that Ring rejects with 406.
+_APP_USER_AGENT = "android:com.ringapp"
+
 
 # ---------------------------------------------------------------------------
 # Module-level helpers
@@ -68,7 +80,12 @@ def init_client(
     Raises ``ring_doorbell.AuthenticationError`` on bad credentials.
     """
     global _client
-    client = RingClient()
+    # Reuse the existing client's event loop on OTP retries; create fresh otherwise.
+    if _client is None:
+        client = RingClient()
+    else:
+        client = _client
+        client._ring = None  # reset auth state, keep loop alive
     client.authenticate(username, password, otp_code)
     _client = client
     return _client
@@ -90,7 +107,7 @@ def init_client_from_cache() -> RingClient | None:
         return _client
     except Exception as exc:
         _log.warning("Cache restore failed (%s) — will require fresh login", exc)
-        # Remove stale / invalid cache so next login starts clean.
+        # Remove stale / invalid cache so the next sign-in starts clean.
         TOKEN_CACHE_PATH.unlink(missing_ok=True)
         return None
 
@@ -106,7 +123,7 @@ class RingClient:
         self._ring = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
-        self._listener_task: asyncio.Task | None = None
+        self._listener_future = None  # concurrent.futures.Future from run_coroutine_threadsafe
         self._stop_event = threading.Event()
 
     # ------------------------------------------------------------------
@@ -147,9 +164,8 @@ class RingClient:
     ) -> None:
         """Authenticate with Ring.
 
-        If a valid token cache exists it is used directly (no password
-        needed).  Pass *otp_code* only when responding to a
-        ``Requires2FAError`` raised by a previous call.
+        Raises ``Requires2FAError`` if 2FA is required; call again with the
+        OTP to complete.  Raises ``AuthenticationError`` on bad credentials.
         """
         self._run(self._async_authenticate(username, password, otp_code))
 
@@ -161,16 +177,20 @@ class RingClient:
         self, username: str, password: str, otp_code: str | None
     ) -> None:
         from ring_doorbell import Auth, Ring
-        from ring_doorbell.const import USER_AGENT
 
-        cached_token = _load_token()
-        auth = Auth(USER_AGENT, cached_token, _save_token)
+        # Always do a fresh OAuth exchange — never shortcut via the cache on an
+        # explicit sign-in.  Pass None for the token so ring-doorbell doesn't
+        # try to reuse a stale cached credential.
+        auth = Auth(_APP_USER_AGENT, None, _save_token)
 
-        if not cached_token:
-            # May raise Requires2FAError or AuthenticationError — let them propagate.
-            await auth.async_fetch_token(username, password, otp_code)
+        # May raise Requires2FAError or AuthenticationError — let propagate.
+        await auth.async_fetch_token(username, password, otp_code)
 
         self._ring = Ring(auth)
+        _log.debug(
+            "OAuth token obtained — hardware_id=%s user_agent=%s",
+            auth.get_hardware_id(), _APP_USER_AGENT,
+        )
         await self._ring.async_update_data()
         _log.info(
             "Ring authenticated — %d device(s) found",
@@ -178,15 +198,21 @@ class RingClient:
         )
 
     async def _async_authenticate_from_cache(self) -> None:
-        from ring_doorbell import Auth, Ring
-        from ring_doorbell.const import USER_AGENT
+        from ring_doorbell import Auth, AuthenticationError, Ring
 
         token = _load_token()
         if not token:
             raise RuntimeError("No cached token found")
-        auth = Auth(USER_AGENT, token, _save_token)
+
+        auth = Auth(_APP_USER_AGENT, token, _save_token)
         self._ring = Ring(auth)
-        await self._ring.async_update_data()
+
+        try:
+            await self._ring.async_update_data()
+        except AuthenticationError:
+            # Cached token expired and refresh failed — bubble up so
+            # init_client_from_cache() can delete the stale file.
+            raise
 
     # ------------------------------------------------------------------
     # Properties
@@ -211,19 +237,31 @@ class RingClient:
         if self._ring is None:
             return
         self._stop_event.clear()
-        loop = self._ensure_loop()
-        self._listener_task = asyncio.run_coroutine_threadsafe(
-            self._async_listen(), loop
+        self._listener_future = asyncio.run_coroutine_threadsafe(
+            self._async_listen(), self._ensure_loop()
         )
         _log.debug("FCM listener task submitted")
 
     def stop(self) -> None:
-        """Stop the listener and shut down the background loop."""
+        """Stop the listener, close the ring auth session, shut down the loop."""
         self._stop_event.set()
-        if self._listener_task and not self._listener_task.done():
-            self._listener_task.cancel()
+
+        if self._listener_future and not self._listener_future.done():
+            self._listener_future.cancel()
+
         if self._loop and not self._loop.is_closed():
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._async_close(), self._loop
+                ).result(timeout=5)
+            except Exception as exc:
+                _log.debug("Error during async close: %s", exc)
             self._loop.call_soon_threadsafe(self._loop.stop)
+
+    async def _async_close(self) -> None:
+        """Close the ring auth session (which owns the aiohttp ClientSession)."""
+        if self._ring is not None:
+            await self._ring.auth.async_close()
 
     async def _async_listen(self) -> None:
         from ring_doorbell import RingEventListener
