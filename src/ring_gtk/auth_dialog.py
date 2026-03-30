@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import gi
 
 gi.require_version("Adw", "1")
@@ -13,6 +15,8 @@ from gi.repository import Adw, GLib, Gtk  # noqa: E402
 class AuthDialog(Adw.Dialog):
     def __init__(self) -> None:
         super().__init__(title="Sign in to Ring", content_width=360)
+        self._email: str = ""
+        self._password: str = ""
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -47,7 +51,7 @@ class AuthDialog(Adw.Dialog):
         self._password_row = Adw.PasswordEntryRow(title="Password")
         creds_group.add(self._password_row)
 
-        # OTP group (revealed after first auth attempt if needed)
+        # OTP group — hidden until Ring asks for it
         self._otp_group = Adw.PreferencesGroup(
             title="Two-Factor Authentication",
             description="Enter the code sent to your email or phone.",
@@ -59,13 +63,14 @@ class AuthDialog(Adw.Dialog):
         self._otp_row.set_input_purpose(Gtk.InputPurpose.DIGITS)
         self._otp_group.add(self._otp_row)
 
-        # Status label (errors)
-        self._status_label = Gtk.Label(
+        # Error banner
+        self._error_label = Gtk.Label(
             visible=False,
             wrap=True,
+            halign=Gtk.Align.START,
             css_classes=["error"],
         )
-        box.append(self._status_label)
+        box.append(self._error_label)
 
         # Sign-in button
         self._sign_in_btn = Gtk.Button(
@@ -75,6 +80,10 @@ class AuthDialog(Adw.Dialog):
         )
         self._sign_in_btn.connect("clicked", self._on_sign_in_clicked)
         box.append(self._sign_in_btn)
+
+        # Allow Enter key to submit from any entry row
+        for row in (self._email_row, self._password_row, self._otp_row):
+            row.connect("entry-activated", lambda *_: self._sign_in_btn.emit("clicked"))
 
     # ------------------------------------------------------------------
     # Auth flow
@@ -88,13 +97,14 @@ class AuthDialog(Adw.Dialog):
             self._show_error("Email and password are required.")
             return
 
-        self._sign_in_btn.set_sensitive(False)
-        self._sign_in_btn.set_label("Signing in…")
-        self._status_label.set_visible(False)
+        # Snapshot credentials so the OTP retry reuses them.
+        self._email = email
+        self._password = password
 
         otp_code = self._otp_row.get_text().strip() or None
 
-        import threading
+        self._set_loading(True)
+        self._error_label.set_visible(False)
 
         threading.Thread(
             target=self._authenticate,
@@ -102,37 +112,51 @@ class AuthDialog(Adw.Dialog):
             daemon=True,
         ).start()
 
-    def _authenticate(self, email: str, password: str, otp: str | None) -> None:
+    def _authenticate(self, email: str, password: str, otp_code: str | None) -> None:
         try:
+            from ring_doorbell import Requires2FAError
+
             from ring_gtk.ring_client import init_client
 
-            otp_cb = (lambda: otp) if otp else None
-            client = init_client(email, password, otp_cb)
+            client = init_client(email, password, otp_code)
             client.start()
             GLib.idle_add(self._on_auth_success)
+
         except Exception as exc:
-            msg = str(exc)
-            if "two factor" in msg.lower() or "otp" in msg.lower() or "mfa" in msg.lower():
+            from ring_doorbell import Requires2FAError
+
+            if isinstance(exc, Requires2FAError):
                 GLib.idle_add(self._show_otp_prompt)
             else:
-                GLib.idle_add(self._show_error, msg)
+                GLib.idle_add(self._show_error, str(exc))
 
     def _on_auth_success(self) -> bool:
         self.close()
-        # Trigger a window refresh
-        from ring_gtk.ring_client import get_client  # noqa: F401
-
+        # Refresh the main window device list.
+        app = Gtk.Application.get_default()
+        if app is not None:
+            win = app.get_active_window()
+            if hasattr(win, "refresh"):
+                win.refresh()
         return GLib.SOURCE_REMOVE
 
     def _show_otp_prompt(self) -> bool:
         self._otp_group.set_visible(True)
+        self._otp_row.grab_focus()
         self._sign_in_btn.set_label("Verify")
-        self._sign_in_btn.set_sensitive(True)
+        self._set_loading(False)
         return GLib.SOURCE_REMOVE
 
     def _show_error(self, message: str) -> bool:
-        self._status_label.set_text(message)
-        self._status_label.set_visible(True)
-        self._sign_in_btn.set_label("Sign In")
-        self._sign_in_btn.set_sensitive(True)
+        self._error_label.set_text(message)
+        self._error_label.set_visible(True)
+        self._set_loading(False)
         return GLib.SOURCE_REMOVE
+
+    def _set_loading(self, loading: bool) -> None:
+        self._sign_in_btn.set_sensitive(not loading)
+        self._sign_in_btn.set_label("Signing in…" if loading else (
+            "Verify" if self._otp_group.get_visible() else "Sign In"
+        ))
+        self._email_row.set_sensitive(not loading)
+        self._password_row.set_sensitive(not loading)

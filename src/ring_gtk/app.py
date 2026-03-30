@@ -42,8 +42,18 @@ class RingApplication(Adw.Application):
     def do_activate(self) -> None:
         win = self.get_active_window()
         if win is None:
+            # Try to restore a prior session before creating the window so
+            # the device list populates immediately without a sign-in prompt.
+            self._try_restore_session()
             win = RingWindow(application=self)
         win.present()
+
+    def _try_restore_session(self) -> None:
+        from ring_gtk.ring_client import init_client_from_cache
+
+        client = init_client_from_cache()
+        if client is not None:
+            client.start()
 
     def do_shutdown(self) -> None:
         from ring_gtk.ring_client import get_client  # avoid circular at top

@@ -1,8 +1,5 @@
 """Tests for config load/save round-trip."""
 
-import json
-import pytest
-from pathlib import Path
 
 
 def test_load_defaults(tmp_path, monkeypatch):
