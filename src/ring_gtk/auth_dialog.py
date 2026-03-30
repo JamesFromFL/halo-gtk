@@ -123,10 +123,18 @@ class AuthDialog(Adw.Dialog):
             GLib.idle_add(self._on_auth_success)
 
         except Exception as exc:
+            from aiohttp import ClientConnectorError
             from ring_doorbell import Requires2FAError
 
             if isinstance(exc, Requires2FAError):
                 GLib.idle_add(self._show_otp_prompt)
+            elif isinstance(exc, ClientConnectorError) or "Cannot connect to host" in str(exc):
+                GLib.idle_add(
+                    self._show_error,
+                    "Cannot reach Ring servers. Check that your VPN or firewall is"
+                    " allowing connections to oauth.ring.com, api.ring.com, and"
+                    " mtalk.google.com — or temporarily disable it to sign in.",
+                )
             else:
                 GLib.idle_add(self._show_error, str(exc))
 

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import threading
+
 import gi
 
 gi.require_version("Adw", "1")
@@ -10,6 +13,8 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
 from ring_gtk.ring_client import get_client  # noqa: E402
+
+_log = logging.getLogger(__name__)
 
 # Map ring-doorbell device family names to symbolic icon names.
 _FAMILY_ICON: dict[str, str] = {
@@ -21,6 +26,13 @@ _FAMILY_ICON: dict[str, str] = {
     "other": "security-high-symbolic",
 }
 
+# Device families that support async_get_snapshot().
+_SNAPSHOT_FAMILIES = frozenset({"doorbots", "authorized_doorbots", "stickup_cams"})
+
+# Thumbnail dimensions (16:9) shown in the device list row.
+_THUMB_W = 80
+_THUMB_H = 45
+
 
 class RingWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs) -> None:
@@ -30,6 +42,8 @@ class RingWindow(Adw.ApplicationWindow):
             default_height=640,
             **kwargs,
         )
+        # device_id → (device_obj, Gtk.Picture | None)
+        self._device_rows: dict[int, tuple] = {}
         self._build_ui()
         self.refresh()
 
@@ -57,9 +71,6 @@ class RingWindow(Adw.ApplicationWindow):
         self._banner = Adw.Banner(title="Not signed in to Ring", button_label="Sign In")
         self._banner.connect("button-clicked", self._on_sign_in)
         toolbar_view.add_top_bar(self._banner)
-
-        # Spinner shown while fetching devices
-        self._spinner = Adw.Spinner(visible=False)
 
         # Main scroll area
         scroll = Gtk.ScrolledWindow(vexpand=True)
@@ -107,15 +118,11 @@ class RingWindow(Adw.ApplicationWindow):
         self._status_page.set_description("")
         self._clear_list()
 
-        # Fetch devices on a background thread; update UI on main loop.
-        import threading
-
         threading.Thread(target=self._fetch_and_populate, daemon=True).start()
 
     def _fetch_and_populate(self) -> None:
         client = get_client()
         try:
-            # update_data is async; run it via the client's background loop.
             client._run(client._ring.async_update_data())
             devices = client.all_devices
             GLib.idle_add(self._populate_devices, devices)
@@ -136,16 +143,149 @@ class RingWindow(Adw.ApplicationWindow):
             family = getattr(device, "family", "other") or "other"
             icon = _FAMILY_ICON.get(family, "security-high-symbolic")
             kind = getattr(device, "kind", "") or ""
-            row = Adw.ActionRow(
-                title=device.name,
-                subtitle=kind,
-                icon_name=icon,
-            )
+            has_snapshot = family in _SNAPSHOT_FAMILIES
+
+            row = Adw.ActionRow(title=device.name, subtitle=kind)
+
+            if has_snapshot:
+                picture = self._make_thumbnail()
+                row.add_prefix(picture)
+                row.set_activatable(True)
+                device_id = device.id
+                row.connect(
+                    "activated",
+                    lambda _r, did=device_id: self._on_row_activated(did),
+                )
+                self._device_rows[device.id] = (device, picture)
+                threading.Thread(
+                    target=self._load_snapshot,
+                    args=(device,),
+                    daemon=True,
+                ).start()
+            else:
+                row.set_icon_name(icon)
+                self._device_rows[device.id] = (device, None)
+
             self._list_box.append(row)
 
         self._status_page.set_title("No devices")
         self._status_page.set_description("No Ring devices are linked to your account.")
+
+        # Register for FCM events so snapshots refresh on ding/motion.
+        client = get_client()
+        if client is not None:
+            client.add_event_callback(self._on_ring_event)
+
         return GLib.SOURCE_REMOVE
+
+    def _make_thumbnail(self) -> Gtk.Picture:
+        return Gtk.Picture(
+            width_request=_THUMB_W,
+            height_request=_THUMB_H,
+            content_fit=Gtk.ContentFit.COVER,
+            can_shrink=True,
+            margin_top=6,
+            margin_bottom=6,
+            margin_end=6,
+        )
+
+    # ------------------------------------------------------------------
+    # Snapshot loading
+    # ------------------------------------------------------------------
+
+    def _load_snapshot(self, device) -> None:
+        """Fetch snapshot bytes in a background thread, marshal result to GTK thread."""
+        client = get_client()
+        if client is None:
+            return
+        try:
+            png_bytes = client._run(device.async_get_snapshot())
+            if png_bytes:
+                GLib.idle_add(self._set_snapshot, device.id, bytes(png_bytes))
+            else:
+                _log.debug("No snapshot returned for %s", device.name)
+        except Exception as exc:
+            _log.debug("Snapshot fetch failed for %s: %s", device.name, exc)
+
+    def _set_snapshot(self, device_id: int, png_bytes: bytes) -> bool:
+        """Decode PNG bytes and paint the thumbnail (GTK main thread)."""
+        entry = self._device_rows.get(device_id)
+        if entry is None:
+            return GLib.SOURCE_REMOVE
+        _, picture = entry
+        if picture is None:
+            return GLib.SOURCE_REMOVE
+        try:
+            from gi.repository import Gdk, GdkPixbuf
+
+            loader = GdkPixbuf.PixbufLoader()
+            loader.write(png_bytes)
+            loader.close()
+            pixbuf = loader.get_pixbuf()
+            if pixbuf is not None:
+                picture.set_paintable(Gdk.Texture.new_for_pixbuf(pixbuf))
+        except Exception as exc:
+            _log.debug("Failed to set snapshot texture for device %s: %s", device_id, exc)
+        return GLib.SOURCE_REMOVE
+
+    # ------------------------------------------------------------------
+    # FCM event → snapshot refresh (no polling)
+    # ------------------------------------------------------------------
+
+    def _on_ring_event(self, event) -> None:
+        """Called on the GTK main thread when an FCM ding/motion event arrives."""
+        kind = getattr(event, "kind", None)
+        if kind not in ("ding", "motion"):
+            return
+        device_id = getattr(event, "doorbot_id", None)
+        if device_id is None:
+            return
+        entry = self._device_rows.get(device_id)
+        if entry is None or entry[1] is None:
+            return
+        device, _ = entry
+        _log.debug("Refreshing snapshot for %s after %s event", device.name, kind)
+        threading.Thread(
+            target=self._load_snapshot,
+            args=(device,),
+            daemon=True,
+        ).start()
+
+    # ------------------------------------------------------------------
+    # Row click → full-size snapshot dialog
+    # ------------------------------------------------------------------
+
+    def _on_row_activated(self, device_id: int) -> None:
+        entry = self._device_rows.get(device_id)
+        if entry is None:
+            return
+        device, picture = entry
+        if picture is None:
+            return
+        paintable = picture.get_paintable()
+        if paintable is None:
+            return  # snapshot not yet loaded
+        self._show_snapshot_dialog(device.name, paintable)
+
+    def _show_snapshot_dialog(self, title: str, paintable) -> None:
+        dialog = Adw.Dialog(title=title, content_width=720, content_height=440)
+        toolbar_view = Adw.ToolbarView()
+        dialog.set_child(toolbar_view)
+        toolbar_view.add_top_bar(Adw.HeaderBar())
+        full_picture = Gtk.Picture(
+            paintable=paintable,
+            content_fit=Gtk.ContentFit.CONTAIN,
+            margin_top=12,
+            margin_bottom=12,
+            margin_start=12,
+            margin_end=12,
+        )
+        toolbar_view.set_content(full_picture)
+        dialog.present(self)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _show_fetch_error(self, message: str) -> bool:
         self._status_page.set_title("Failed to load devices")
@@ -153,6 +293,7 @@ class RingWindow(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def _clear_list(self) -> None:
+        self._device_rows.clear()
         while (child := self._list_box.get_first_child()) is not None:
             self._list_box.remove(child)
 

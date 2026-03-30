@@ -125,6 +125,7 @@ class RingClient:
         self._loop_thread: threading.Thread | None = None
         self._listener_future = None  # concurrent.futures.Future from run_coroutine_threadsafe
         self._stop_event = threading.Event()
+        self._event_callbacks: list = []
 
     # ------------------------------------------------------------------
     # Async event loop management
@@ -284,6 +285,11 @@ class RingClient:
             await listener.stop()
             _log.info("FCM event listener stopped")
 
+    def add_event_callback(self, callback) -> None:
+        """Register a callable to be invoked (on the GTK main thread) for every FCM event."""
+        if callback not in self._event_callbacks:
+            self._event_callbacks.append(callback)
+
     def _on_ring_event(self, event) -> None:
         """Called from the asyncio thread; marshal to GTK main loop."""
         GLib.idle_add(self._dispatch_event, event)
@@ -292,6 +298,11 @@ class RingClient:
         from ring_gtk.notifications import send_ring_notification
 
         send_ring_notification(event)
+        for cb in self._event_callbacks:
+            try:
+                cb(event)
+            except Exception as exc:
+                _log.debug("Event callback error: %s", exc)
         return GLib.SOURCE_REMOVE
 
 
