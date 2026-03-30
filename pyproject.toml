@@ -7,11 +7,20 @@ license = { text = "GPL-3.0-or-later" }
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    # Pure-Python packages — managed by uv
     # Ring API — >=0.8 ships the websocket listener for real-time events
     "ring-doorbell[listen]>=0.8",
     # HTTP session used by ring-doorbell
     "requests>=2.32",
 ]
+# ---------------------------------------------------------------------------
+# Required system packages (Arch Linux) — NOT managed by uv
+# Install with: sudo pacman -S python-gobject gtk4 libadwaita libnotify
+# Systray (optional): yay -S libayatana-appindicator
+#
+# These are GObject introspection libraries that must come from pacman.
+# Pass --system-site-packages to uv sync so the venv can find `gi`.
+# ---------------------------------------------------------------------------
 
 [project.scripts]
 ring-gtk = "ring_gtk.__main__:main"
