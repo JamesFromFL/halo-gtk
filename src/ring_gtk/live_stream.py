@@ -46,41 +46,76 @@ _log = logging.getLogger(__name__)
 
 
 def _patch_aiortc_h264() -> None:
-    """Monkey-patch aiortc for H264 compatibility with Ring cameras.
+    """Monkey-patch aiortc for H264 and RTP receiver compatibility with Ring cameras.
 
-    Two patches are applied:
+    Three patches are applied at module import time so they take effect before
+    any RTCPeerConnection or H264Decoder is created.
 
-    1. SDP offer: add packetization-mode=0 H264 codec variants alongside the
-       default mode=1 entries.  aiortc only advertises mode=1 by default;
-       Ring cameras (e.g. stickup_cam_mini_v3) may answer with mode=0 (or
-       omit packetization-mode, which RFC 6184 defines as mode=0).
-       is_codec_compatible() requires an exact mode match, so without mode=0
-       in the offer, setRemoteDescription() raises OperationError and no video
-       track is established for those cameras.
+    Patch 1 — JitterBuffer capacity (128 → 512)
+        The stickup_cam_mini_v3 sends each IDR keyframe as 159 RTP packets:
+        1 SPS + 1 PPS + 157 FU-A fragments at 1172 bytes each (~184 KB total).
+        aiortc's video JitterBuffer has capacity=128.  When packet #128 arrives
+        (still part of the IDR), delta >= capacity triggers smart_remove(1),
+        which removes packets until the timestamp changes — but SPS, PPS, and
+        all 157 IDR fragments share the same RTP timestamp, so smart_remove
+        wipes the ENTIRE keyframe.  The decoder never receives SPS+PPS+IDR and
+        every subsequent P-frame fails with AVERROR_INVALIDDATA.  Capacity 512
+        (power-of-2 requirement) comfortably fits the largest Ring IDR.
 
-    2. H264Decoder: set AV_CODEC_FLAG_OUTPUT_CORRUPT (0x8) on the av.CodecContext
-       before the first decode.  Ring cameras occasionally produce IDR frames
-       (keyframes) that fail avcodec_send_packet() with AVERROR_INVALIDDATA.
-       With this flag, FFmpeg outputs the partially-decoded frame with error
-       concealment rather than silently dropping it, so the stream recovers
-       immediately instead of staying blank until the next keyframe (~2 s).
-       The codec opens lazily on the first decode() call, so the flag is
-       applied in time.
+    Patch 2 — SDP offer H264 codec variants
+        Two additions to the CODECS["video"] list:
+        a. packetization-mode=0 Baseline variants: aiortc only offers mode=1;
+           cameras that answer with mode=0 cause is_codec_compatible() to return
+           False, raising OperationError in setRemoteDescription().
+        b. High Profile Level 5.0 (profile-level-id=640032): the stickup_cam_mini_v3
+           streams High Profile H264 (profile_idc=100, confirmed from SPS bytes
+           0x67 0x64 0x00 0x32 in the RTP stream) but Ring's SDP answers with
+           Baseline (42001f) because our offer only lists Baseline.  Adding
+           640032 lets Ring negotiate the correct profile so the SPS in the
+           bitstream matches what was negotiated, eliminating the profile
+           mismatch that causes decode errors after the buffer fix.
+
+    Patch 3 — H264Decoder AV_CODEC_FLAG_OUTPUT_CORRUPT (0x8)
+        Instructs FFmpeg to output error-concealed frames rather than silently
+        dropping them, helping the stream stay visible through transient errors.
     """
     try:
         from aiortc.codecs import CODECS
         from aiortc.codecs.h264 import H264Decoder
+        from aiortc.jitterbuffer import JitterBuffer
         from aiortc.rtcrtpparameters import RTCRtcpFeedback, RTCRtpCodecParameters
+        from aiortc.rtcrtpreceiver import RTCRtpReceiver
 
-        # --- Patch 1: add packetization-mode=0 H264 codecs to the SDP offer ---
-        existing_modes = {
-            c.parameters.get("packetization-mode")
+        # --- Patch 1: increase video JitterBuffer capacity 128 → 512 ---
+        _orig_receiver_init = RTCRtpReceiver.__init__
+
+        def _patched_receiver_init(self, kind: str, transport) -> None:
+            _orig_receiver_init(self, kind, transport)
+            if kind == "video":
+                # Replace the 128-slot buffer created by __init__ with a 512-slot
+                # one.  Name mangling: __jitter_buffer → _RTCRtpReceiver__jitter_buffer.
+                self._RTCRtpReceiver__jitter_buffer = JitterBuffer(capacity=512, is_video=True)
+
+        RTCRtpReceiver.__init__ = _patched_receiver_init
+        _log.debug("Patched RTCRtpReceiver video JitterBuffer capacity: 128 → 512")
+
+        # --- Patch 2: add H264 codec variants to the SDP offer ---
+        existing_h264 = {
+            (c.parameters.get("packetization-mode"), c.parameters.get("profile-level-id"))
             for c in CODECS["video"]
             if c.mimeType.lower() == "video/h264"
         }
-        if "0" not in existing_modes:
-            base_pt = max((c.payloadType for c in CODECS["video"]), default=102) + 1
-            for profile_level_id in ("42001f", "42e01f"):
+        base_pt = max((c.payloadType for c in CODECS["video"]), default=102) + 1
+        additions = [
+            # packetization-mode=0 Baseline (cameras that negotiate mode=0)
+            ("0", "42001f"),
+            ("0", "42e01f"),
+            # High Profile Level 5.0, both modes (stickup_cam_mini_v3 bitstream)
+            ("1", "640032"),
+            ("0", "640032"),
+        ]
+        for mode, profile in additions:
+            if (mode, profile) not in existing_h264:
                 CODECS["video"].append(
                     RTCRtpCodecParameters(
                         mimeType="video/H264",
@@ -93,32 +128,30 @@ def _patch_aiortc_h264() -> None:
                         ],
                         parameters={
                             "level-asymmetry-allowed": "1",
-                            "packetization-mode": "0",
-                            "profile-level-id": profile_level_id,
+                            "packetization-mode": mode,
+                            "profile-level-id": profile,
                         },
                     )
                 )
                 base_pt += 1
-            _log.debug("Added packetization-mode=0 H264 codecs to SDP offer")
+        _log.debug("Added H264 SDP variants (mode=0 Baseline, High Profile 640032)")
 
-        # --- Patch 2: set AV_CODEC_FLAG_OUTPUT_CORRUPT on the H264Decoder ---
-        _orig_init = H264Decoder.__init__
+        # --- Patch 3: set AV_CODEC_FLAG_OUTPUT_CORRUPT on the H264Decoder ---
+        _orig_h264_init = H264Decoder.__init__
 
         def _permissive_init(self) -> None:
-            _orig_init(self)
-            # AV_CODEC_FLAG_OUTPUT_CORRUPT (1 << 3 = 0x8): instruct FFmpeg to
-            # output frames even when avcodec_send_packet() reports
-            # AVERROR_INVALIDDATA.  Ring cameras produce AVERROR_INVALIDDATA
-            # at every IDR (keyframe) boundary (~2 s interval); with this flag
-            # FFmpeg applies error concealment and outputs the best available
-            # frame rather than dropping it, allowing P-frames that follow to
-            # use it as a reference and keeping the stream visible.
+            _orig_h264_init(self)
+            # AV_CODEC_FLAG_OUTPUT_CORRUPT (1 << 3): output frames even when
+            # avcodec_send_packet() reports AVERROR_INVALIDDATA, using FFmpeg's
+            # error concealment to keep the stream visible through transient errors.
             self.codec.flags |= 0x8  # AV_CODEC_FLAG_OUTPUT_CORRUPT
 
         H264Decoder.__init__ = _permissive_init
         _log.debug("Applied H264 decoder patch (AV_CODEC_FLAG_OUTPUT_CORRUPT)")
+
+        _log.debug("aiortc H264/RTP patches applied")
     except Exception as exc:
-        _log.debug("Could not apply H264 compatibility patches: %s", exc)
+        _log.debug("Could not apply aiortc compatibility patches: %s", exc)
 
 
 _patch_aiortc_h264()
