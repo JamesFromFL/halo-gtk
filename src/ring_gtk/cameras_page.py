@@ -1,4 +1,4 @@
-"""Cameras page — FlowBox grid of camera cards + embedded live stream view."""
+"""Cameras page — single-column list of camera cards + embedded live stream view."""
 
 from __future__ import annotations
 
@@ -21,10 +21,6 @@ _log = logging.getLogger(__name__)
 
 # Families that support snapshot capture.
 _SNAPSHOT_FAMILIES = frozenset({"doorbots", "authorized_doorbots", "stickup_cams"})
-
-# Card thumbnail dimensions (16:9).
-_THUMB_W = 240
-_THUMB_H = 135
 
 
 # ---------------------------------------------------------------------------
@@ -84,59 +80,61 @@ def _apply_motion_off_overlay(png_bytes: bytes) -> bytes:
 # ---------------------------------------------------------------------------
 
 
-class CameraCard(Gtk.FlowBoxChild):
-    """A single camera card shown in the grid."""
+class CameraCard(Gtk.Box):
+    """A single camera card shown in the single-column list."""
 
-    def __init__(self, device) -> None:
-        super().__init__()
-        self.device = device
-        self.set_focusable(True)
-
-        frame = Gtk.Frame(css_classes=["card"])
-        self.set_child(frame)
-
-        box = Gtk.Box(
+    def __init__(self, device, on_activated) -> None:
+        super().__init__(
             orientation=Gtk.Orientation.VERTICAL,
-            spacing=0,
+            hexpand=True,
+            margin_top=8,
+            margin_bottom=8,
+            margin_start=16,
+            margin_end=16,
         )
+        self.device = device
+        self._on_activated = on_activated
+
+        frame = Gtk.Frame(css_classes=["card"], hexpand=True)
+        self.append(frame)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         frame.set_child(box)
 
-        # Thumbnail picture.
+        # Thumbnail — native aspect ratio, no fixed height.
         self._picture = Gtk.Picture(
-            width_request=_THUMB_W,
-            height_request=_THUMB_H,
-            content_fit=Gtk.ContentFit.COVER,
+            hexpand=True,
+            content_fit=Gtk.ContentFit.CONTAIN,
             can_shrink=True,
         )
         box.append(self._picture)
 
-        # Name + subtitle row.
-        label_box = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL,
-            spacing=2,
+        # Camera name, centered.
+        name_label = Gtk.Label(
+            label=device.name,
+            halign=Gtk.Align.CENTER,
+            ellipsize=3,  # PANGO_ELLIPSIZE_END
+            css_classes=["heading"],
             margin_top=8,
             margin_bottom=8,
             margin_start=10,
             margin_end=10,
         )
-        box.append(label_box)
+        box.append(name_label)
 
-        name_label = Gtk.Label(
-            label=device.name,
-            halign=Gtk.Align.START,
-            ellipsize=3,  # PANGO_ELLIPSIZE_END
-            css_classes=["heading"],
-        )
-        label_box.append(name_label)
+        # Click gesture to activate.
+        gesture = Gtk.GestureClick()
+        gesture.connect("released", self._on_click)
+        frame.add_controller(gesture)
 
-        kind = getattr(device, "kind", "") or ""
-        sub_label = Gtk.Label(
-            label=kind,
-            halign=Gtk.Align.START,
-            ellipsize=3,
-            css_classes=["dim-label", "caption"],
-        )
-        label_box.append(sub_label)
+        # Hover state via EventControllerMotion.
+        motion = Gtk.EventControllerMotion()
+        motion.connect("enter", lambda *_: frame.add_css_class("activatable"))
+        motion.connect("leave", lambda *_: frame.remove_css_class("activatable"))
+        frame.add_controller(motion)
+
+    def _on_click(self, gesture, n_press, x, y) -> None:
+        self._on_activated(self)
 
     def set_snapshot(self, png_bytes: bytes) -> None:
         """Update the thumbnail from raw PNG bytes (GTK main thread)."""
@@ -264,7 +262,7 @@ class _LivePanel(Gtk.Box):
 
 
 class CamerasPage(Gtk.Box):
-    """Two-state cameras panel: FlowBox grid ↔ embedded live stream."""
+    """Two-state cameras panel: single-column list ↔ embedded live stream."""
 
     def __init__(self, on_navigate_to_history=None) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, hexpand=True, vexpand=True)
@@ -297,7 +295,7 @@ class CamerasPage(Gtk.Box):
         )
         self._stack.add_named(grid_box, "grid")
 
-        # Status / placeholder when grid is empty.
+        # Status / placeholder when list is empty.
         self._status_page = Adw.StatusPage(
             icon_name="camera-video-symbolic",
             title="No cameras",
@@ -311,20 +309,13 @@ class CamerasPage(Gtk.Box):
         grid_box.append(scroll)
         self._scroll = scroll
 
-        self._flow_box = Gtk.FlowBox(
-            column_spacing=12,
-            row_spacing=12,
-            margin_top=16,
-            margin_bottom=16,
-            margin_start=16,
-            margin_end=16,
-            homogeneous=True,
-            max_children_per_line=6,
-            min_children_per_line=1,
-            selection_mode=Gtk.SelectionMode.NONE,
+        self._list_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=0,
+            margin_top=8,
+            margin_bottom=8,
         )
-        self._flow_box.connect("child-activated", self._on_card_activated)
-        scroll.set_child(self._flow_box)
+        scroll.set_child(self._list_box)
 
         # --- Live page ---
         self._live_panel = _LivePanel(
@@ -338,7 +329,7 @@ class CamerasPage(Gtk.Box):
     # ------------------------------------------------------------------
 
     def refresh(self) -> None:
-        """Re-fetch device list and repopulate the grid."""
+        """Re-fetch device list and repopulate the list."""
         client = get_client()
         if client is None or not client.is_authenticated:
             self._status_page.set_title("No cameras")
@@ -351,7 +342,7 @@ class CamerasPage(Gtk.Box):
         self._status_page.set_description("")
         self._status_page.set_visible(True)
         self._scroll.set_visible(False)
-        self._clear_grid()
+        self._clear_list()
         self._show_grid()
 
         threading.Thread(target=self._fetch_and_populate, daemon=True).start()
@@ -374,7 +365,7 @@ class CamerasPage(Gtk.Box):
             GLib.idle_add(self._show_fetch_error, str(exc))
 
     def _populate_devices(self, devices: list) -> bool:
-        self._clear_grid()
+        self._clear_list()
 
         if not devices:
             self._status_page.set_title("No cameras found")
@@ -387,8 +378,8 @@ class CamerasPage(Gtk.Box):
         self._scroll.set_visible(True)
 
         for device in devices:
-            card = CameraCard(device)
-            self._flow_box.append(card)
+            card = CameraCard(device, on_activated=self._on_card_activated)
+            self._list_box.append(card)
             self._cards[device.id] = card
 
             threading.Thread(
@@ -472,10 +463,8 @@ class CamerasPage(Gtk.Box):
     # Card activation → live stream
     # ------------------------------------------------------------------
 
-    def _on_card_activated(self, flow_box: Gtk.FlowBox, child: Gtk.FlowBoxChild) -> None:
-        if not isinstance(child, CameraCard):
-            return
-        self._show_live(child.device)
+    def _on_card_activated(self, card: CameraCard) -> None:
+        self._show_live(card.device)
 
     def _show_live(self, device) -> None:
         self._live_panel.start_for_device(device)
@@ -527,8 +516,8 @@ class CamerasPage(Gtk.Box):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _clear_grid(self) -> None:
+    def _clear_list(self) -> None:
         self._cancel_all_refresh_timers()
         self._cards.clear()
-        while (child := self._flow_box.get_first_child()) is not None:
-            self._flow_box.remove(child)
+        while (child := self._list_box.get_first_child()) is not None:
+            self._list_box.remove(child)
