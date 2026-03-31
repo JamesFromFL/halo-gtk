@@ -12,6 +12,7 @@ dependencies = [
     "ring-doorbell>=0.8",
     # HTTP session used by ring-doorbell
     "requests>=2.32",
+    "aiortc>=1.14.0",
 ]
 # ---------------------------------------------------------------------------
 # Required system packages (Arch Linux) — NOT managed by uv

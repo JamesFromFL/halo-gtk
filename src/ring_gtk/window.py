@@ -250,36 +250,20 @@ class RingWindow(Adw.ApplicationWindow):
         ).start()
 
     # ------------------------------------------------------------------
-    # Row click → full-size snapshot dialog
+    # Row click → live stream dialog
     # ------------------------------------------------------------------
 
     def _on_row_activated(self, device_id: int) -> None:
         entry = self._device_rows.get(device_id)
         if entry is None:
             return
-        device, picture = entry
-        if picture is None:
-            return
-        paintable = picture.get_paintable()
-        if paintable is None:
-            return  # snapshot not yet loaded
-        self._show_snapshot_dialog(device.name, paintable)
+        device, _ = entry
+        self._open_live_stream(device)
 
-    def _show_snapshot_dialog(self, title: str, paintable) -> None:
-        dialog = Adw.Dialog(title=title, content_width=720, content_height=440)
-        toolbar_view = Adw.ToolbarView()
-        dialog.set_child(toolbar_view)
-        toolbar_view.add_top_bar(Adw.HeaderBar())
-        full_picture = Gtk.Picture(
-            paintable=paintable,
-            content_fit=Gtk.ContentFit.CONTAIN,
-            margin_top=12,
-            margin_bottom=12,
-            margin_start=12,
-            margin_end=12,
-        )
-        toolbar_view.set_content(full_picture)
-        dialog.present(self)
+    def _open_live_stream(self, device) -> None:
+        from ring_gtk.live_stream import LiveStreamDialog
+
+        LiveStreamDialog(device).present(self)
 
     # ------------------------------------------------------------------
     # Helpers

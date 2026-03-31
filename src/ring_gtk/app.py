@@ -29,6 +29,14 @@ class RingApplication(Adw.Application):
 
     def do_startup(self) -> None:
         Adw.Application.do_startup(self)
+        # Initialise GStreamer for live camera feed playback.
+        try:
+            gi.require_version("Gst", "1.0")
+            from gi.repository import Gst
+
+            Gst.init(None)
+        except (ValueError, ImportError):
+            pass  # GStreamer not available — live stream will fail gracefully
         # Initialise libnotify so notifications are available before a
         # window is shown (e.g. when running in background/systray mode).
         try:
