@@ -1,4 +1,4 @@
-"""Cameras page — single-column list of camera cards + embedded live stream view."""
+"""Cameras page — responsive FlowBox camera grid with size modes and drag-to-reorder."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Adw, Gdk, GdkPixbuf, GLib, Gtk  # noqa: E402
 
+from ring_gtk import config as _cfg  # noqa: E402
 from ring_gtk.ring_client import get_client  # noqa: E402
 
 _log = logging.getLogger(__name__)
@@ -22,9 +23,23 @@ _log = logging.getLogger(__name__)
 # Families that support snapshot capture.
 _SNAPSHOT_FAMILIES = frozenset({"doorbots", "authorized_doorbots", "stickup_cams"})
 
+# Default tile dimensions (16:9) before any snapshot is loaded.
+_DEFAULT_NATIVE_W = 1280
+_DEFAULT_NATIVE_H = 720
+
+# Size mode: name → (fraction of native width, min tiles per row)
+_SIZE_MODES: dict[str, tuple[float, int]] = {
+    "small": (0.25, 4),
+    "medium": (0.50, 2),
+    "large": (1.00, 1),
+}
+
+# Module-level drag state — safe for same-process DnD.
+_dnd_src_id: int | None = None
+
 
 # ---------------------------------------------------------------------------
-# Snapshot helpers (same logic as the old window.py)
+# Snapshot helpers
 # ---------------------------------------------------------------------------
 
 
@@ -44,7 +59,7 @@ def _make_grey_placeholder() -> bytes:
     try:
         from PIL import Image
 
-        img = Image.new("RGB", (240, 135), color=(48, 48, 48))
+        img = Image.new("RGB", (_DEFAULT_NATIVE_W, _DEFAULT_NATIVE_H), color=(48, 48, 48))
         out = io.BytesIO()
         img.save(out, format="PNG")
         return out.getvalue()
@@ -76,65 +91,85 @@ def _apply_motion_off_overlay(png_bytes: bytes) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Camera card widget
+# Camera tile widget
 # ---------------------------------------------------------------------------
 
 
-class CameraCard(Gtk.Box):
-    """A single camera card shown in the single-column list."""
+class CameraTile(Gtk.FlowBoxChild):
+    """A single camera tile in the FlowBox grid."""
 
-    def __init__(self, device, on_activated) -> None:
-        super().__init__(
-            orientation=Gtk.Orientation.VERTICAL,
-            hexpand=True,
-            margin_top=8,
-            margin_bottom=8,
-            margin_start=16,
-            margin_end=16,
-        )
+    def __init__(self, device, on_reorder) -> None:
+        super().__init__()
         self.device = device
-        self._on_activated = on_activated
+        self._on_reorder = on_reorder
+        self._native_w = _DEFAULT_NATIVE_W
+        self._native_h = _DEFAULT_NATIVE_H
+        self._current_mode = "medium"
+        self.set_focusable(True)
 
-        frame = Gtk.Frame(css_classes=["card"], hexpand=True)
-        self.append(frame)
+        # Card frame.
+        self._frame = Gtk.Frame(css_classes=["card"])
+        self.set_child(self._frame)
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        frame.set_child(box)
+        # Inner box — 5px padding on all sides.
+        box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=5,
+            margin_top=5,
+            margin_bottom=5,
+            margin_start=5,
+            margin_end=5,
+        )
+        self._frame.set_child(box)
 
-        # Thumbnail — native aspect ratio, no fixed height.
+        # Snapshot picture at native aspect ratio.
         self._picture = Gtk.Picture(
-            hexpand=True,
             content_fit=Gtk.ContentFit.CONTAIN,
             can_shrink=True,
+            hexpand=True,
         )
         box.append(self._picture)
 
-        # Camera name, centered.
-        name_label = Gtk.Label(
+        # Camera name label, centered.
+        self._name_label = Gtk.Label(
             label=device.name,
             halign=Gtk.Align.CENTER,
             ellipsize=3,  # PANGO_ELLIPSIZE_END
             css_classes=["heading"],
-            margin_top=8,
-            margin_bottom=8,
-            margin_start=10,
-            margin_end=10,
         )
-        box.append(name_label)
+        box.append(self._name_label)
 
-        # Click gesture to activate.
-        gesture = Gtk.GestureClick()
-        gesture.connect("released", self._on_click)
-        frame.add_controller(gesture)
-
-        # Hover state via EventControllerMotion.
+        # Hover state.
         motion = Gtk.EventControllerMotion()
-        motion.connect("enter", lambda *_: frame.add_css_class("activatable"))
-        motion.connect("leave", lambda *_: frame.remove_css_class("activatable"))
-        frame.add_controller(motion)
+        motion.connect("enter", lambda *_: self._frame.add_css_class("activatable"))
+        motion.connect("leave", lambda *_: self._frame.remove_css_class("activatable"))
+        self._frame.add_controller(motion)
 
-    def _on_click(self, gesture, n_press, x, y) -> None:
-        self._on_activated(self)
+        # Drag source — set module-level ID so the drop target can read it.
+        drag_src = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
+        drag_src.connect("prepare", self._on_drag_prepare)
+        drag_src.connect("drag-begin", self._on_drag_begin)
+        self.add_controller(drag_src)
+
+        # Drop target — accepts a string (the source device ID).
+        drop_tgt = Gtk.DropTarget.new(str, Gdk.DragAction.MOVE)
+        drop_tgt.connect("drop", self._on_drop)
+        self.add_controller(drop_tgt)
+
+    # ------------------------------------------------------------------
+    # Sizing
+    # ------------------------------------------------------------------
+
+    def apply_size_mode(self, mode: str) -> None:
+        """Update width_request to match the given size mode and native resolution."""
+        self._current_mode = mode
+        fraction, _ = _SIZE_MODES[mode]
+        w = max(80, int(self._native_w * fraction))
+        self.set_size_request(w, -1)
+
+    # ------------------------------------------------------------------
+    # Snapshot
+    # ------------------------------------------------------------------
 
     def set_snapshot(self, png_bytes: bytes) -> None:
         """Update the thumbnail from raw PNG bytes (GTK main thread)."""
@@ -144,13 +179,43 @@ class CameraCard(Gtk.Box):
             loader.close()
             pixbuf = loader.get_pixbuf()
             if pixbuf is not None:
+                self._native_w = pixbuf.get_width()
+                self._native_h = pixbuf.get_height()
                 self._picture.set_paintable(Gdk.Texture.new_for_pixbuf(pixbuf))
+                # Re-apply size mode now that we have real dimensions.
+                self.apply_size_mode(self._current_mode)
         except Exception as exc:
-            _log.debug("CameraCard.set_snapshot failed for %s: %s", self.device.name, exc)
+            _log.debug("CameraTile.set_snapshot failed for %s: %s", self.device.name, exc)
+
+    # ------------------------------------------------------------------
+    # Drag source
+    # ------------------------------------------------------------------
+
+    def _on_drag_prepare(self, source, x, y):
+        global _dnd_src_id
+        _dnd_src_id = self.device.id
+        return Gdk.ContentProvider.new_for_value(str(self.device.id))
+
+    def _on_drag_begin(self, source, drag) -> None:
+        paintable = Gtk.WidgetPaintable.new(self)
+        source.set_icon(paintable, 0, 0)
+
+    # ------------------------------------------------------------------
+    # Drop target
+    # ------------------------------------------------------------------
+
+    def _on_drop(self, target, value, x, y) -> bool:
+        global _dnd_src_id
+        src_id = _dnd_src_id
+        _dnd_src_id = None
+        if src_id is None or src_id == self.device.id:
+            return False
+        self._on_reorder(src_id, self.device.id)
+        return True
 
 
 # ---------------------------------------------------------------------------
-# Live stream panel (embedded inside the cameras page stack)
+# Live stream panel
 # ---------------------------------------------------------------------------
 
 
@@ -262,16 +327,23 @@ class _LivePanel(Gtk.Box):
 
 
 class CamerasPage(Gtk.Box):
-    """Two-state cameras panel: single-column list ↔ embedded live stream."""
+    """Two-state cameras panel: responsive FlowBox grid ↔ embedded live stream."""
 
     def __init__(self, on_navigate_to_history=None) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, hexpand=True, vexpand=True)
         self._on_navigate_to_history = on_navigate_to_history
 
-        # device_id → CameraCard
-        self._cards: dict[int, CameraCard] = {}
+        # device_id → CameraTile
+        self._cards: dict[int, CameraTile] = {}
         # device_id → GLib source_id for 30-second fallback refresh.
         self._refresh_timers: dict[int, int] = {}
+
+        # Restore persisted preferences.
+        cfg = _cfg.load()
+        self._size_mode: str = cfg.get("camera_grid_size", "medium")
+        if self._size_mode not in _SIZE_MODES:
+            self._size_mode = "medium"
+        self._order: list[int] = cfg.get("camera_order", [])
 
         self._build_ui()
 
@@ -295,7 +367,42 @@ class CamerasPage(Gtk.Box):
         )
         self._stack.add_named(grid_box, "grid")
 
-        # Status / placeholder when list is empty.
+        # In-page toolbar: size mode toggle buttons on the right.
+        toolbar = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            margin_top=6,
+            margin_bottom=6,
+            margin_start=12,
+            margin_end=12,
+        )
+        grid_box.append(toolbar)
+
+        # Spacer pushes buttons to the right.
+        toolbar.append(Gtk.Box(hexpand=True))
+
+        size_box = Gtk.Box(css_classes=["linked"], spacing=0)
+
+        self._size_btns: dict[str, Gtk.ToggleButton] = {}
+        first_btn = None
+        for mode, label, tip in [
+            ("small", "S", "Small tiles — 4 per row minimum"),
+            ("medium", "M", "Medium tiles — 2 per row minimum"),
+            ("large", "L", "Large tiles — 1 per row minimum"),
+        ]:
+            btn = Gtk.ToggleButton(label=label, tooltip_text=tip)
+            if first_btn is None:
+                first_btn = btn
+            else:
+                btn.set_group(first_btn)
+            btn.set_active(mode == self._size_mode)
+            btn.connect("toggled", self._on_size_toggled, mode)
+            size_box.append(btn)
+            self._size_btns[mode] = btn
+
+        toolbar.append(size_box)
+        grid_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        # Status page shown when list is empty or loading.
         self._status_page = Adw.StatusPage(
             icon_name="camera-video-symbolic",
             title="No cameras",
@@ -305,17 +412,29 @@ class CamerasPage(Gtk.Box):
         self._status_page.set_visible(True)
         grid_box.append(self._status_page)
 
-        scroll = Gtk.ScrolledWindow(vexpand=True, visible=False)
+        scroll = Gtk.ScrolledWindow(
+            vexpand=True,
+            visible=False,
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+        )
         grid_box.append(scroll)
         self._scroll = scroll
 
-        self._list_box = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL,
-            spacing=0,
-            margin_top=8,
-            margin_bottom=8,
+        _, min_per_line = _SIZE_MODES[self._size_mode]
+        self._flow_box = Gtk.FlowBox(
+            column_spacing=5,
+            row_spacing=5,
+            margin_top=5,
+            margin_bottom=5,
+            margin_start=5,
+            margin_end=5,
+            homogeneous=False,
+            selection_mode=Gtk.SelectionMode.NONE,
         )
-        scroll.set_child(self._list_box)
+        self._flow_box.set_min_children_per_line(min_per_line)
+        self._flow_box.set_max_children_per_line(100)
+        self._flow_box.connect("child-activated", self._on_child_activated)
+        scroll.set_child(self._flow_box)
 
         # --- Live page ---
         self._live_panel = _LivePanel(
@@ -325,11 +444,65 @@ class CamerasPage(Gtk.Box):
         self._stack.add_named(self._live_panel, "live")
 
     # ------------------------------------------------------------------
+    # Size mode
+    # ------------------------------------------------------------------
+
+    def _on_size_toggled(self, button: Gtk.ToggleButton, mode: str) -> None:
+        if not button.get_active():
+            return
+        self._size_mode = mode
+        _, min_per_line = _SIZE_MODES[mode]
+        self._flow_box.set_min_children_per_line(min_per_line)
+        for tile in self._cards.values():
+            tile.apply_size_mode(mode)
+        cfg = _cfg.load()
+        cfg["camera_grid_size"] = mode
+        _cfg.save(cfg)
+
+    # ------------------------------------------------------------------
+    # Drag-and-drop reorder
+    # ------------------------------------------------------------------
+
+    def _on_reorder(self, src_id: int, dst_id: int) -> None:
+        """Move the tile for *src_id* to the position of *dst_id*."""
+        # Build current order from FlowBox children.
+        order: list[int] = []
+        child = self._flow_box.get_first_child()
+        while child is not None:
+            if isinstance(child, CameraTile):
+                order.append(child.device.id)
+            child = child.get_next_sibling()
+
+        if src_id not in order or dst_id not in order:
+            return
+
+        src_idx = order.index(src_id)
+        dst_idx = order.index(dst_id)
+        order.pop(src_idx)
+        order.insert(dst_idx, src_id)
+
+        # Remove all tiles, then re-add in new order.
+        for did in list(order):
+            tile = self._cards.get(did)
+            if tile is not None:
+                self._flow_box.remove(tile)
+
+        for did in order:
+            tile = self._cards.get(did)
+            if tile is not None:
+                self._flow_box.append(tile)
+
+        self._order = order
+        cfg = _cfg.load()
+        cfg["camera_order"] = order
+        _cfg.save(cfg)
+
+    # ------------------------------------------------------------------
     # Public refresh
     # ------------------------------------------------------------------
 
     def refresh(self) -> None:
-        """Re-fetch device list and repopulate the list."""
+        """Re-fetch device list and repopulate the grid."""
         client = get_client()
         if client is None or not client.is_authenticated:
             self._status_page.set_title("No cameras")
@@ -342,7 +515,7 @@ class CamerasPage(Gtk.Box):
         self._status_page.set_description("")
         self._status_page.set_visible(True)
         self._scroll.set_visible(False)
-        self._clear_list()
+        self._clear_grid()
         self._show_grid()
 
         threading.Thread(target=self._fetch_and_populate, daemon=True).start()
@@ -365,7 +538,7 @@ class CamerasPage(Gtk.Box):
             GLib.idle_add(self._show_fetch_error, str(exc))
 
     def _populate_devices(self, devices: list) -> bool:
-        self._clear_list()
+        self._clear_grid()
 
         if not devices:
             self._status_page.set_title("No cameras found")
@@ -377,10 +550,18 @@ class CamerasPage(Gtk.Box):
         self._status_page.set_visible(False)
         self._scroll.set_visible(True)
 
-        for device in devices:
-            card = CameraCard(device, on_activated=self._on_card_activated)
-            self._list_box.append(card)
-            self._cards[device.id] = card
+        # Apply saved order: known IDs first (in saved order), new IDs appended.
+        known = {did: i for i, did in enumerate(self._order)}
+        ordered = sorted(
+            devices,
+            key=lambda d: (known.get(d.id, len(self._order)), d.name),
+        )
+
+        for device in ordered:
+            tile = CameraTile(device, on_reorder=self._on_reorder)
+            tile.apply_size_mode(self._size_mode)
+            self._flow_box.append(tile)
+            self._cards[device.id] = tile
 
             threading.Thread(
                 target=self._load_snapshot,
@@ -434,9 +615,9 @@ class CamerasPage(Gtk.Box):
                     GLib.idle_add(self._set_card_snapshot, device.id, img)
 
     def _set_card_snapshot(self, device_id: int, png_bytes: bytes) -> bool:
-        card = self._cards.get(device_id)
-        if card is not None:
-            card.set_snapshot(png_bytes)
+        tile = self._cards.get(device_id)
+        if tile is not None:
+            tile.set_snapshot(png_bytes)
         return GLib.SOURCE_REMOVE
 
     # ------------------------------------------------------------------
@@ -450,21 +631,22 @@ class CamerasPage(Gtk.Box):
         device_id = getattr(event, "doorbot_id", None)
         if device_id is None or device_id not in self._cards:
             return
-        card = self._cards[device_id]
-        _log.debug("Refreshing snapshot for %s after %s event", card.device.name, kind)
+        tile = self._cards[device_id]
+        _log.debug("Refreshing snapshot for %s after %s event", tile.device.name, kind)
         threading.Thread(
             target=self._load_snapshot,
-            args=(card.device,),
+            args=(tile.device,),
             daemon=True,
         ).start()
         self._start_refresh_timer(device_id)
 
     # ------------------------------------------------------------------
-    # Card activation → live stream
+    # Tile activation → live stream
     # ------------------------------------------------------------------
 
-    def _on_card_activated(self, card: CameraCard) -> None:
-        self._show_live(card.device)
+    def _on_child_activated(self, flow_box: Gtk.FlowBox, child: Gtk.FlowBoxChild) -> None:
+        if isinstance(child, CameraTile):
+            self._show_live(child.device)
 
     def _show_live(self, device) -> None:
         self._live_panel.start_for_device(device)
@@ -499,14 +681,14 @@ class CamerasPage(Gtk.Box):
         self._refresh_timers.clear()
 
     def _fallback_refresh(self, device_id: int) -> bool:
-        card = self._cards.get(device_id)
-        if card is None:
+        tile = self._cards.get(device_id)
+        if tile is None:
             self._refresh_timers.pop(device_id, None)
             return GLib.SOURCE_REMOVE
-        _log.debug("Fallback snapshot refresh for %s", card.device.name)
+        _log.debug("Fallback snapshot refresh for %s", tile.device.name)
         threading.Thread(
             target=self._load_snapshot,
-            args=(card.device,),
+            args=(tile.device,),
             daemon=True,
         ).start()
         self._refresh_timers.pop(device_id, None)
@@ -516,8 +698,8 @@ class CamerasPage(Gtk.Box):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _clear_list(self) -> None:
+    def _clear_grid(self) -> None:
         self._cancel_all_refresh_timers()
         self._cards.clear()
-        while (child := self._list_box.get_first_child()) is not None:
-            self._list_box.remove(child)
+        while (child := self._flow_box.get_first_child()) is not None:
+            self._flow_box.remove(child)
