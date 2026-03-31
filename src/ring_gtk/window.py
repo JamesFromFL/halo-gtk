@@ -17,6 +17,24 @@ from ring_gtk.ring_client import get_client  # noqa: E402
 _log = logging.getLogger(__name__)
 
 
+async def _async_fetch_cached_snapshot(ring, device_id: int) -> bytes | None:
+    """Fetch the last stored snapshot image directly from Ring's snapshot endpoint.
+
+    Unlike async_get_snapshot(), this does not trigger a new capture or wait
+    for a fresh timestamp — it just retrieves whatever Ring has cached.
+    Returns raw image bytes on success, None otherwise.
+    """
+    try:
+        from ring_doorbell.const import SNAPSHOT_ENDPOINT
+
+        resp = await ring.async_query(SNAPSHOT_ENDPOINT.format(device_id))
+        if resp.status_code == 200 and resp.content:
+            return bytes(resp.content)
+    except Exception as exc:
+        _log.debug("Cached snapshot fetch failed for device %s: %s", device_id, exc)
+    return None
+
+
 def _make_grey_placeholder() -> bytes:
     """Return a small dark-grey PNG for cameras whose snapshot fetch failed."""
     try:
@@ -246,24 +264,29 @@ class RingWindow(Adw.ApplicationWindow):
         client = get_client()
         if client is None:
             return
+        png_bytes: bytes | None = None
         try:
             png_bytes = client._run(device.async_get_snapshot())
-            if png_bytes:
-                img = bytes(png_bytes)
-                if not getattr(device, "motion_detection", True):
-                    img = _apply_motion_off_overlay(img)
-                GLib.idle_add(self._set_snapshot, device.id, img)
-            else:
-                _log.debug("No snapshot returned for %s", device.name)
-                if not getattr(device, "motion_detection", True):
-                    img = _apply_motion_off_overlay(_make_grey_placeholder())
-                    if img:
-                        GLib.idle_add(self._set_snapshot, device.id, img)
         except Exception as exc:
+            # async_get_snapshot() raises when Ring returns an empty timestamps
+            # list ({"timestamps": []}) for cameras that don't support on-demand
+            # snapshot capture.  Fall through to the cached-snapshot fallback.
             _log.debug("Snapshot fetch failed for %s: %s", device.name, exc)
-            # Ring returns empty timestamps list for some cameras; even when the
-            # fetch fails, show the "Motion Detection Off" overlay on a placeholder
-            # so the user knows why the thumbnail is missing.
+
+        if not png_bytes and client._ring is not None:
+            # async_get_snapshot() timed out waiting for a fresh snapshot, or
+            # failed entirely.  Try the direct snapshot image endpoint instead —
+            # this returns whatever Ring has cached without triggering a new capture.
+            _log.debug("Trying cached snapshot fallback for %s", device.name)
+            png_bytes = client._run(_async_fetch_cached_snapshot(client._ring, device.id))
+
+        if png_bytes:
+            img = bytes(png_bytes)
+            if not getattr(device, "motion_detection", True):
+                img = _apply_motion_off_overlay(img)
+            GLib.idle_add(self._set_snapshot, device.id, img)
+        else:
+            _log.debug("No snapshot available for %s", device.name)
             if not getattr(device, "motion_detection", True):
                 img = _apply_motion_off_overlay(_make_grey_placeholder())
                 if img:

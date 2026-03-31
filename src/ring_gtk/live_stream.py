@@ -48,44 +48,33 @@ _log = logging.getLogger(__name__)
 def _patch_aiortc_h264() -> None:
     """Monkey-patch aiortc's H264Decoder for compatibility with Ring cameras.
 
-    Ring cameras (particularly stickup_cam_mini_v3 and some floodlight models)
-    send H264 bitstreams using Main/High profile features (B-frames, etc.)
-    even though aiortc negotiates Baseline in the SDP offer.  Two changes:
+    Ring cameras (particularly stickup_cam_mini_v3) negotiate Baseline H264
+    in the SDP but send B-frames (common in Main/High profile streams).
+    FFmpeg's H264 decoder returns AVERROR_INVALIDDATA for these frames when
+    strict profile checking is active.
 
-    1. Set codec.flags2 = 1 (AV_CODEC_FLAG2_FAST) before the codec context
-       opens on its first decode call.  This is the correct PyAV attribute for
-       permitting non-spec-compliant bitstream tricks; setting options['err_detect']
-       targets soft error reporting and has no effect on AVERROR_INVALIDDATA.
-
-    2. Patch decode() to flush the codec after any FFmpegError.  B-frame
-       reference failures cascade: once one frame is dropped, every B-frame
-       that references it also fails.  Flushing releases internal references
-       so the next IDR keyframe starts a clean decode sequence.
+    Fix: set skip_frame = "NONREF" directly on the av.CodecContext object
+    (not via the options dict) after it is created in H264Decoder.__init__.
+    This tells the decoder to discard non-reference frames without raising
+    an error, keeping the stream alive at the cost of skipping B-frames.
+    The codec opens lazily on the first decode() call, so the attribute is
+    applied before any packet is processed.
     """
     try:
         from aiortc.codecs.h264 import H264Decoder
 
         _orig_init = H264Decoder.__init__
-        _orig_decode = H264Decoder.decode
 
         def _permissive_init(self) -> None:
             _orig_init(self)
-            # AV_CODEC_FLAG2_FAST (0x1) — allow non-spec-compliant speedup tricks.
-            # Must be set before the first decode() call (codec opens lazily).
-            self.codec.flags2 = 1
-
-        def _resilient_decode(self, encoded_frame):
-            frames = _orig_decode(self, encoded_frame)
-            if not frames:
-                # Flush decoder state so the next keyframe starts clean,
-                # preventing cascading reference failures from B-frames.
-                with contextlib.suppress(Exception):
-                    self.codec.decode(None)
-            return frames
+            # skip_frame is a direct attribute on av.CodecContext (VideoCodecContext).
+            # NONREF = discard non-reference frames; B-frames from Ring cameras are
+            # often non-reference, so they are silently dropped rather than causing
+            # AVERROR_INVALIDDATA errors that would stall the decode loop.
+            self.codec.skip_frame = "NONREF"
 
         H264Decoder.__init__ = _permissive_init
-        H264Decoder.decode = _resilient_decode
-        _log.debug("Applied permissive H264 decoder patch (flags2=FAST, flush-on-error)")
+        _log.debug("Applied H264 decoder patch (skip_frame=NONREF)")
     except Exception as exc:
         _log.debug("Could not patch H264Decoder: %s", exc)
 
@@ -227,25 +216,9 @@ class LiveStreamDialog(Adw.Dialog):
         session_id = str(uuid.uuid4())
         self._session_id = session_id
 
-        # Build ICE server list: always include Ring's STUN servers; merge in
-        # any TURN credentials returned by the Ring API so that cameras behind
-        # strict NAT (where STUN peer-to-peer fails) can still stream via relay.
-        ice_servers = [RTCIceServer(urls=self._device.get_ice_servers())]
-        turn_servers = await client.async_get_turn_servers()
-        for srv in turn_servers:
-            url = srv.get("url") or srv.get("urls")
-            if url:
-                ice_servers.append(
-                    RTCIceServer(
-                        urls=[url] if isinstance(url, str) else url,
-                        username=srv.get("username"),
-                        credential=srv.get("credential"),
-                    )
-                )
-        if turn_servers:
-            _log.debug("Added %d TURN server(s) to ICE configuration", len(turn_servers))
-
-        pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
+        pc = RTCPeerConnection(
+            RTCConfiguration(iceServers=[RTCIceServer(urls=self._device.get_ice_servers())])
+        )
         self._pc = pc
 
         pc.addTransceiver("video", direction="recvonly")
