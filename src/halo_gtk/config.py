@@ -8,7 +8,7 @@ from pathlib import Path
 
 _log = logging.getLogger(__name__)
 
-CONFIG_DIR = Path.home() / ".config" / "ring-gtk"
+CONFIG_DIR = Path.home() / ".config" / "halo-gtk"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 _DEFAULTS: dict = {

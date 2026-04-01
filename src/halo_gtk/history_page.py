@@ -15,7 +15,7 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Adw, GLib, Gst, Gtk  # noqa: E402
 
-from ring_gtk.ring_client import get_client  # noqa: E402
+from halo_gtk.ring_client import get_client  # noqa: E402
 
 _log = logging.getLogger(__name__)
 
@@ -440,7 +440,7 @@ class HistoryPage(Gtk.Box):
         action_bar.pack_start(_action_btn("share-symbolic", "Copy recording URL", self._on_share))
         action_bar.pack_start(
             _action_btn(
-                "document-save-symbolic", "Download to ~/Videos/ring-gtk/", self._on_download
+                "document-save-symbolic", "Download to ~/Videos/halo-gtk/", self._on_download
             )
         )
         action_bar.pack_start(
@@ -644,7 +644,7 @@ class HistoryPage(Gtk.Box):
             url = client._run(device.async_recording_url(event_id))
             if not url:
                 return
-            dest = Path.home() / "Videos" / "ring-gtk"
+            dest = Path.home() / "Videos" / "halo-gtk"
             dest.mkdir(parents=True, exist_ok=True)
             kind = event.get("kind", "event")
             fname = dest / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{kind}.mp4"
@@ -659,7 +659,7 @@ class HistoryPage(Gtk.Box):
         if png is None:
             _log.debug("No frame available for screenshot")
             return
-        dest = Path.home() / "Pictures" / "ring-gtk"
+        dest = Path.home() / "Pictures" / "halo-gtk"
         dest.mkdir(parents=True, exist_ok=True)
         fname = dest / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
         fname.write_bytes(png)

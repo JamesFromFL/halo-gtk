@@ -1,16 +1,16 @@
-"""Entry point — `uv run ring-gtk` or `python -m ring_gtk`."""
+"""Entry point — `uv run halo-gtk` or `python -m halo_gtk`."""
 
 import logging
 import sys
 
-from ring_gtk.app import RingApplication
+from halo_gtk.app import RingApplication
 
 logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
 # Show info/debug from our own code but keep third-party libs quiet.
-logging.getLogger("ring_gtk").setLevel(logging.DEBUG)
+logging.getLogger("halo_gtk").setLevel(logging.DEBUG)
 
 
 def main() -> None:

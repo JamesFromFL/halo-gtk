@@ -15,8 +15,8 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Adw, Gdk, GdkPixbuf, GLib, Gtk  # noqa: E402
 
-from ring_gtk import config as _cfg  # noqa: E402
-from ring_gtk.ring_client import get_client  # noqa: E402
+from halo_gtk import config as _cfg  # noqa: E402
+from halo_gtk.ring_client import get_client  # noqa: E402
 
 _log = logging.getLogger(__name__)
 
@@ -286,7 +286,7 @@ class _LivePanel(Gtk.Box):
         self.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
         # Embedded live stream view.
-        from ring_gtk.live_stream import LiveStreamView
+        from halo_gtk.live_stream import LiveStreamView
 
         self._live_view = LiveStreamView()
         self.append(self._live_view)
@@ -310,7 +310,7 @@ class _LivePanel(Gtk.Box):
         if png is None:
             _log.debug("No frame available for screenshot")
             return
-        dest = Path.home() / "Pictures" / "ring-gtk"
+        dest = Path.home() / "Pictures" / "halo-gtk"
         dest.mkdir(parents=True, exist_ok=True)
         fname = dest / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.png"
         fname.write_bytes(png)

@@ -19,7 +19,7 @@ behaviour on that endpoint.
 
 Usage
 -----
-    from ring_gtk.ring_client import get_client, init_client, init_client_from_cache
+    from halo_gtk.ring_client import get_client, init_client, init_client_from_cache
 
     # Fresh login (raises Requires2FAError if 2FA needed)
     client = init_client(email, password)
@@ -50,7 +50,7 @@ _log = logging.getLogger(__name__)
 _client: RingClient | None = None
 
 # XDG data home — matches the path documented in README / pyproject comment.
-TOKEN_CACHE_PATH = Path.home() / ".local" / "share" / "ring-gtk" / "token.cache"
+TOKEN_CACHE_PATH = Path.home() / ".local" / "share" / "halo-gtk" / "token.cache"
 
 # Ring validates device_model in the session POST body, which ring-doorbell
 # constructs as "ring-doorbell:<user_agent>".  Ring's backend only accepts
@@ -292,7 +292,7 @@ class RingClient:
         GLib.idle_add(self._dispatch_event, event)
 
     def _dispatch_event(self, event) -> bool:
-        from ring_gtk.notifications import send_ring_notification
+        from halo_gtk.notifications import send_ring_notification
 
         send_ring_notification(event)
         for cb in self._event_callbacks:

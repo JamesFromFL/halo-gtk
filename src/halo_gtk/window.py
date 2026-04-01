@@ -15,10 +15,10 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Adw, Gtk  # noqa: E402
 
-from ring_gtk.cameras_page import CamerasPage  # noqa: E402
-from ring_gtk.history_page import HistoryPage  # noqa: E402
-from ring_gtk.home_page import HomePage  # noqa: E402
-from ring_gtk.ring_client import get_client  # noqa: E402
+from halo_gtk.cameras_page import CamerasPage  # noqa: E402
+from halo_gtk.history_page import HistoryPage  # noqa: E402
+from halo_gtk.home_page import HomePage  # noqa: E402
+from halo_gtk.ring_client import get_client  # noqa: E402
 
 _log = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ _NAV_ITEMS = [
 class RingWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs) -> None:
         super().__init__(
-            title="Ring",
+            title="Halo",
             default_width=1100,
             default_height=720,
             **kwargs,
@@ -156,7 +156,7 @@ class RingWindow(Adw.ApplicationWindow):
         from gi.repository import Gio
 
         menu = Gio.Menu()
-        menu.append("About Ring", "app.about")
+        menu.append("About Halo", "app.about")
         menu.append("Quit", "app.quit")
         return menu
 
@@ -201,7 +201,7 @@ class RingWindow(Adw.ApplicationWindow):
     # ------------------------------------------------------------------
 
     def _on_sign_in(self, *_) -> None:
-        from ring_gtk.auth_dialog import AuthDialog
+        from halo_gtk.auth_dialog import AuthDialog
 
         dialog = AuthDialog()
         dialog.present(self)

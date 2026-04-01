@@ -642,6 +642,39 @@ wheels = [
 ]
 
 [[package]]
+name = "halo-gtk"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "aiortc" },
+    { name = "pillow" },
+    { name = "requests" },
+    { name = "ring-doorbell" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aiortc", specifier = ">=1.14.0" },
+    { name = "pillow", specifier = ">=10.0" },
+    { name = "requests", specifier = ">=2.32" },
+    { name = "ring-doorbell", specifier = ">=0.8" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=8" },
+    { name = "pytest-asyncio", specifier = ">=0.24" },
+    { name = "ruff", specifier = ">=0.9" },
+]
+
+[[package]]
 name = "http-ece"
 version = "1.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1158,39 +1191,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/6c/4e/ee8bc785b04a8d64ffb9fcf4ddfededc94d78ca2a9ed0d13af29413b54f2/ring_doorbell-0.9.14.tar.gz", hash = "sha256:33df67c0cba8d0ece2b89a4dcee6602baf47b44fbfc1b3a085e8a3d54c016917", size = 68089, upload-time = "2026-02-28T14:15:24.367Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/39/c0/69d6064b6b294ff4ffea85da845e90d99aae8b7515d6d6b0c342a9ea1d60/ring_doorbell-0.9.14-py3-none-any.whl", hash = "sha256:5b3b3ebffcdaa1bc50f137a09062f36da42e3e59a63fe134292e16275142d9ec", size = 50260, upload-time = "2026-02-28T14:15:22.697Z" },
-]
-
-[[package]]
-name = "ring-gtk"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "aiortc" },
-    { name = "pillow" },
-    { name = "requests" },
-    { name = "ring-doorbell" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aiortc", specifier = ">=1.14.0" },
-    { name = "pillow", specifier = ">=10.0" },
-    { name = "requests", specifier = ">=2.32" },
-    { name = "ring-doorbell", specifier = ">=0.8" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=8" },
-    { name = "pytest-asyncio", specifier = ">=0.24" },
-    { name = "ruff", specifier = ">=0.9" },
 ]
 
 [[package]]

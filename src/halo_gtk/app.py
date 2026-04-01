@@ -9,8 +9,8 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Adw, Gio, GLib  # noqa: E402
 
-from ring_gtk import APP_ID, APP_VERSION  # noqa: E402
-from ring_gtk.window import RingWindow  # noqa: E402
+from halo_gtk import APP_ID, APP_VERSION  # noqa: E402
+from halo_gtk.window import RingWindow  # noqa: E402
 
 
 class RingApplication(Adw.Application):
@@ -19,7 +19,7 @@ class RingApplication(Adw.Application):
             application_id=APP_ID,
             flags=Gio.ApplicationFlags.DEFAULT_FLAGS,
         )
-        GLib.set_application_name("Ring")
+        GLib.set_application_name("Halo")
         GLib.set_prgname(APP_ID)
         self._setup_actions()
 
@@ -43,7 +43,7 @@ class RingApplication(Adw.Application):
             gi.require_version("Notify", "0.7")
             from gi.repository import Notify  # type: ignore[attr-defined]
 
-            Notify.init("Ring")
+            Notify.init("Halo")
         except (ValueError, ImportError):
             pass  # libnotify not available — graceful degradation
 
@@ -57,14 +57,14 @@ class RingApplication(Adw.Application):
         win.present()
 
     def _try_restore_session(self) -> None:
-        from ring_gtk.ring_client import init_client_from_cache
+        from halo_gtk.ring_client import init_client_from_cache
 
         client = init_client_from_cache()
         if client is not None:
             client.start()
 
     def do_shutdown(self) -> None:
-        from ring_gtk.ring_client import get_client  # avoid circular at top
+        from halo_gtk.ring_client import get_client  # avoid circular at top
 
         client = get_client()
         if client is not None:
@@ -87,12 +87,12 @@ class RingApplication(Adw.Application):
 
     def _on_about(self, *_) -> None:
         dialog = Adw.AboutDialog(
-            application_name="Ring",
+            application_name="Halo",
             application_icon=APP_ID,
             developer_name="JamesFromFL",
             version=APP_VERSION,
-            website="https://github.com/JamesFromFL/ring-gtk",
-            issue_url="https://github.com/JamesFromFL/ring-gtk/issues",
+            website="https://github.com/JamesFromFL/halo-gtk",
+            issue_url="https://github.com/JamesFromFL/halo-gtk/issues",
             license_type=0,  # GTK_LICENSE_GPL_3_0
             copyright="© 2026 JamesFromFL",
         )

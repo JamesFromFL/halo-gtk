@@ -256,7 +256,7 @@ class LiveStreamView(Gtk.Box):
 
         self._set_status("Connecting…")
 
-        from ring_gtk.ring_client import get_client
+        from halo_gtk.ring_client import get_client
 
         client = get_client()
         if client is None:
@@ -268,7 +268,7 @@ class LiveStreamView(Gtk.Box):
 
     def stop(self) -> None:
         """Stop WebRTC and GStreamer.  Safe to call from GTK thread."""
-        from ring_gtk.ring_client import get_client
+        from halo_gtk.ring_client import get_client
 
         client = get_client()
         if client is not None and (self._session_id or self._pc):

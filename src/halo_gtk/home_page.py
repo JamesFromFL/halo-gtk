@@ -8,7 +8,7 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Gtk  # noqa: E402
 
-from ring_gtk import APP_ID  # noqa: E402
+from halo_gtk import APP_ID  # noqa: E402
 
 
 class HomePage(Gtk.Box):

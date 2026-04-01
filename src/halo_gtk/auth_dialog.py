@@ -116,7 +116,7 @@ class AuthDialog(Adw.Dialog):
         try:
             from ring_doorbell import Requires2FAError
 
-            from ring_gtk.ring_client import init_client
+            from halo_gtk.ring_client import init_client
 
             client = init_client(email, password, otp_code)
             client.start()

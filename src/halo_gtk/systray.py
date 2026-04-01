@@ -32,7 +32,7 @@ class SystemTray:
         gi.require_version("Gtk", "4.0")
 
         self._indicator = indicator_cls.Indicator.new(
-            "ring-gtk",
+            "halo-gtk",
             "security-high-symbolic",
             indicator_cls.IndicatorCategory.APPLICATION_STATUS,
         )
@@ -51,7 +51,7 @@ class SystemTray:
 
         menu = Gtk.Menu()
 
-        show_item = Gtk.MenuItem(label="Show Ring")
+        show_item = Gtk.MenuItem(label="Show Halo")
         show_item.connect("activate", self._on_show)
         menu.append(show_item)
 

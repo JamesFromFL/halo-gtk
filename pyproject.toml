@@ -1,5 +1,5 @@
 [project]
-name = "ring-gtk"
+name = "halo-gtk"
 version = "0.1.0"
 description = "Native GTK4 + libadwaita Linux desktop app for Ring home security"
 authors = [{ name = "JamesFromFL" }]
@@ -26,18 +26,18 @@ dependencies = [
 # ---------------------------------------------------------------------------
 
 [project.scripts]
-ring-gtk = "ring_gtk.__main__:main"
+halo-gtk = "halo_gtk.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/JamesFromFL/ring-gtk"
-Issues   = "https://github.com/JamesFromFL/ring-gtk/issues"
+Homepage = "https://github.com/JamesFromFL/halo-gtk"
+Issues   = "https://github.com/JamesFromFL/halo-gtk/issues"
 
 [build-system]
 requires      = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/ring_gtk"]
+packages = ["src/halo_gtk"]
 
 [dependency-groups]
 dev = [

@@ -1,7 +1,7 @@
-# ring-gtk
+# halo-gtk
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/JamesFromFL/ring-gtk/main/data/icons/hicolor/256x256/apps/io.github.JamesFromFL.RingGtk.png" width="256" alt="ring-gtk icon"/>
+  <img src="https://raw.githubusercontent.com/JamesFromFL/halo-gtk/main/data/icons/hicolor/256x256/apps/io.github.JamesFromFL.HaloGtk.png" width="256" alt="halo-gtk icon"/>
 </p>
 
 Native GTK4 + libadwaita Linux desktop client for [Ring](https://ring.com) home security.
@@ -54,15 +54,15 @@ sudo pacman -S python-gobject gtk4 libadwaita libnotify libayatana-appindicator
 
 ```bash
 # Clone
-git clone https://github.com/JamesFromFL/ring-gtk
-cd ring-gtk
+git clone https://github.com/JamesFromFL/halo-gtk
+cd halo-gtk
 
 # Create venv with access to system-installed PyGObject, then install deps
 uv venv --system-site-packages
 uv sync
 
 # Run
-uv run ring-gtk
+uv run halo-gtk
 ```
 
 > `uv venv --system-site-packages` is required so the virtualenv can find

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <schemalist>
-  <schema id="io.github.JamesFromFL.RingGtk" path="/io/github/JamesFromFL/RingGtk/">
+  <schema id="io.github.JamesFromFL.HaloGtk" path="/io/github/JamesFromFL/HaloGtk/">
     <key name="start-minimised" type="b">
       <default>false</default>
       <summary>Start minimised to tray</summary>
