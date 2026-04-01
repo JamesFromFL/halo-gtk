@@ -7,7 +7,7 @@ import gi
 gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import Adw, Gio  # noqa: E402
+from gi.repository import Adw, Gio, Gtk  # noqa: E402
 
 from halo_gtk import APP_ID, APP_VERSION  # noqa: E402
 from halo_gtk.window import RingWindow  # noqa: E402
@@ -91,7 +91,36 @@ class RingApplication(Adw.Application):
             version=APP_VERSION,
             website="https://github.com/JamesFromFL/halo-gtk",
             issue_url="https://github.com/JamesFromFL/halo-gtk/issues",
-            license_type=0,  # GTK_LICENSE_GPL_3_0
-            copyright="© 2026 JamesFromFL",
+            license_type=Gtk.License.GPL_3_0,
+            copyright="© 2026 JamesFromFL — Unofficial GTK client for Ring home security",
         )
+        dialog.add_link("Disclaimers", "about:disclaimers")
+        dialog.connect("activate-link", self._on_about_link)
         dialog.present(self.get_active_window())
+
+    def _on_about_link(self, dialog, url: str) -> bool:
+        if url != "about:disclaimers":
+            return False
+        _DISCLAIMERS = (
+            "Halo\n\n"
+            "An Unofficial GTK Client for Ring Devices\n\n"
+            "Project Philosophy & Origin\n\n"
+            "This application was born out of a personal need to monitor my home security"
+            " directly from my Arch Linux desktop. It is not an official product of Ring"
+            " or Amazon, and I am not affiliated with them in any capacity.\n\n"
+            "AI Disclaimer\n\n"
+            "I am a Linux enthusiast using this project as a learning bridge to application"
+            " development. To bring this vision to life, I have collaborated extensively"
+            " with Claude AI to generate and debug the codebase. While I am meticulously"
+            " testing every feature and revision to ensure it meets my personal standards"
+            " for a polished experience, please be aware that this is a community-driven"
+            " project provided as-is.\n\n"
+            "I'm sharing this simply because I found it useful, and I hope other Linux"
+            " enthusiasts do too."
+        )
+        alert = Adw.AlertDialog(heading="Disclaimers", body=_DISCLAIMERS)
+        alert.add_response("close", "Close")
+        alert.set_default_response("close")
+        alert.set_close_response("close")
+        alert.present(self.get_active_window())
+        return True

@@ -79,10 +79,6 @@ class RingWindow(Adw.ApplicationWindow):
         toggle_btn.connect("toggled", self._on_sidebar_toggled)
         header.pack_start(toggle_btn)
 
-        refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Refresh")
-        refresh_btn.connect("clicked", lambda *_: self.refresh())
-        header.pack_end(refresh_btn)
-
         menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic", tooltip_text="Menu")
         menu_btn.set_menu_model(self._build_menu())
         header.pack_end(menu_btn)
@@ -168,7 +164,7 @@ class RingWindow(Adw.ApplicationWindow):
         from gi.repository import Gio
 
         menu = Gio.Menu()
-        menu.append("About Halo", "app.about")
+        menu.append("About", "app.about")
         menu.append("Quit", "app.quit")
         return menu
 
