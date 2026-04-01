@@ -14,6 +14,9 @@ dependencies = [
     "requests>=2.32",
     "aiortc>=1.14.0",
     "Pillow>=10.0",
+    # PyAV — first-frame decode from Ring recording URLs for motion-off tiles.
+    # Already pulled in transitively by aiortc; declared here to pin the requirement.
+    "av>=10.0",
 ]
 # ---------------------------------------------------------------------------
 # Required system packages (Arch Linux) — NOT managed by uv

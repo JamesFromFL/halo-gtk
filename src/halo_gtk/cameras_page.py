@@ -72,24 +72,99 @@ def _make_grey_placeholder() -> bytes:
 
 def _apply_motion_off_overlay(png_bytes: bytes) -> bytes:
     try:
-        from PIL import Image, ImageDraw, ImageFilter
+        from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+        # Try DejaVuSans-Bold at 28 pt; fall back to Pillow's built-in default.
+        font = None
+        for _font_path in (
+            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        ):
+            try:
+                font = ImageFont.truetype(_font_path, 28)
+                break
+            except OSError:
+                pass
 
         img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-        img = img.filter(ImageFilter.GaussianBlur(radius=4))
+        img = img.filter(ImageFilter.GaussianBlur(radius=12))
         draw = ImageDraw.Draw(img)
         text = "Motion Detection Off"
         w, h = img.size
-        bbox = draw.textbbox((0, 0), text)
+        bbox = draw.textbbox((0, 0), text, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         x, y = (w - tw) // 2, (h - th) // 2
-        draw.text((x + 1, y + 1), text, fill=(0, 0, 0))
-        draw.text((x, y), text, fill=(255, 255, 255))
+        # 4-way drop shadow in black, then white foreground.
+        for dx, dy in ((-2, -2), (2, -2), (-2, 2), (2, 2)):
+            draw.text((x + dx, y + dy), text, fill=(0, 0, 0), font=font)
+        draw.text((x, y), text, fill=(255, 255, 255), font=font)
         out = io.BytesIO()
         img.save(out, format="PNG")
         return out.getvalue()
     except Exception as exc:
         _log.debug("motion overlay failed: %s", exc)
         return png_bytes
+
+
+def _make_dark_placeholder() -> bytes:
+    """1280×720 near-black placeholder for motion-off cameras with no event frame."""
+    try:
+        from PIL import Image
+
+        img = Image.new("RGB", (1280, 720), color=(26, 26, 26))
+        out = io.BytesIO()
+        img.save(out, format="PNG")
+        return out.getvalue()
+    except Exception as exc:
+        _log.debug("dark placeholder creation failed: %s", exc)
+        return b""
+
+
+async def _fetch_last_event_frame(client, device) -> bytes | None:
+    """Return PNG bytes of the first decoded frame from the device's most
+    recent recorded event.
+
+    Strategy:
+      1. Fetch the most recent history event (limit=1).
+      2. Obtain a signed S3 recording URL via async_recording_url().
+      3. Open the URL with PyAV and decode exactly one frame.
+      4. Convert the frame to PNG via Pillow.
+      5. On any failure at any step, fall back to the cached snapshot endpoint.
+    """
+    try:
+        import av  # noqa: PLC0415
+
+        history = await device.async_history(limit=1)
+        if not history:
+            _log.debug("No history for %s — using cached snapshot", device.name)
+            return await _async_fetch_cached_snapshot(client._ring, device.id)
+
+        event_id = history[0].get("id")
+        if event_id is None:
+            return await _async_fetch_cached_snapshot(client._ring, device.id)
+
+        url = await device.async_recording_url(event_id)
+        if not url:
+            _log.debug("No recording URL for event %s — using cached snapshot", event_id)
+            return await _async_fetch_cached_snapshot(client._ring, device.id)
+
+        container = av.open(url, options={"timeout": "5000000"})
+        try:
+            frame = next(container.decode(video=0))
+            arr = frame.to_ndarray(format="rgb24")
+        finally:
+            container.close()
+
+        from PIL import Image  # noqa: PLC0415
+
+        out = io.BytesIO()
+        Image.fromarray(arr).save(out, format="PNG")
+        _log.debug("Decoded first frame from recording for %s", device.name)
+        return out.getvalue()
+
+    except Exception as exc:
+        _log.debug("_fetch_last_event_frame failed for %s: %s", device.name, exc)
+        return await _async_fetch_cached_snapshot(client._ring, device.id)
 
 
 # ---------------------------------------------------------------------------
@@ -632,6 +707,18 @@ class CamerasPage(Gtk.Box):
         client = get_client()
         if client is None:
             return
+
+        if not getattr(device, "motion_detection", True):
+            # Motion detection is off — decode the first frame of the most
+            # recent recording as the base image, then apply the blur overlay.
+            png_bytes = client._run(_fetch_last_event_frame(client, device))
+            base = bytes(png_bytes) if png_bytes else _make_dark_placeholder()
+            img = _apply_motion_off_overlay(base)
+            if img:
+                GLib.idle_add(self._set_card_snapshot, device.id, img)
+            return
+
+        # Motion detection is on — fetch the current live snapshot.
         png_bytes: bytes | None = None
         try:
             png_bytes = client._run(device.async_get_snapshot())
@@ -643,16 +730,9 @@ class CamerasPage(Gtk.Box):
             png_bytes = client._run(_async_fetch_cached_snapshot(client._ring, device.id))
 
         if png_bytes:
-            img = bytes(png_bytes)
-            if not getattr(device, "motion_detection", True):
-                img = _apply_motion_off_overlay(img)
-            GLib.idle_add(self._set_card_snapshot, device.id, img)
+            GLib.idle_add(self._set_card_snapshot, device.id, bytes(png_bytes))
         else:
             _log.debug("No snapshot available for %s", device.name)
-            if not getattr(device, "motion_detection", True):
-                img = _apply_motion_off_overlay(_make_grey_placeholder())
-                if img:
-                    GLib.idle_add(self._set_card_snapshot, device.id, img)
 
     def _set_card_snapshot(self, device_id: int, png_bytes: bytes) -> bool:
         tile = self._cards.get(device_id)

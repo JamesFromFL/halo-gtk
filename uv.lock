@@ -647,6 +647,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiortc" },
+    { name = "av" },
     { name = "pillow" },
     { name = "requests" },
     { name = "ring-doorbell" },
@@ -662,6 +663,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiortc", specifier = ">=1.14.0" },
+    { name = "av", specifier = ">=10.0" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "requests", specifier = ">=2.32" },
     { name = "ring-doorbell", specifier = ">=0.8" },
