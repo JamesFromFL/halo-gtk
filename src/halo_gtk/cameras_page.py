@@ -215,10 +215,13 @@ class CameraTile(Gtk.FlowBoxChild):
         self._native_h = _DEFAULT_NATIVE_H
         self._current_mode = "medium"
         self.set_focusable(True)
-        # Prevent tiles from stretching beyond their size_request in the FlowBox.
+        # Tiles pack from the top-left; no expand in either axis.
         self.set_hexpand(False)
-        # Track last requested width to avoid redundant queue_resize calls from
-        # set_size_request() inside the FlowBox size-allocate handler.
+        self.set_vexpand(False)
+        self.set_halign(Gtk.Align.START)
+        self.set_valign(Gtk.Align.START)
+        # Track last requested width so _set_tile_size avoids redundant
+        # queue_resize calls when the value hasn't changed.
         self._req_w: int = 0
 
         # Snapshot age timer state.
@@ -246,7 +249,8 @@ class CameraTile(Gtk.FlowBoxChild):
         self._picture = Gtk.Picture(
             content_fit=Gtk.ContentFit.CONTAIN,
             can_shrink=True,
-            hexpand=True,
+            hexpand=False,
+            vexpand=False,
         )
         self._timer_label = Gtk.Label(
             css_classes=["caption", "numeric", "snapshot-timer"],
@@ -298,18 +302,25 @@ class CameraTile(Gtk.FlowBoxChild):
     # ------------------------------------------------------------------
 
     def apply_size_mode(self, mode: str) -> None:
-        """Store the new size mode; actual pixel width is set by the FlowBox
-        size-allocate callback so the tile never imposes a hard minimum on the
-        window width."""
+        """Store the new size mode.  Resets the cached width so the next
+        _set_tile_size() call always recomputes width and picture height."""
         self._current_mode = mode
-        self._set_req_width(1)
+        self._req_w = 0
+        self.set_size_request(1, -1)
 
-    def _set_req_width(self, w: int) -> None:
-        """Call set_size_request only when the value changes to avoid an
-        infinite layout loop from the size-allocate handler."""
-        if w != self._req_w:
-            self._req_w = w
-            self.set_size_request(w, -1)
+    def _set_tile_size(self, w: int) -> None:
+        """Set the tile's width request and the picture's height request so the
+        image maintains its natural aspect ratio.  Guards against redundant
+        set_size_request calls (which would trigger unnecessary queue_resize)."""
+        if w == self._req_w:
+            return
+        self._req_w = w
+        self.set_size_request(w, -1)
+        # The inner Box has 5 px margins on each side, so the picture's
+        # effective width is tile_w - 10.  Derive height from the aspect ratio.
+        content_w = max(1, w - 10)
+        h = max(1, int(content_w * self._native_h / self._native_w))
+        self._picture.set_size_request(content_w, h)
 
     # ------------------------------------------------------------------
     # Snapshot
@@ -614,6 +625,9 @@ class CamerasPage(Gtk.Box):
             margin_end=5,
             homogeneous=False,
             selection_mode=Gtk.SelectionMode.NONE,
+            # Pack rows from the top; don't stretch to fill vertical space.
+            vexpand=False,
+            valign=Gtk.Align.START,
         )
         self._flow_box.set_min_children_per_line(min_per_line)
         self._flow_box.set_max_children_per_line(100)
@@ -632,22 +646,23 @@ class CamerasPage(Gtk.Box):
     # ------------------------------------------------------------------
 
     def do_size_allocate(self, width: int, height: int, baseline: int) -> None:
-        """Recompute tile widths on every allocation so tiles fill available
-        space without imposing a hard minimum on the window."""
+        """Recompute tile sizes on every allocation so tiles fill available
+        width without imposing a hard minimum on the window."""
         Gtk.Box.do_size_allocate(self, width, height, baseline)
-        self._recalc_tile_widths(width)
+        self._recalc_tile_sizes(width)
 
-    def _recalc_tile_widths(self, available_width: int) -> None:
+    def _recalc_tile_sizes(self, available_width: int) -> None:
+        """Compute tile width from the available width and current column count,
+        then let each tile derive its own height from its image aspect ratio."""
         if not self._cards:
             return
-        fraction, min_per_line = _SIZE_MODES[self._size_mode]
-        # FlowBox has margin_start/end of 5 px each and column_spacing of 5 px.
+        _, min_per_line = _SIZE_MODES[self._size_mode]
+        # FlowBox has 5 px margin_start/end and 5 px column_spacing.
         inner_w = available_width - 10
         gap_total = max(0, min_per_line - 1) * 5
         tile_w = max(1, (inner_w - gap_total) // min_per_line)
         for tile in self._cards.values():
-            max_w = max(1, int(tile._native_w * fraction))
-            tile._set_req_width(min(tile_w, max_w))
+            tile._set_tile_size(tile_w)
 
     # ------------------------------------------------------------------
     # Size mode
@@ -663,7 +678,7 @@ class CamerasPage(Gtk.Box):
             tile.apply_size_mode(mode)
         # Recalculate immediately; do_size_allocate only fires if the window
         # width changes, but the mode change needs an instant tile resize.
-        self._recalc_tile_widths(self.get_width())
+        self._recalc_tile_sizes(self.get_width())
         cfg = _cfg.load()
         cfg["camera_grid_size"] = mode
         _cfg.save(cfg)
