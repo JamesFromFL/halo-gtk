@@ -7,7 +7,7 @@ import gi
 gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import Adw, Gio, GLib  # noqa: E402
+from gi.repository import Adw, Gio  # noqa: E402
 
 from halo_gtk import APP_ID, APP_VERSION  # noqa: E402
 from halo_gtk.window import RingWindow  # noqa: E402
@@ -19,8 +19,6 @@ class RingApplication(Adw.Application):
             application_id=APP_ID,
             flags=Gio.ApplicationFlags.DEFAULT_FLAGS,
         )
-        GLib.set_application_name("Halo")
-        GLib.set_prgname(APP_ID)
         self._setup_actions()
 
     # ------------------------------------------------------------------

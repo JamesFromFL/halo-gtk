@@ -329,9 +329,10 @@ class _LivePanel(Gtk.Box):
 class CamerasPage(Gtk.Box):
     """Two-state cameras panel: responsive FlowBox grid ↔ embedded live stream."""
 
-    def __init__(self, on_navigate_to_history=None) -> None:
+    def __init__(self, on_navigate_to_history=None, on_title_change=None) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, hexpand=True, vexpand=True)
         self._on_navigate_to_history = on_navigate_to_history
+        self._on_title_change = on_title_change
 
         # device_id → CameraTile
         self._cards: dict[int, CameraTile] = {}
@@ -651,10 +652,14 @@ class CamerasPage(Gtk.Box):
     def _show_live(self, device) -> None:
         self._live_panel.start_for_device(device)
         self._stack.set_visible_child_name("live")
+        if self._on_title_change is not None:
+            self._on_title_change(device.name)
 
     def _show_grid(self) -> None:
         self._live_panel.stop()
         self._stack.set_visible_child_name("grid")
+        if self._on_title_change is not None:
+            self._on_title_change(None)
 
     def _go_history(self, device_id: int) -> None:
         self._show_grid()

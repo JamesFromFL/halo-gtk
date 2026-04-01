@@ -30,6 +30,13 @@ _NAV_ITEMS = [
 ]
 
 
+_PAGE_LABELS: dict[str, str] = {
+    "home": "Home",
+    "cameras": "Cameras",
+    "history": "Event History",
+}
+
+
 class RingWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs) -> None:
         super().__init__(
@@ -59,6 +66,8 @@ class RingWindow(Adw.ApplicationWindow):
         self.set_content(outer_toolbar)
 
         header = Adw.HeaderBar()
+        self._header_title = Adw.WindowTitle(title="Home")
+        header.set_title_widget(self._header_title)
         outer_toolbar.add_top_bar(header)
 
         # Hamburger / sidebar toggle button.
@@ -128,10 +137,13 @@ class RingWindow(Adw.ApplicationWindow):
 
         self._cameras_page = CamerasPage(
             on_navigate_to_history=self._navigate_to_history,
+            on_title_change=lambda name: self._update_title("cameras", name),
         )
         self._content_stack.add_named(self._cameras_page, "cameras")
 
-        self._history_page = HistoryPage()
+        self._history_page = HistoryPage(
+            on_title_change=lambda name: self._update_title("history", name),
+        )
         self._content_stack.add_named(self._history_page, "history")
 
         # Default to Home.
@@ -164,12 +176,26 @@ class RingWindow(Adw.ApplicationWindow):
     # Navigation
     # ------------------------------------------------------------------
 
+    def _update_title(self, page: str, sub: str | None = None) -> None:
+        """Update the window title (breadcrumb) and header bar label."""
+        page_label = _PAGE_LABELS.get(page, page)
+        if sub is not None:
+            self._header_title.set_title(sub)
+            self.set_title(f"Halo \u2022 {page_label} \u2022 {sub}")
+        elif page == "home":
+            self._header_title.set_title(page_label)
+            self.set_title("Halo")
+        else:
+            self._header_title.set_title(page_label)
+            self.set_title(f"Halo \u2022 {page_label}")
+
     def _on_nav_selected(self, list_box: Gtk.ListBox, row: Gtk.ListBoxRow | None) -> None:
         if row is None:
             return
         for name, nav_row in self._nav_rows.items():
             if nav_row is row:
                 self._content_stack.set_visible_child_name(name)
+                self._update_title(name)
                 if name == "history":
                     self._history_page.refresh()
                 break

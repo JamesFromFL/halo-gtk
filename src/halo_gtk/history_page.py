@@ -349,8 +349,9 @@ class _VideoPlayer(Gtk.Box):
 class HistoryPage(Gtk.Box):
     """Adw.NavigationSplitView — event list on left, player on right."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_title_change=None) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, hexpand=True, vexpand=True)
+        self._on_title_change = on_title_change
         self._events: list = []
         self._devices: list = []
         self._selected_device_id: int | None = None  # None = all cameras
@@ -575,6 +576,11 @@ class HistoryPage(Gtk.Box):
             return
         self._current_event = event
         self._nav_split.set_show_content(True)
+
+        if self._on_title_change is not None:
+            device = event.get("_device")
+            camera_name = device.name if device is not None else None
+            self._on_title_change(camera_name)
 
         threading.Thread(target=self._load_and_play, args=(event,), daemon=True).start()
 
