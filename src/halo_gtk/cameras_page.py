@@ -244,9 +244,9 @@ class CameraTile(Gtk.FlowBoxChild):
         # Snapshot picture wrapped in an Overlay so the age timer badge can
         # float in the bottom-left corner without affecting layout.
         self._picture = Gtk.Picture(
-            content_fit=Gtk.ContentFit.CONTAIN,
+            content_fit=Gtk.ContentFit.FILL,
             can_shrink=True,
-            hexpand=False,
+            hexpand=True,
             vexpand=False,
         )
         self._timer_label = Gtk.Label(
@@ -305,9 +305,21 @@ class CameraTile(Gtk.FlowBoxChild):
     def do_size_allocate(self, w: int, h: int, b: int) -> None:
         """Derive picture height from the tile's actual allocated width so the
         image always fills the tile at its native aspect ratio."""
-        # Tile frame border (~1 px each side) + inner Box margins (5 px each side) = ~12 px.
-        content_w = max(1, w - 12)
-        pic_h = max(1, int(content_w * self._native_h / self._native_w))
+        # Inner Box has 5 px margins on each side; Frame "card" adds no pixel-consuming border.
+        content_w = max(1, w - 10)
+        uncapped_h = max(1, int(content_w * self._native_h / self._native_w))
+        # Cap tile height to a 16:9 maximum so portrait/square cameras (e.g.
+        # doorbell at 1:1) don't make a row taller than widescreen cameras.
+        max_h = max(1, int(content_w * 9 / 16))
+        if uncapped_h > max_h:
+            # Taller than 16:9 — cap height and let CONTAIN letterbox within the
+            # capped cell so the image is never distorted.
+            pic_h = max_h
+            self._picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+        else:
+            # 16:9 or wider — FILL renders pixel-perfect with no letterboxing.
+            pic_h = uncapped_h
+            self._picture.set_content_fit(Gtk.ContentFit.FILL)
         self._picture.set_size_request(content_w, pic_h)
         Gtk.FlowBoxChild.do_size_allocate(self, w, h, b)
 
