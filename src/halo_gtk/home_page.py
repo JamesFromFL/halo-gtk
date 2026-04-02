@@ -46,6 +46,8 @@ class HomePage(Gtk.ScrolledWindow):
             label="Halo",
             css_classes=["title-1"],
             halign=Gtk.Align.CENTER,
+            max_width_chars=20,
+            ellipsize=3,  # PANGO_ELLIPSIZE_END — safety net for any app-name change
         )
         self._inner.append(title)
 

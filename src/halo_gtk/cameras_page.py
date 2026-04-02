@@ -218,11 +218,8 @@ class CameraTile(Gtk.FlowBoxChild):
         # Tiles pack from the top-left; no expand in either axis.
         self.set_hexpand(False)
         self.set_vexpand(False)
-        self.set_halign(Gtk.Align.START)
+        self.set_halign(Gtk.Align.FILL)
         self.set_valign(Gtk.Align.START)
-        # Track last requested width so _set_tile_size avoids redundant
-        # queue_resize calls when the value hasn't changed.
-        self._req_w: int = 0
 
         # Snapshot age timer state.
         self._snapshot_loaded_at: float = 0.0
@@ -302,25 +299,17 @@ class CameraTile(Gtk.FlowBoxChild):
     # ------------------------------------------------------------------
 
     def apply_size_mode(self, mode: str) -> None:
-        """Store the new size mode.  Resets the cached width so the next
-        _set_tile_size() call always recomputes width and picture height."""
+        """Store the new size mode."""
         self._current_mode = mode
-        self._req_w = 0
-        self.set_size_request(1, -1)
 
-    def _set_tile_size(self, w: int) -> None:
-        """Set the tile's width request and the picture's height request so the
-        image maintains its natural aspect ratio.  Guards against redundant
-        set_size_request calls (which would trigger unnecessary queue_resize)."""
-        if w == self._req_w:
-            return
-        self._req_w = w
-        self.set_size_request(w, -1)
-        # The inner Box has 5 px margins on each side, so the picture's
-        # effective width is tile_w - 10.  Derive height from the aspect ratio.
-        content_w = max(1, w - 10)
-        h = max(1, int(content_w * self._native_h / self._native_w))
-        self._picture.set_size_request(content_w, h)
+    def do_size_allocate(self, w: int, h: int, b: int) -> None:
+        """Derive picture height from the tile's actual allocated width so the
+        image always fills the tile at its native aspect ratio."""
+        # Tile frame border (~1 px each side) + inner Box margins (5 px each side) = ~12 px.
+        content_w = max(1, w - 12)
+        pic_h = max(1, int(content_w * self._native_h / self._native_w))
+        self._picture.set_size_request(content_w, pic_h)
+        Gtk.FlowBoxChild.do_size_allocate(self, w, h, b)
 
     # ------------------------------------------------------------------
     # Snapshot
@@ -333,16 +322,20 @@ class CameraTile(Gtk.FlowBoxChild):
         a static blurred still, so elapsed time is not meaningful).
         """
         try:
+            from PIL import Image  # noqa: PLC0415
+
+            with Image.open(io.BytesIO(png_bytes)) as im:
+                self._native_w, self._native_h = im.size
+
             loader = GdkPixbuf.PixbufLoader()
             loader.write(png_bytes)
             loader.close()
             pixbuf = loader.get_pixbuf()
             if pixbuf is not None:
-                self._native_w = pixbuf.get_width()
-                self._native_h = pixbuf.get_height()
                 self._picture.set_paintable(Gdk.Texture.new_for_pixbuf(pixbuf))
-                # Re-apply size mode now that we have real dimensions.
-                self.apply_size_mode(self._current_mode)
+                # Trigger a re-layout so do_size_allocate recomputes picture height
+                # with the new native dimensions.
+                self.queue_resize()
         except Exception as exc:
             _log.debug("CameraTile.set_snapshot failed for %s: %s", self.device.name, exc)
 
@@ -628,10 +621,10 @@ class CamerasPage(Gtk.Box):
             vexpand=False,
             valign=Gtk.Align.START,
         )
-        self._flow_box.set_min_children_per_line(1)
-        self._flow_box.set_max_children_per_line(20)
+        _, num_per_row = _SIZE_MODES[self._size_mode]
+        self._flow_box.set_min_children_per_line(num_per_row)
+        self._flow_box.set_max_children_per_line(num_per_row)
         self._flow_box.connect("child-activated", self._on_child_activated)
-        self._flow_box.connect("notify::allocated-width", self._on_flow_box_width_changed)
         scroll.set_child(self._flow_box)
 
         # --- Live page ---
@@ -642,27 +635,6 @@ class CamerasPage(Gtk.Box):
         self._stack.add_named(self._live_panel, "live")
 
     # ------------------------------------------------------------------
-    # Size allocation — drives dynamic tile widths
-    # ------------------------------------------------------------------
-
-    def _on_flow_box_width_changed(self, flow_box: Gtk.FlowBox, _pspec) -> None:
-        """Recompute tile sizes when the FlowBox's allocated width changes."""
-        self._recalc_tile_sizes(flow_box.get_width())
-
-    def _recalc_tile_sizes(self, available_width: int) -> None:
-        """Compute tile width from the available width and current column count,
-        then let each tile derive its own height from its image aspect ratio."""
-        if not self._cards:
-            return
-        _, min_per_line = _SIZE_MODES[self._size_mode]
-        # FlowBox has 5 px margin_start/end and 5 px column_spacing.
-        inner_w = available_width - 10
-        gap_total = max(0, min_per_line - 1) * 5
-        tile_w = max(1, (inner_w - gap_total) // min_per_line)
-        for tile in self._cards.values():
-            tile._set_tile_size(tile_w)
-
-    # ------------------------------------------------------------------
     # Size mode
     # ------------------------------------------------------------------
 
@@ -670,9 +642,11 @@ class CamerasPage(Gtk.Box):
         if not button.get_active():
             return
         self._size_mode = mode
+        _, num_per_row = _SIZE_MODES[mode]
+        self._flow_box.set_min_children_per_line(num_per_row)
+        self._flow_box.set_max_children_per_line(num_per_row)
         for tile in self._cards.values():
             tile.apply_size_mode(mode)
-        self._recalc_tile_sizes(self._flow_box.get_width())
         cfg = _cfg.load()
         cfg["camera_grid_size"] = mode
         _cfg.save(cfg)
