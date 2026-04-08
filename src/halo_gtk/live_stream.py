@@ -250,9 +250,8 @@ class LiveStreamView(Gtk.Box):
         if self._pipeline is not None:
             self._pipeline.set_state(Gst.State.NULL)
             if self._video_appsrc is not None:
-                self._video_appsrc.set_property(
-                    "caps", Gst.Caps.from_string("video/x-raw,format=RGB")
-                )
+                caps_str = "video/x-raw,format=RGB,framerate=0/1"
+                self._video_appsrc.set_property("caps", Gst.Caps.from_string(caps_str))
             self._pipeline.set_state(Gst.State.PLAYING)
 
         self._set_status("Connecting…")
