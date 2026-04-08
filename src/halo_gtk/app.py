@@ -27,6 +27,8 @@ class RingApplication(Adw.Application):
 
     def do_startup(self) -> None:
         Adw.Application.do_startup(self)
+        style_manager = Adw.StyleManager.get_default()
+        style_manager.set_color_scheme(Adw.ColorScheme.PREFER_DARK)
         # Initialise GStreamer for live camera feed playback.
         try:
             gi.require_version("Gst", "1.0")
