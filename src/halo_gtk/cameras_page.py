@@ -506,6 +506,14 @@ class _LivePanel(Gtk.Box):
         vol_box.append(self._vol_scale)
         top_bar.append(vol_box)
 
+        self._mic_btn = Gtk.ToggleButton(
+            icon_name="audio-input-microphone-symbolic",
+            tooltip_text="Talk (hold to speak)",
+            sensitive=False,
+        )
+        self._mic_btn.connect("toggled", self._on_mic_toggled)
+        top_bar.append(self._mic_btn)
+
         screenshot_btn = Gtk.Button(
             icon_name="camera-photo-symbolic",
             tooltip_text="Save screenshot",
@@ -531,13 +539,26 @@ class _LivePanel(Gtk.Box):
         self._device = device
         self._title_label.set_label(device.name)
         self._vol_scale.set_value(1.0)
+        self._mic_btn.set_sensitive(True)
         self._live_view.start_for_device(device)
 
     def stop(self) -> None:
+        # Untoggle the mic button without firing _on_mic_toggled (stop_talking is
+        # handled by LiveStreamView._async_cleanup when the stream tears down).
+        self._mic_btn.handler_block_by_func(self._on_mic_toggled)
+        self._mic_btn.set_active(False)
+        self._mic_btn.handler_unblock_by_func(self._on_mic_toggled)
+        self._mic_btn.set_sensitive(False)
         self._live_view.stop()
 
     def _on_volume_changed(self, scale: Gtk.Scale) -> None:
         self._live_view.set_volume(scale.get_value())
+
+    def _on_mic_toggled(self, btn: Gtk.ToggleButton) -> None:
+        if btn.get_active():
+            self._live_view.start_talking()
+        else:
+            self._live_view.stop_talking()
 
     def _on_screenshot(self, *_) -> None:
         png = self._live_view.get_current_frame_png()

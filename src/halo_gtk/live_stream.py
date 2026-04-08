@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fractions
 import logging
+import time
 import uuid
 
 import gi
@@ -21,6 +23,8 @@ gi.require_version("Adw", "1")
 gi.require_version("Gst", "1.0")
 gi.require_version("Gtk", "4.0")
 
+from aiortc.mediastreams import AudioStreamTrack, MediaStreamError  # noqa: E402
+from av import AudioFrame  # noqa: E402
 from gi.repository import Adw, GLib, Gst, Gtk  # noqa: E402
 
 _log = logging.getLogger(__name__)
@@ -149,6 +153,110 @@ _AV_TO_GST_FMT: dict[str, str] = {
     "dblp": "F64LE",
 }
 
+_MIC_SAMPLE_RATE = 48000
+_MIC_SAMPLES = 960  # 20 ms at 48 kHz — matches aiortc's AUDIO_PTIME
+
+
+class MicrophoneTrack(AudioStreamTrack):
+    """AudioStreamTrack that captures from the system microphone via GStreamer pulsesrc.
+
+    Sends silence (zeroed frames at 48 kHz mono) by default so the Opus encoder
+    always receives valid, consistently-formatted frames.  Call start_capture() /
+    stop_capture() from the asyncio event loop to toggle live mic input.
+    """
+
+    kind = "audio"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._active = False
+        self._mic_pipeline: Gst.Pipeline | None = None
+        self._mic_appsink: Gst.Element | None = None
+        self._start: float | None = None
+        self._timestamp: int = 0
+
+    async def start_capture(self) -> None:
+        """Start the GStreamer pulsesrc pipeline and begin sending mic audio."""
+        if self._active:
+            return
+        pipeline = Gst.parse_launch(
+            "pulsesrc blocksize=1920 "
+            "! audioconvert "
+            "! audioresample "
+            "! capsfilter caps=audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved "
+            "! appsink name=sink emit-signals=false max-buffers=5 drop=false"
+        )
+        self._mic_pipeline = pipeline
+        self._mic_appsink = pipeline.get_by_name("sink")
+        pipeline.set_state(Gst.State.PLAYING)
+        self._active = True
+        _log.debug("Microphone capture started")
+
+    async def stop_capture(self) -> None:
+        """Stop mic capture and revert to silence."""
+        if not self._active:
+            return
+        self._active = False
+        if self._mic_pipeline is not None:
+            self._mic_pipeline.set_state(Gst.State.NULL)
+            self._mic_pipeline = None
+            self._mic_appsink = None
+        _log.debug("Microphone capture stopped")
+
+    def _pull_sample_blocking(self, appsink: Gst.Element) -> bytes | None:
+        """Pull one buffer from appsink (blocking — intended for run_in_executor)."""
+        sample = appsink.emit("pull-sample")
+        if sample is None:
+            return None
+        buf = sample.get_buffer()
+        ok, info = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return None
+        data = bytes(info.data)
+        buf.unmap(info)
+        return data
+
+    async def recv(self) -> AudioFrame:  # type: ignore[override]
+        if self.readyState != "live":
+            raise MediaStreamError
+
+        # Pace output to a fixed 20 ms interval independent of mic availability.
+        if self._start is None:
+            self._start = time.time()
+            self._timestamp = 0
+        else:
+            self._timestamp += _MIC_SAMPLES
+            wait = self._start + (self._timestamp / _MIC_SAMPLE_RATE) - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+
+        frame = AudioFrame(format="s16", layout="mono", samples=_MIC_SAMPLES)
+        frame.sample_rate = _MIC_SAMPLE_RATE
+        frame.pts = self._timestamp
+        frame.time_base = fractions.Fraction(1, _MIC_SAMPLE_RATE)
+
+        appsink = self._mic_appsink
+        if self._active and appsink is not None:
+            loop = asyncio.get_running_loop()
+            try:
+                raw = await asyncio.wait_for(
+                    loop.run_in_executor(None, self._pull_sample_blocking, appsink),
+                    timeout=0.1,
+                )
+                if raw:
+                    # Pad or trim to exactly the expected frame size.
+                    needed = _MIC_SAMPLES * 2  # S16LE = 2 bytes per sample
+                    raw = raw[:needed].ljust(needed, b"\x00")
+                    frame.planes[0].update(raw)
+                    return frame
+            except Exception as exc:
+                _log.debug("Mic pull error: %s", exc)
+
+        # Silence fallback — zeroed plane.
+        for p in frame.planes:
+            p.update(bytes(p.buffer_size))
+        return frame
+
 
 class LiveStreamView(Gtk.Box):
     """Embeddable live camera feed widget — GStreamer + WebRTC, no dialog chrome.
@@ -175,6 +283,7 @@ class LiveStreamView(Gtk.Box):
         self._vol_element: Gst.Element | None = None
         self._video_caps_set = False
         self._audio_caps_set = False
+        self._mic_track: MicrophoneTrack | None = None
         # Last decoded frame as a raw numpy array (h, w, 3) — updated every frame.
         # Read from GTK thread for screenshots; written from asyncio thread.
         # Single-reference replacement is safe under the GIL.
@@ -282,6 +391,32 @@ class LiveStreamView(Gtk.Box):
         if self._vol_element is not None:
             self._vol_element.set_property("volume", max(0.0, min(1.0, value)))
 
+    def start_talking(self) -> None:
+        """Begin sending microphone audio to Ring.  Safe to call from GTK thread."""
+        if self._mic_track is None:
+            return
+        from halo_gtk.ring_client import get_client
+
+        client = get_client()
+        if client is not None:
+            asyncio.run_coroutine_threadsafe(
+                self._mic_track.start_capture(),
+                client._ensure_loop(),
+            )
+
+    def stop_talking(self) -> None:
+        """Stop sending microphone audio.  Safe to call from GTK thread."""
+        if self._mic_track is None:
+            return
+        from halo_gtk.ring_client import get_client
+
+        client = get_client()
+        if client is not None:
+            asyncio.run_coroutine_threadsafe(
+                self._mic_track.stop_capture(),
+                client._ensure_loop(),
+            )
+
     def get_current_frame_png(self) -> bytes | None:
         """Return the most recently decoded video frame as PNG bytes, or None."""
         arr = self._last_frame_rgb
@@ -323,7 +458,8 @@ class LiveStreamView(Gtk.Box):
         self._pc = pc
 
         pc.addTransceiver("video", direction="recvonly")
-        pc.addTransceiver("audio", direction="recvonly")
+        self._mic_track = MicrophoneTrack()
+        pc.addTransceiver(self._mic_track, direction="sendrecv")
 
         def on_rtc_message(msg) -> None:
             if msg.answer:
@@ -480,6 +616,10 @@ class LiveStreamView(Gtk.Box):
     # ------------------------------------------------------------------
 
     async def _async_cleanup(self) -> None:
+        if self._mic_track is not None:
+            await self._mic_track.stop_capture()
+            self._mic_track = None
+
         for task in (self._video_task, self._audio_task):
             if task and not task.done():
                 task.cancel()
