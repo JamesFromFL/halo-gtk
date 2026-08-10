@@ -11,6 +11,10 @@ This section tracks the work toward Halo GTK's first tagged release.
 ### Added
 - Ring sign-in, two-factor authentication, Secret Service token storage, and background
   session restore.
+- Experimental native Ring Alarm backend sharing the existing authenticated Ring session,
+  with bounded CLAP parsing, multi-location state, sensor normalization, reconnect supervision,
+  and revision-checked Disarmed/Home/Away requests. The UI and live-hardware validation remain
+  deliberately deferred, and emergency, siren, dispatch, lock, and device commands are excluded.
 - Camera dashboard, multi-camera live monitoring layouts, focused live view, event history,
   local favorites, downloads, screenshots, and desktop notifications.
 - Shared WebRTC session ownership with bounded stream counts, H.264 compatibility handling,

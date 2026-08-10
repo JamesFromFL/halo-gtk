@@ -43,10 +43,25 @@ import io
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
+from contextvars import ContextVar
+from dataclasses import replace
 from functools import partial
 from typing import Any
 
+from halo_gtk.alarm.models import (
+    AlarmAccountSnapshot,
+    AlarmMode,
+    AlarmServiceStatus,
+    empty_alarm_snapshot,
+)
+from halo_gtk.alarm.provider import (
+    AlarmCommandResult,
+    AlarmCommandSupersededError,
+    AlarmLocationSeed,
+    AlarmRequestError,
+    location_seeds_from_base_stations,
+)
 from halo_gtk.secret_store import (
     clear_ring_account_email,
     clear_ring_event_credentials,
@@ -64,6 +79,7 @@ _log = logging.getLogger(__name__)
 
 _client: RingClient | None = None
 _session_lock = threading.RLock()
+_alarm_command_lock = threading.RLock()
 _session_generation = 0
 _active_client_generation = 0
 _account_email_cache: str | None = None
@@ -73,6 +89,7 @@ _account_email_lock = threading.Lock()
 _APP_USER_AGENT = "android:com.ringapp"
 _DEFAULT_CALL_TIMEOUT = 90
 _LISTENER_STOP_TIMEOUT = 4
+_ALARM_STOP_TIMEOUT = 4
 _ASYNC_CLOSE_TIMEOUT = 5
 _LOOP_JOIN_TIMEOUT = 5
 _LOOP_START_TIMEOUT = 5
@@ -80,6 +97,8 @@ _DEVICE_REFRESH_TTL = 8
 _LISTENER_MONITOR_INTERVAL = 2
 _LISTENER_RECONNECT_MIN = 5
 _LISTENER_RECONNECT_MAX = 120
+_RING_LOCATIONS_ENDPOINT = "https://api.ring.com/devices/v1/locations"
+_ALARM_LOCATION_DISCOVERY_TIMEOUT = 10
 
 # Real-time event-listener connection state, surfaced to the UI for an
 # "events offline / reconnecting" indicator. Module-level so subscribers survive
@@ -94,6 +113,99 @@ _connection_callbacks: list = []
 
 class SessionSupersededError(RuntimeError):
     """Raised when a newer login or logout invalidates session work."""
+
+
+class _RingAlarmRestGateway:
+    """Expose validated JSON requests while keeping OAuth ownership in Ring Auth."""
+
+    def __init__(self, auth) -> None:
+        self._auth = auth
+
+    async def request_json(
+        self,
+        url: str,
+        *,
+        method: str = "GET",
+        json: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> Mapping[str, Any]:
+        from ring_doorbell import AuthenticationError
+
+        request_kwargs = {
+            "method": method,
+            "json": dict(json) if json is not None else None,
+            "timeout": timeout,
+            "raise_for_status": False,
+        }
+        try:
+            response = await self._auth.async_query(url, **request_kwargs)
+            # ring-doorbell 0.9.14 refreshes Auth after a 401 but returns that
+            # original response. Replay one safe read with the rotated token.
+            if getattr(response, "status_code", 200) == 401 and method.upper() == "GET":
+                response = await self._auth.async_query(url, **request_kwargs)
+        except AuthenticationError:
+            raise AlarmRequestError("authentication-required") from None
+        except Exception:
+            raise AlarmRequestError("request-failed") from None
+        status_code = getattr(response, "status_code", 200)
+        if status_code == 401:
+            raise AlarmRequestError("authentication-required")
+        if status_code == 429:
+            # Auth.Response in ring-doorbell 0.9.14 drops Retry-After headers.
+            raise AlarmRequestError("rate-limited", retry_after=60.0)
+        if not isinstance(status_code, int) or not 200 <= status_code < 300:
+            raise AlarmRequestError("request-failed")
+        try:
+            payload = response.json()
+        except Exception:
+            raise AlarmRequestError("invalid-response") from None
+        if not isinstance(payload, Mapping):
+            raise AlarmRequestError("invalid-response")
+        return dict(payload)
+
+
+def _install_serialized_auth_refresh(auth) -> None:
+    """Serialize token rotation and deduplicate stale in-flight request refreshes."""
+    if getattr(auth, "_halo_refresh_serialized", False):
+        return
+
+    original_refresh = getattr(auth, "async_refresh_tokens", None)
+    if not callable(original_refresh):
+        return
+    refresh_lock = asyncio.Lock()
+    completed_refreshes = 0
+    last_result = None
+    request_refresh_generation: ContextVar[int | None] = ContextVar(
+        "ring_request_refresh_generation",
+        default=None,
+    )
+
+    async def serialized_refresh():
+        nonlocal completed_refreshes, last_result
+        observed_refreshes = completed_refreshes
+        request_generation = request_refresh_generation.get()
+        async with refresh_lock:
+            if request_generation is not None and completed_refreshes != request_generation:
+                return last_result
+            if completed_refreshes != observed_refreshes:
+                return last_result
+            last_result = await original_refresh()
+            completed_refreshes += 1
+            return last_result
+
+    auth.async_refresh_tokens = serialized_refresh
+    original_query = getattr(auth, "async_query", None)
+    if callable(original_query):
+
+        async def generation_tracked_query(*args, **kwargs):
+            token = request_refresh_generation.set(completed_refreshes)
+            try:
+                return await original_query(*args, **kwargs)
+            finally:
+                request_refresh_generation.reset(token)
+
+        auth.async_query = generation_tracked_query
+    auth._halo_refresh_serialized = True
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +246,7 @@ def _publish_session_candidate(
     generation: int,
 ) -> tuple[bool, RingClient | None]:
     global _active_client_generation, _client
-    with _session_lock:
+    with _alarm_command_lock, _session_lock:
         if generation != _session_generation:
             return False, None
 
@@ -145,7 +257,14 @@ def _publish_session_candidate(
         previous = _client
         _active_client_generation = generation
         client._published_generation = generation
+        initialize_alarm = getattr(client, "_initialize_alarm_generation", None)
+        if callable(initialize_alarm):
+            initialize_alarm(generation)
         _client = client
+        if previous is not None and previous is not client:
+            invalidate_alarm = getattr(previous, "_invalidate_alarm_state", None)
+            if callable(invalidate_alarm):
+                invalidate_alarm(generation)
         return True, previous
 
 
@@ -273,7 +392,7 @@ def logout_client(*, expected_client: RingClient | None = None) -> bool:
     global _active_client_generation, _client, _session_generation
     global _account_email_cache, _account_email_loaded
     clear_error = None
-    with _session_lock:
+    with _alarm_command_lock, _session_lock:
         if expected_client is not None and _client is not expected_client:
             return False
         _session_generation += 1
@@ -281,6 +400,10 @@ def logout_client(*, expected_client: RingClient | None = None) -> bool:
         generation = _active_client_generation
         client = _client
         _client = None
+        if client is not None:
+            invalidate_alarm = getattr(client, "_invalidate_alarm_state", None)
+            if callable(invalidate_alarm):
+                invalidate_alarm(generation)
 
         for clear_secret in (
             _clear_token,
@@ -305,12 +428,16 @@ def logout_client(*, expected_client: RingClient | None = None) -> bool:
 def shutdown_client() -> None:
     """Invalidate session work and stop the active client without clearing secrets."""
     global _active_client_generation, _client, _session_generation
-    with _session_lock:
+    with _alarm_command_lock, _session_lock:
         _session_generation += 1
         _active_client_generation = _session_generation
         generation = _active_client_generation
         client = _client
         _client = None
+        if client is not None:
+            invalidate_alarm = getattr(client, "_invalidate_alarm_state", None)
+            if callable(invalidate_alarm):
+                invalidate_alarm(generation)
 
     _set_listener_state(LISTENER_OFFLINE, generation=generation)
     _stop_client_quietly(client)
@@ -423,8 +550,16 @@ class RingClient:
         self._loop_start_error: BaseException | None = None
         self._loop_thread: threading.Thread | None = None
         self._listener_future = None  # concurrent.futures.Future from run_coroutine_threadsafe
+        self._alarm_future = None  # concurrent.futures.Future from run_coroutine_threadsafe
+        self._alarm_stop_event: asyncio.Event | None = None
+        self._alarm_service = None
+        self._alarm_closing_service = None
+        self._alarm_close_task: asyncio.Task | None = None
         self._stop_event = threading.Event()
         self._event_callbacks: list = []
+        self._alarm_callbacks: list = []
+        self._alarm_snapshot_lock = threading.Lock()
+        self._alarm_snapshot = empty_alarm_snapshot()
         self._loop_lock = threading.Lock()
         self._last_device_update_at = 0.0
         self._published_generation: int | None = None
@@ -548,6 +683,7 @@ class RingClient:
         # explicit sign-in.  Pass None for the token so ring-doorbell doesn't
         # try to reuse a stale cached credential.
         auth = Auth(_APP_USER_AGENT, None, self._capture_auth_token)
+        _install_serialized_auth_refresh(auth)
 
         try:
             # May raise Requires2FAError or AuthenticationError — let propagate.
@@ -580,6 +716,7 @@ class RingClient:
         self._ring = None
         self._pending_auth_token = None
         auth = Auth(_APP_USER_AGENT, token, self._capture_auth_token)
+        _install_serialized_auth_refresh(auth)
 
         try:
             ring = Ring(auth)
@@ -638,6 +775,122 @@ class RingClient:
         await self._ring.auth.async_refresh_tokens()
         await self._ring.async_update_data()
         self._last_device_update_at = time.monotonic()
+        await self._async_reconcile_alarm_discovery()
+
+    async def _async_reconcile_alarm_discovery(self) -> None:
+        service = self._alarm_service
+        if service is not None:
+            try:
+                await service.reconcile(await self._async_alarm_location_seeds())
+            except Exception as exc:
+                _log.warning(
+                    "Ring Alarm discovery reconciliation failed after session refresh (%s)",
+                    type(exc).__name__,
+                )
+
+    def _alarm_location_seeds(
+        self,
+        *,
+        raw_locations: Mapping[object, object] | Iterable[object] | None = None,
+    ) -> tuple[AlarmLocationSeed, ...]:
+        ring = self._ring
+        if ring is None:
+            return ()
+        base_stations = getattr(ring, "devices_data", {}).get("base_stations", {})
+        return location_seeds_from_base_stations(
+            base_stations,
+            raw_locations=raw_locations,
+        )
+
+    async def _async_alarm_location_seeds(self) -> tuple[AlarmLocationSeed, ...]:
+        seeds = self._alarm_location_seeds()
+        if not seeds:
+            return ()
+        ring = self._ring
+        auth = getattr(ring, "auth", None)
+        if auth is None:
+            return seeds
+        try:
+            payload = await _RingAlarmRestGateway(auth).request_json(
+                _RING_LOCATIONS_ENDPOINT,
+                timeout=_ALARM_LOCATION_DISCOVERY_TIMEOUT,
+            )
+            return self._alarm_location_seeds(raw_locations=payload)
+        except Exception:
+            return seeds
+
+    def _create_alarm_service(
+        self,
+        generation: int,
+        locations: Iterable[AlarmLocationSeed] | None = None,
+    ):
+        from halo_gtk.alarm.service import RingAlarmService
+
+        ring = self._ring
+        if ring is None:
+            raise RuntimeError("Not signed in to Ring")
+        return RingAlarmService(
+            _RingAlarmRestGateway(ring.auth),
+            tuple(locations) if locations is not None else self._alarm_location_seeds(),
+            self._on_alarm_snapshot,
+            generation=generation,
+            command_admission=partial(self._alarm_command_admission, generation),
+        )
+
+    @contextlib.contextmanager
+    def _alarm_command_admission(self, generation: int):
+        """Exclude session invalidation across the single Alarm socket write."""
+        with _alarm_command_lock:
+            if not _is_active_client_generation(self, generation):
+                raise AlarmCommandSupersededError
+            yield
+
+    async def _async_run_alarm(self, generation: int) -> None:
+        if not _is_active_client_generation(self, generation) or self._stop_event.is_set():
+            return
+        stop_event = asyncio.Event()
+        self._alarm_stop_event = stop_event
+
+        service = None
+        try:
+            locations = await self._async_alarm_location_seeds()
+            if not _is_active_client_generation(self, generation) or self._stop_event.is_set():
+                return
+            service = self._create_alarm_service(generation, locations)
+            self._alarm_service = service
+            await service.run(stop_event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Alarm is independent of camera FCM and media. Do not let a
+            # compatibility failure tear down the authenticated Ring client.
+            _log.warning("Ring Alarm service stopped unexpectedly (%s)", type(exc).__name__)
+            self._publish_alarm_error(generation)
+        finally:
+            try:
+                if service is not None:
+                    await self._async_close_alarm_service(service)
+            except Exception as exc:
+                _log.debug("Ring Alarm close failed (%s)", type(exc).__name__)
+            finally:
+                if self._alarm_service is service:
+                    self._alarm_service = None
+                if self._alarm_stop_event is stop_event:
+                    self._alarm_stop_event = None
+
+    async def _async_close_alarm_service(self, service) -> None:
+        """Share one close operation across runner cancellation and client teardown."""
+        task = self._alarm_close_task
+        if task is None or self._alarm_closing_service is not service:
+            task = asyncio.create_task(service.close(), name="ring-alarm-close")
+            self._alarm_close_task = task
+            self._alarm_closing_service = service
+        try:
+            await asyncio.shield(task)
+        finally:
+            if task.done() and self._alarm_close_task is task:
+                self._alarm_close_task = None
+                self._alarm_closing_service = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -652,6 +905,98 @@ class RingClient:
         if self._ring is None:
             return []
         return list(self._ring.devices().all_devices)
+
+    def get_alarm_snapshot(self) -> AlarmAccountSnapshot:
+        """Return the latest immutable Ring Alarm account snapshot."""
+        with self._alarm_snapshot_lock:
+            return self._alarm_snapshot
+
+    def _initialize_alarm_generation(self, generation: int) -> None:
+        with self._alarm_snapshot_lock:
+            self._alarm_snapshot = empty_alarm_snapshot(generation)
+
+    def _invalidate_alarm_state(self, generation: int) -> None:
+        self._initialize_alarm_generation(generation)
+        self._alarm_callbacks.clear()
+
+    def _publish_alarm_error(self, generation: int) -> None:
+        with self._alarm_snapshot_lock:
+            current = self._alarm_snapshot
+        locations = (
+            tuple(
+                replace(
+                    location,
+                    can_set_mode=False,
+                    command_unavailable_reason="service-failed",
+                )
+                for location in current.locations
+            )
+            if current.generation == generation
+            else ()
+        )
+        revision = current.revision + 1 if current.generation == generation else 1
+        self._on_alarm_snapshot(
+            AlarmAccountSnapshot(
+                generation=generation,
+                revision=revision,
+                status=AlarmServiceStatus.ERROR,
+                locations=locations,
+                updated_at=time.time(),
+                error_code="service-failed",
+            )
+        )
+
+    def add_alarm_callback(self, callback) -> None:
+        """Register a GTK-thread callback for immutable Alarm snapshots."""
+        if callback not in self._alarm_callbacks:
+            self._alarm_callbacks.append(callback)
+
+    def remove_alarm_callback(self, callback) -> None:
+        """Remove a previously registered Alarm snapshot callback."""
+        with contextlib.suppress(ValueError):
+            self._alarm_callbacks.remove(callback)
+
+    def request_alarm_mode(
+        self,
+        location_id: str,
+        target: AlarmMode,
+        *,
+        expected_revision: int,
+        bypass_ids: Iterable[str] = (),
+    ) -> concurrent.futures.Future[AlarmCommandResult]:
+        """Submit one confirmed Alarm mode request without blocking GTK."""
+        return self.submit(
+            self._async_request_alarm_mode(
+                location_id,
+                target,
+                expected_revision=expected_revision,
+                bypass_ids=bypass_ids,
+            )
+        )
+
+    async def _async_request_alarm_mode(
+        self,
+        location_id: str,
+        target: AlarmMode,
+        *,
+        expected_revision: int,
+        bypass_ids: Iterable[str],
+    ) -> AlarmCommandResult:
+        generation = self._published_generation
+        if not _is_active_client_generation(self, generation):
+            raise SessionSupersededError("Ring session was superseded before Alarm command")
+        service = self._alarm_service
+        if service is None:
+            raise RuntimeError("Ring Alarm service is not running")
+        result = await service.request_mode(
+            location_id,
+            target,
+            bypass_zids=bypass_ids,
+            expected_revision=expected_revision,
+        )
+        if not _is_active_client_generation(self, generation):
+            raise SessionSupersededError("Ring session was superseded during Alarm command")
+        return result
 
     def refresh_devices(
         self,
@@ -672,6 +1017,7 @@ class RingClient:
         if time.monotonic() - self._last_device_update_at > max_age_seconds:
             await self._ring.async_update_data()
             self._last_device_update_at = time.monotonic()
+            await self._async_reconcile_alarm_discovery()
         devices = list(self._ring.devices().all_devices)
         if families is None:
             return devices
@@ -951,14 +1297,19 @@ class RingClient:
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Start the real-time FCM event listener (non-blocking)."""
+        """Start independent camera-event and Alarm services without blocking."""
         if self._ring is None:
             return
-        if self._listener_future is not None and not self._listener_future.done():
-            return
         self._stop_event.clear()
-        self._listener_future = self.submit(self._async_listen())
-        _log.debug("FCM listener task submitted")
+        if self._listener_future is None or self._listener_future.done():
+            self._listener_future = self.submit(self._async_listen())
+            _log.debug("FCM listener task submitted")
+        generation = self._published_generation
+        if _is_active_client_generation(self, generation) and (
+            self._alarm_future is None or self._alarm_future.done()
+        ):
+            self._alarm_future = self.submit(self._async_run_alarm(generation))
+            _log.debug("Ring Alarm task submitted")
 
     def stop(self) -> None:
         """Stop the listener, close the ring auth session, shut down the loop."""
@@ -966,18 +1317,14 @@ class RingClient:
             self._stopped = True
         self._stop_event.set()
         self._retire_event_listener_revision()
-        future = self._listener_future
+        self._signal_alarm_stop()
+        alarm_future = self._alarm_future
+        self._alarm_future = None
+        listener_future = self._listener_future
         self._listener_future = None
 
-        if future and not future.done():
-            try:
-                future.result(timeout=_LISTENER_STOP_TIMEOUT)
-            except concurrent.futures.TimeoutError:
-                future.cancel()
-                with contextlib.suppress(Exception):
-                    future.result(timeout=1)
-            except Exception as exc:
-                _log.debug("FCM listener stopped with error: %s", exc)
+        self._wait_for_background_future(alarm_future, _ALARM_STOP_TIMEOUT, "Ring Alarm")
+        self._wait_for_background_future(listener_future, _LISTENER_STOP_TIMEOUT, "FCM listener")
 
         # Hold the loop lock so a concurrent _ensure_loop() can't race the
         # teardown (read/replace self._loop/_loop_thread) and spawn an orphan loop.
@@ -1002,8 +1349,51 @@ class RingClient:
             self._loop = None
             self._loop_thread = None
 
+    def _signal_alarm_stop(self) -> None:
+        stop_event = self._alarm_stop_event
+        loop = self._loop
+        if stop_event is None or loop is None or loop.is_closed() or not loop.is_running():
+            return
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(stop_event.set)
+
+    @staticmethod
+    def _wait_for_background_future(
+        future: concurrent.futures.Future | None,
+        timeout: float,
+        label: str,
+    ) -> None:
+        if future is None:
+            return
+        if future.done():
+            try:
+                future.result()
+            except concurrent.futures.CancelledError:
+                pass
+            except Exception as exc:
+                _log.debug("%s stopped with error (%s)", label, type(exc).__name__)
+            return
+        try:
+            future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            with contextlib.suppress(Exception):
+                future.result(timeout=1)
+        except Exception as exc:
+            _log.debug("%s stopped with error (%s)", label, type(exc).__name__)
+
     async def _async_close(self) -> None:
-        """Close the ring auth session (which owns the aiohttp ClientSession)."""
+        """Close Alarm transports before the Ring Auth-owned HTTP session."""
+        service = self._alarm_service
+        self._alarm_service = None
+        self._alarm_stop_event = None
+        if service is None:
+            service = self._alarm_closing_service
+        if service is not None:
+            try:
+                await self._async_close_alarm_service(service)
+            except Exception as exc:
+                _log.debug("Ring Alarm close failed (%s)", type(exc).__name__)
         ring = self._ring
         self._authenticated = False
         self._ring = None
@@ -1163,6 +1553,31 @@ class RingClient:
         if name == "STOPPED":
             return LISTENER_OFFLINE
         return LISTENER_CONNECTING
+
+    def _on_alarm_snapshot(self, snapshot: AlarmAccountSnapshot) -> None:
+        """Receive an Alarm snapshot on the asyncio thread and marshal it to GTK."""
+        from gi.repository import GLib
+
+        generation = self._published_generation
+        if snapshot.generation != generation or not _is_active_client_generation(self, generation):
+            return
+        with self._alarm_snapshot_lock:
+            self._alarm_snapshot = snapshot
+        GLib.idle_add(self._dispatch_alarm_snapshot, snapshot, generation)
+
+    def _dispatch_alarm_snapshot(
+        self,
+        snapshot: AlarmAccountSnapshot,
+        generation: int,
+    ) -> bool:
+        if snapshot.generation != generation or not _is_active_client_generation(self, generation):
+            return False
+        for callback in list(self._alarm_callbacks):
+            try:
+                callback(snapshot)
+            except Exception as exc:
+                _log.debug("Alarm snapshot callback error (%s)", type(exc).__name__)
+        return False
 
     def add_event_callback(self, callback) -> None:
         """Register a callable to be invoked (on the GTK main thread) for every FCM event."""

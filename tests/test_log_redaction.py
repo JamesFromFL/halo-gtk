@@ -13,6 +13,18 @@ def test_redact_text_removes_url_credentials_query_and_fragment():
     assert redacted == "open https://[2001:db8::1]:443/video?<redacted>#<redacted> now"
 
 
+def test_redact_text_removes_alarm_websocket_credentials():
+    redacted = redact_text(
+        "connect wss://alarm.example.test/ws?authcode=socket-secret "
+        '{"ticket": "ticket-secret", "authcode": "auth-secret"}'
+    )
+
+    assert "socket-secret" not in redacted
+    assert "ticket-secret" not in redacted
+    assert "auth-secret" not in redacted
+    assert redacted.count("<redacted>") == 3
+
+
 def test_redact_text_removes_common_token_fields():
     redacted = redact_text(
         """{"access_token": "access-secret", "client_secret": "client-secret"} """

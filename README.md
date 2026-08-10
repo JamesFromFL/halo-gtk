@@ -27,6 +27,31 @@ well as standard system icons.
 - Device loading for Ring cameras, doorbells, chimes, and other discovered Ring devices.
 - Firebase Cloud Messaging listener for live Ring events.
 
+### Ring Alarm Backend (Experimental)
+
+- Uses the existing Halo Ring login, hardware identity, OAuth session, and rotating token owner;
+  Alarm does not create a second account session or require a Node helper.
+- Runs an independent, native per-location Alarm WebSocket transport without changing the
+  established camera, history, notification, or media paths.
+- Publishes immutable, revisioned location, hub, security-panel, and sensor snapshots with
+  explicit connection, inventory, stale, unknown, transition, and alarm states.
+- Normalizes contact, motion, glass-break, tilt, flood/freeze, smoke/CO, retrofit, power,
+  tamper, battery, lock, switch, valve, and unknown device data when Ring reports it.
+- Provides a conservative backend request API for Disarmed, Home, and Away modes. Requests
+  require current owner authorization, a fresh online panel, an expected state revision, and
+  explicit confirmation of any bypass set; success is reported only after Ring publishes the
+  requested panel state.
+- Keeps Alarm tickets and raw protocol frames in memory only. It does not persist Alarm state
+  or send Alarm notifications yet.
+
+The reserved Alarm page is intentionally not connected to this backend yet. The implementation
+uses Ring's undocumented CLAP interfaces and has only been exercised with bounded synthetic
+fixtures. Live read-only inventory comparison must be completed before live mode-control testing.
+Halo is not an emergency-monitoring interface, and the backend intentionally exposes no panic,
+dispatch, Alarm siren, lock, switch, schedule, or device-configuration commands. Protocol behavior
+was independently implemented against the pinned
+[`ring-client-api` reference](https://github.com/koush/ring/tree/516e96a24ec279168c246795e623b6bfdf58ec45/packages/ring-client-api).
+
 ### Dashboard
 
 - Account summary and loaded Ring device status.
@@ -145,6 +170,7 @@ Halo supports Python 3.11 through 3.14. Python dependencies are locked with
 `uv` 0.11.24:
 
 - `ring-doorbell` for Ring API access
+- `aiohttp` for the isolated Ring Alarm WebSocket transport
 - `aiortc` for WebRTC live streams
 - `av` and `numpy` for video frame handling
 - `Pillow` for snapshots, overlays, and screenshots
@@ -220,7 +246,8 @@ These folders can be changed in Halo Settings.
 
 ## Planned Features
 
-- Full Ring Alarm state monitoring and arm/disarm controls.
+- Connect the experimental Ring Alarm backend to the reserved Alarm page after controlled
+  read-only and mode-control validation with owned hardware.
 - Expanded support for non-camera Ring devices such as chimes and sensors.
 - More camera settings as Ring exposes them through `ring-doorbell`.
 - Direct PipeWire capture/export mode for using live camera output in tools such as OBS
