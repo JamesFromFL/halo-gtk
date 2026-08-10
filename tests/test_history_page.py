@@ -147,6 +147,7 @@ def test_page_hidden_stops_playback_and_invalidates_pending_load():
         _history_loading=True,
         _pending_event_id=42,
         _player=player,
+        _nav_split=SimpleNamespace(set_show_content=lambda value: loaded.append(("list", value))),
     )
 
     HistoryPage.on_page_hidden(page)
@@ -154,7 +155,7 @@ def test_page_hidden_stops_playback_and_invalidates_pending_load():
     HistoryPage._show_fetch_error(page, "stale error", 3)
 
     assert stopped == [True]
-    assert loaded == []
+    assert loaded == [("list", False)]
     assert page._history_request_generation == 4
     assert page._playback_request_generation == 8
     assert page._history_loading is False

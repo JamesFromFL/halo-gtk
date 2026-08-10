@@ -89,3 +89,40 @@ def test_rejected_refresh_does_not_logout_a_replacement_client(monkeypatch):
             False,
         )
     ]
+
+
+def test_grid_density_selection_is_persisted_and_refreshes_the_main_window(monkeypatch):
+    page = SettingsPage.__new__(SettingsPage)
+    page._refreshing = False
+    refreshed = []
+    saved = []
+    page._refresh_main_window = lambda: refreshed.append(True)
+    monkeypatch.setattr(settings_page._config, "load", lambda: {"show_notifications": True})
+    monkeypatch.setattr(settings_page._config, "save", lambda cfg: saved.append(cfg))
+
+    class Combo:
+        @staticmethod
+        def get_selected():
+            return 1
+
+    page._on_grid_density_selected(Combo(), None)
+
+    assert saved == [
+        {
+            "show_notifications": True,
+            "camera_grid_density_preset": "dense",
+        }
+    ]
+    assert refreshed == [True]
+
+
+def test_refreshing_six_stream_switch_does_not_refresh_main_window():
+    page = SettingsPage.__new__(SettingsPage)
+    page._refreshing = True
+    refreshed = []
+    page._save_bool_setting = lambda *_args: refreshed.append("saved")
+    page._refresh_main_window = lambda: refreshed.append("refreshed")
+
+    page._on_live_monitoring_allow_six_toggled(object(), None)
+
+    assert refreshed == []

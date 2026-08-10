@@ -12,15 +12,10 @@ import gi
 gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import Adw, Gdk, GdkPixbuf, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, GdkPixbuf, GLib, Gtk, Pango  # noqa: E402
 
 from halo_gtk import config as _cfg  # noqa: E402
-from halo_gtk import (  # noqa: E402
-    device_commands,
-    device_names,
-    live_layouts,
-    theme_icons,
-)
+from halo_gtk import device_commands, device_names, live_layouts  # noqa: E402
 from halo_gtk.camera_settings import CameraSettingsWindow  # noqa: E402
 from halo_gtk.live_sessions import (  # noqa: E402
     LIVE_MONITORING_OWNER,
@@ -54,18 +49,34 @@ _MOTION_OFF_MAX_WIDTH_RATIO = 0.86
 _MOTION_OFF_MAX_HEIGHT_RATIO = 0.26
 _MOTION_OFF_STROKE_RATIO = 0.035
 
-# Size mode → tiles per row.
-_SIZE_MODES: dict[str, int] = {
-    "small": 4,
-    "medium": 2,
-    "large": 1,
+# Density presets intentionally keep the persisted size names semantic. Saved
+# layouts therefore remain compatible when users choose a denser camera wall.
+_DENSITY_PRESETS: dict[str, dict[str, int]] = {
+    "balanced": {"small": 4, "medium": 2, "large": 1},
+    "dense": {"small": 5, "medium": 3, "large": 2},
 }
+_SIZE_MODES = _DENSITY_PRESETS["balanced"]
 _DEFAULT_LIVE_MONITORING_MAX_STREAMS = 4
 _EXPERIMENTAL_LIVE_MONITORING_MAX_STREAMS = 6
 _MAX_EXCEEDED_TOOLTIP = "Exceeded Camera Maximum for Live Monitoring"
 
 # Module-level drag state — safe for same-process DnD.
 _dnd_src_id: int | None = None
+
+
+def _density_columns(mode: str) -> int:
+    preset = str(_cfg.load().get("camera_grid_density_preset", "balanced"))
+    columns = _DENSITY_PRESETS.get(preset, _DENSITY_PRESETS["balanced"])
+    return columns.get(mode, columns["medium"])
+
+
+def _safe_device_text(device, attribute: str, fallback: str) -> str:
+    try:
+        value = getattr(device, attribute)
+    except Exception:
+        return fallback
+    text = str(value or "").strip()
+    return text or fallback
 
 
 def _reorder_ids(order: list[int], available_ids: set[int], src_id: int, dst_id: int) -> list[int]:
@@ -309,6 +320,7 @@ class CameraTile(Gtk.Frame):
         live_monitoring: bool = False,
         on_light_toggle=None,
         on_siren_toggle=None,
+        on_stream_status_changed=None,
     ) -> None:
         super().__init__()
         self.device = device
@@ -320,14 +332,21 @@ class CameraTile(Gtk.Frame):
         self._intercom_supported = live_monitoring and supports_ring_camera_intercom(device)
         self._on_light_toggle = on_light_toggle
         self._on_siren_toggle = on_siren_toggle
+        self._on_stream_status_changed = on_stream_status_changed
         self._native_w = _DEFAULT_NATIVE_W
         self._native_h = _DEFAULT_NATIVE_H
         self._size_mode = "medium"
         self._live_session = None
         self._live_active = False
+        self._stream_start_failed = False
         self._volume = 0.0
         self._previous_volume = 1.0
         self.set_focusable(True)
+        self.set_accessible_role(Gtk.AccessibleRole.BUTTON)
+        self.update_property(
+            [Gtk.AccessibleProperty.LABEL],
+            [f"Open {device_names.display_name(device)}"],
+        )
         self.set_hexpand(True)
         self.set_vexpand(False)
         self.set_halign(Gtk.Align.FILL)
@@ -340,88 +359,140 @@ class CameraTile(Gtk.Frame):
         self._timer_source_id: int | None = None
 
         self.add_css_class("card")
+        self.add_css_class("camera-tile")
+        self.set_overflow(Gtk.Overflow.HIDDEN)
 
-        # Inner box — 5px padding on all sides.
-        box = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL,
-            spacing=5,
-            margin_top=5,
-            margin_bottom=5,
-            margin_start=5,
-            margin_end=5,
-        )
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.set_child(box)
-
-        # Camera name and status strip.
-        name_row = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL,
-            spacing=6,
-            halign=Gtk.Align.FILL,
-        )
-        box.append(name_row)
-
-        status_box = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL,
-            spacing=6,
-            width_request=50,
-            valign=Gtk.Align.CENTER,
-        )
-        name_row.append(status_box)
-
-        self._network_icon = Gtk.Image(pixel_size=22, valign=Gtk.Align.CENTER)
-        status_box.append(self._network_icon)
-        self._power_icon = Gtk.Image(pixel_size=22, valign=Gtk.Align.CENTER)
-        status_box.append(self._power_icon)
-
-        # Camera name label, centered.
-        self._name_label = Gtk.Label(
-            label=device_names.display_name(device),
-            halign=Gtk.Align.CENTER,
-            hexpand=True,
-            ellipsize=3,  # PANGO_ELLIPSIZE_END
-            css_classes=["heading"],
-        )
-        name_row.append(self._name_label)
-
-        info_box = Gtk.Box(width_request=50, halign=Gtk.Align.END)
-        self._settings_btn = Gtk.Button(
-            icon_name="preferences-system-symbolic",
-            tooltip_text="Camera Settings",
-            css_classes=["flat"],
-            valign=Gtk.Align.CENTER,
-        )
-        self._settings_btn.connect("clicked", self._on_settings_clicked)
-        info_box.append(self._settings_btn)
-        name_row.append(info_box)
-        self._update_power_status()
-        self._update_network_status()
 
         # AspectBox enforces the tile height via GTK4 measure().
         # The Gtk.Picture lives inside AspectBox, not directly in the tree.
         self.aspect_box = AspectBox()
+        self.aspect_box.add_css_class("camera-picture")
 
         # Timer badge floats over the aspect_box.
         self._timer_label = Gtk.Label(
             css_classes=["caption", "numeric", "snapshot-timer"],
             halign=Gtk.Align.START,
             valign=Gtk.Align.END,
-            margin_start=4,
-            margin_bottom=4,
+            margin_start=8,
+            margin_bottom=8,
             visible=False,
         )
         self._timer_label.get_style_context().add_provider(
             _get_timer_css_provider(), Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
-        picture_overlay = Gtk.Overlay()
-        picture_overlay.set_hexpand(True)
+        picture_overlay = Gtk.Overlay(hexpand=True)
         picture_overlay.set_child(self.aspect_box)
         picture_overlay.add_overlay(self._timer_label)
         self._live_container = Gtk.Box(hexpand=True, vexpand=True, visible=False)
         picture_overlay.add_overlay(self._live_container)
+
+        self._stream_state_box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=5,
+            halign=Gtk.Align.START,
+            valign=Gtk.Align.START,
+            margin_top=8,
+            margin_start=8,
+            visible=self._live_monitoring,
+        )
+        self._stream_state_box.add_css_class("camera-overlay")
+        self._stream_state_icon = Gtk.Image.new_from_icon_name("media-playback-stop-symbolic")
+        self._stream_state_label = Gtk.Label(
+            label="Stream stopped",
+            ellipsize=Pango.EllipsizeMode.END,
+        )
+        self._stream_state_box.append(self._stream_state_icon)
+        self._stream_state_box.append(self._stream_state_label)
+        picture_overlay.add_overlay(self._stream_state_box)
         box.append(picture_overlay)
 
+        footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9)
+        footer.add_css_class("camera-footer")
+        title_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        title_copy = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1, hexpand=True)
+        self._name_label = Gtk.Label(
+            label=device_names.display_name(device),
+            xalign=0,
+            ellipsize=Pango.EllipsizeMode.END,
+        )
+        self._name_label.add_css_class("camera-name")
+        self._model_label = Gtk.Label(
+            label=_safe_device_text(device, "model", "Ring camera"),
+            xalign=0,
+            ellipsize=Pango.EllipsizeMode.END,
+        )
+        self._model_label.add_css_class("dim-label")
+        title_copy.append(self._name_label)
+        title_copy.append(self._model_label)
+        title_row.append(title_copy)
+
+        if not self._live_monitoring:
+            self._settings_btn = Gtk.Button(
+                icon_name="preferences-system-symbolic",
+                tooltip_text="Camera Settings",
+                css_classes=["flat"],
+                valign=Gtk.Align.CENTER,
+            )
+            self._settings_btn.connect("clicked", self._on_settings_clicked)
+            title_row.append(self._settings_btn)
+            self._open_btn = Gtk.Button(
+                icon_name="view-fullscreen-symbolic",
+                tooltip_text="Open live view",
+                css_classes=["flat"],
+                valign=Gtk.Align.CENTER,
+            )
+            self._open_btn.connect("clicked", lambda *_args: self._on_activate(self.device))
+            title_row.append(self._open_btn)
+            self._next_icon = None
+        else:
+            self._settings_btn = None
+            self._open_btn = None
+            self._next_icon = Gtk.Image.new_from_icon_name("go-next-symbolic")
+            title_row.append(self._next_icon)
+        footer.append(title_row)
+
+        self._network_icon = Gtk.Image(pixel_size=16, valign=Gtk.Align.CENTER)
+        self._power_icon = Gtk.Image(pixel_size=16, valign=Gtk.Align.CENTER)
+        self._network_value = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self._power_value = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        motion_text = (
+            "Motion alerts on"
+            if getattr(device, "motion_detection", True)
+            else "Motion detection off"
+        )
+        self._motion_value = Gtk.Label(
+            label=motion_text,
+            xalign=0,
+            ellipsize=Pango.EllipsizeMode.END,
+        )
+        self._details_grid = Gtk.Grid(
+            column_spacing=14,
+            row_spacing=7,
+            column_homogeneous=True,
+            visible=not self._live_monitoring,
+        )
+        self._details_grid.add_css_class("camera-details")
+        self._details_grid.attach(
+            self._detail_item(self._power_icon, self._power_value), 0, 0, 1, 1
+        )
+        self._details_grid.attach(
+            self._detail_item(self._network_icon, self._network_value), 1, 0, 1, 1
+        )
+        motion_icon = Gtk.Image.new_from_icon_name("preferences-system-notifications-symbolic")
+        motion_icon.set_pixel_size(16)
+        motion_icon.add_css_class("dim-label")
+        self._details_grid.attach(self._detail_item(motion_icon, self._motion_value), 0, 1, 2, 1)
+        footer.append(self._details_grid)
+        box.append(footer)
+
+        self._update_power_status()
+        self._update_network_status()
         if self._live_monitoring:
-            box.append(self._build_live_monitoring_controls())
+            self._live_controls = self._build_live_monitoring_controls()
+        else:
+            self._live_controls = None
 
         # Start the 1-second tick; it is a no-op while the timer label is hidden.
         self._timer_source_id = GLib.timeout_add_seconds(1, self._update_timer)
@@ -436,6 +507,10 @@ class CameraTile(Gtk.Frame):
         click.connect("released", self._on_click_released)
         self.add_controller(click)
 
+        key = Gtk.EventControllerKey()
+        key.connect("key-pressed", self._on_key_pressed)
+        self.add_controller(key)
+
         # Drag source — set module-level ID so the drop target can read it.
         drag_src = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
         drag_src.connect("prepare", self._on_drag_prepare)
@@ -447,6 +522,22 @@ class CameraTile(Gtk.Frame):
         drop_tgt.connect("drop", self._on_drop)
         self.add_controller(drop_tgt)
 
+    @staticmethod
+    def _detail_item(icon: Gtk.Image, label: Gtk.Label) -> Gtk.Widget:
+        item = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        icon.add_css_class("dim-label")
+        item.append(icon)
+        label.set_hexpand(True)
+        item.append(label)
+        return item
+
+    def set_selected(self, selected: bool) -> None:
+        if selected:
+            self.add_css_class("selected")
+        else:
+            self.remove_css_class("selected")
+        self.update_state([Gtk.AccessibleState.SELECTED], [int(selected)])
+
     # ------------------------------------------------------------------
     # Ratio update — called by CamerasPage when mode or snapshot changes
     # ------------------------------------------------------------------
@@ -454,10 +545,23 @@ class CameraTile(Gtk.Frame):
     def update_ratio(self, mode: str) -> None:
         """Update the measured display box for the active size mode."""
         self._size_mode = mode
-        if mode in {"small", "medium"}:
+        if _density_columns(mode) > 1:
             self.aspect_box.set_ratio(_FIXED_TILE_H / _FIXED_TILE_W)
         else:
             self.aspect_box.set_ratio(self._native_h / self._native_w)
+        self._details_grid.set_visible(not self._live_monitoring and mode != "small")
+
+    def set_compact_presentation(self, compact: bool) -> None:
+        """Reduce tile chrome when the configured column count is physically tight."""
+        self._model_label.set_visible(not compact)
+        self._details_grid.set_visible(
+            not compact and not self._live_monitoring and self._size_mode != "small"
+        )
+        for button in (self._settings_btn, self._open_btn):
+            if button is not None:
+                button.set_visible(not compact)
+        if self._next_icon is not None:
+            self._next_icon.set_visible(not compact)
 
     # ------------------------------------------------------------------
     # Snapshot
@@ -492,6 +596,9 @@ class CameraTile(Gtk.Frame):
     # ------------------------------------------------------------------
 
     def _update_timer(self) -> bool:
+        if self._live_monitoring:
+            self._refresh_stream_state()
+            return GLib.SOURCE_CONTINUE
         if not self._timer_label.get_visible():
             return GLib.SOURCE_CONTINUE
         elapsed = int(time.monotonic() - self._snapshot_loaded_at)
@@ -513,32 +620,25 @@ class CameraTile(Gtk.Frame):
             GLib.source_remove(self._timer_source_id)
             self._timer_source_id = None
 
-    def refresh_theme_icons(self) -> None:
-        self._update_power_status()
-        self._update_network_status()
-        if self._live_monitoring and hasattr(self, "_light_icon"):
-            self._refresh_light_icon()
-
     def refresh_display_name(self) -> None:
-        self._name_label.set_label(device_names.display_name(self.device))
+        display_name = device_names.display_name(self.device)
+        self._name_label.set_label(display_name)
+        self.update_property(
+            [Gtk.AccessibleProperty.LABEL],
+            [f"Open {display_name}"],
+        )
 
     def _update_power_status(self) -> None:
         status = camera_power_status(self.device)
-        try:
-            texture = Gdk.Texture.new_from_filename(str(status.icon_path))
-            self._power_icon.set_from_paintable(texture)
-        except GLib.Error as exc:
-            _log.debug("Power icon load failed for %s: %s", self.device.name, exc)
+        self._power_icon.set_from_icon_name(status.icon_name)
         self._power_icon.set_tooltip_text(status.tooltip)
+        self._power_value.set_label(status.tooltip)
 
     def _update_network_status(self) -> None:
         status = camera_network_status(self.device)
-        try:
-            texture = Gdk.Texture.new_from_filename(str(status.icon_path))
-            self._network_icon.set_from_paintable(texture)
-        except GLib.Error as exc:
-            _log.debug("Network icon load failed for %s: %s", self.device.name, exc)
+        self._network_icon.set_from_icon_name(status.icon_name)
         self._network_icon.set_tooltip_text(status.tooltip)
+        self._network_value.set_label(status.tooltip)
 
     def _on_settings_clicked(self, *_):
         if self._on_camera_settings is not None:
@@ -553,14 +653,15 @@ class CameraTile(Gtk.Frame):
             orientation=Gtk.Orientation.HORIZONTAL,
             spacing=6,
             halign=Gtk.Align.FILL,
-            margin_top=2,
         )
 
-        self._mic_btn = Gtk.ToggleButton(
-            icon_name="audio-input-microphone-symbolic",
-            tooltip_text="Microphone",
-            css_classes=["flat"],
-        )
+        mic_content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        mic_content.set_halign(Gtk.Align.CENTER)
+        mic_content.append(Gtk.Image.new_from_icon_name("audio-input-microphone-symbolic"))
+        mic_content.append(Gtk.Label(label="Talk"))
+        self._mic_btn = Gtk.ToggleButton(child=mic_content, tooltip_text="Talk through camera")
+        self._mic_btn.add_css_class("command-button")
+        self._mic_btn.set_hexpand(True)
         self._mic_btn.set_sensitive(False)
         self._mic_btn.set_visible(self._intercom_supported)
         self._mic_btn.connect("toggled", self._on_mic_toggled)
@@ -582,16 +683,22 @@ class CameraTile(Gtk.Frame):
         self._volume_scale.set_size_request(70, -1)
         self._volume_scale.set_hexpand(True)
         self._volume_scale.set_sensitive(False)
+        self._volume_scale.update_property(
+            [Gtk.AccessibleProperty.LABEL],
+            ["Camera volume"],
+        )
         self._volume_scale.connect("value-changed", self._on_volume_changed)
         controls.append(self._volume_scale)
 
         if device_commands.has_capability(self.device, "light"):
-            self._light_btn = Gtk.ToggleButton(
-                tooltip_text="Light",
-                css_classes=["flat"],
-            )
+            light_content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+            light_content.set_halign(Gtk.Align.CENTER)
             self._light_icon = Gtk.Image(pixel_size=20)
-            self._light_btn.set_child(self._light_icon)
+            light_content.append(self._light_icon)
+            light_content.append(Gtk.Label(label="Light"))
+            self._light_btn = Gtk.ToggleButton(child=light_content, tooltip_text="Camera light")
+            self._light_btn.add_css_class("command-button")
+            self._light_btn.set_hexpand(True)
             self._light_btn.set_active(
                 device_commands.command_state.light_enabled(get_client(), self.device)
             )
@@ -602,13 +709,16 @@ class CameraTile(Gtk.Frame):
             self._light_btn = None
 
         if device_commands.has_capability(self.device, "siren"):
-            self._siren_btn = Gtk.Button(
-                tooltip_text="Siren",
-                css_classes=["flat"],
-            )
-            self._siren_icon = Gtk.Image(pixel_size=20)
-            self._siren_btn.set_child(self._siren_icon)
-            self._load_icon(self._siren_icon, theme_icons.icon_path("controls", "siren.png"))
+            siren_content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+            siren_content.set_halign(Gtk.Align.CENTER)
+            self._siren_icon = Gtk.Image.new_from_icon_name("alarm-symbolic")
+            self._siren_icon.set_pixel_size(20)
+            siren_content.append(self._siren_icon)
+            siren_content.append(Gtk.Label(label="Siren…"))
+            self._siren_btn = Gtk.Button(child=siren_content, tooltip_text="Camera siren")
+            self._siren_btn.add_css_class("command-button")
+            self._siren_btn.add_css_class("siren-button")
+            self._siren_btn.set_hexpand(True)
             self._siren_btn.connect("clicked", self._on_siren_clicked)
             controls.append(self._siren_btn)
         else:
@@ -616,9 +726,15 @@ class CameraTile(Gtk.Frame):
 
         return controls
 
-    def start_live_monitoring(self, volume: float = 0.0, *, max_streams: int | None = None) -> None:
-        if not self._live_monitoring or self._live_active:
-            return
+    def start_live_monitoring(self, volume: float = 0.0, *, max_streams: int | None = None) -> bool:
+        if not self._live_monitoring:
+            return False
+        if self._live_active:
+            session = get_live_session_manager().session_for(self.device.id)
+            if session is not None and session.active and LIVE_MONITORING_OWNER in session.owners:
+                return True
+            self._live_active = False
+        self._stream_start_failed = False
         self._set_volume_state(volume)
         try:
             self._live_session = get_live_session_manager().acquire(
@@ -631,10 +747,14 @@ class CameraTile(Gtk.Frame):
             raise
         except Exception as exc:
             _log.debug("Failed to start monitoring stream for %s: %s", self.device.name, exc)
-            return
+            self._stream_start_failed = True
+            self._set_stream_state("Stream failed", "dialog-error-symbolic", "offline")
+            return False
         self._live_session.attach_to(self._live_container)
         self._live_active = True
+        self._set_stream_state("Connecting", "media-record-symbolic", "live")
         self._set_stream_controls_sensitive(True)
+        return True
 
     def attach_existing_live_session(self) -> None:
         if self._live_session is None:
@@ -643,30 +763,42 @@ class CameraTile(Gtk.Frame):
                 self.mark_live_monitoring_stopped()
                 return
             self._live_session = session
+        self._set_volume_state(self._live_session.volume)
         self._live_session.attach_to(self._live_container)
         self._live_active = True
         self._live_container.set_visible(True)
+        self._set_stream_state("Live", "media-record-symbolic", "live")
         self._set_stream_controls_sensitive(True)
 
     def mark_live_monitoring_stopped(self) -> None:
-        if hasattr(self, "_mic_btn"):
-            self._mic_btn.handler_block_by_func(self._on_mic_toggled)
-            self._mic_btn.set_active(False)
-            self._mic_btn.handler_unblock_by_func(self._on_mic_toggled)
+        self.stop_talking()
+        self._stream_start_failed = False
         self._live_session = None
         self._live_container.set_visible(False)
         self._live_active = False
+        self._set_stream_state("Stream stopped", "media-playback-stop-symbolic", "snapshot")
         self._set_stream_controls_sensitive(False)
 
     def stop_live_monitoring(self) -> None:
         if not self._live_monitoring:
             return
-        if hasattr(self, "_mic_btn"):
-            self._mic_btn.handler_block_by_func(self._on_mic_toggled)
-            self._mic_btn.set_active(False)
-            self._mic_btn.handler_unblock_by_func(self._on_mic_toggled)
+        self.stop_talking()
         get_live_session_manager().release(self.device.id, owner=LIVE_MONITORING_OWNER)
         self.mark_live_monitoring_stopped()
+
+    def stop_talking(self) -> None:
+        """Stop talkback owned by this tile before its control is hidden or released."""
+        if not hasattr(self, "_mic_btn"):
+            return
+        was_active = self._mic_btn.get_active()
+        if was_active and self._live_session is not None:
+            try:
+                self._live_session.stop_talking()
+            except Exception as exc:
+                _log.debug("Failed to stop camera talkback: %s", exc)
+        self._mic_btn.handler_block_by_func(self._on_mic_toggled)
+        self._mic_btn.set_active(False)
+        self._mic_btn.handler_unblock_by_func(self._on_mic_toggled)
 
     def _set_stream_controls_sensitive(self, sensitive: bool) -> None:
         if not hasattr(self, "_mic_btn"):
@@ -738,19 +870,45 @@ class CameraTile(Gtk.Frame):
     def _refresh_light_icon(self) -> None:
         if not hasattr(self, "_light_icon"):
             return
-        path = (
-            theme_icons.icon_path("controls", "light-on.png")
-            if self._light_btn.get_active()
-            else theme_icons.themed_icon_path("controls", "light-off")
+        self._light_icon.set_from_icon_name("display-brightness-symbolic")
+        self._light_btn.set_tooltip_text(
+            "Turn camera light off" if self._light_btn.get_active() else "Turn camera light on"
         )
-        self._load_icon(self._light_icon, path)
 
-    @staticmethod
-    def _load_icon(widget: Gtk.Image, path) -> None:
-        try:
-            widget.set_from_paintable(Gdk.Texture.new_from_filename(str(path)))
-        except GLib.Error as exc:
-            _log.debug("Control icon load failed for %s: %s", path, exc)
+    def _set_stream_state(self, label: str, icon_name: str, style: str) -> None:
+        changed = self._stream_state_label.get_label() != label
+        self._stream_state_label.set_label(label)
+        self._stream_state_icon.set_from_icon_name(icon_name)
+        for css_class in ("state-live", "state-snapshot", "state-offline"):
+            self._stream_state_box.remove_css_class(css_class)
+        self._stream_state_box.add_css_class(f"state-{style}")
+        if changed and self._on_stream_status_changed is not None:
+            self._on_stream_status_changed(self.device, label)
+
+    def _refresh_stream_state(self) -> None:
+        session = get_live_session_manager().session_for(self.device.id)
+        owned = session is not None and LIVE_MONITORING_OWNER in session.owners
+        if owned and session.active:
+            state = getattr(session.state, "value", str(session.state))
+            if state == "active":
+                self._set_stream_state("Live", "media-record-symbolic", "live")
+            else:
+                self._set_stream_state("Connecting", "media-record-symbolic", "live")
+        elif owned:
+            self.stop_talking()
+            self._live_active = False
+            self._set_stream_controls_sensitive(False)
+            self._set_stream_state("Stream unavailable", "dialog-error-symbolic", "offline")
+        elif self._stream_start_failed:
+            self.stop_talking()
+            self._live_active = False
+            self._set_stream_controls_sensitive(False)
+            self._set_stream_state("Stream failed", "dialog-error-symbolic", "offline")
+        else:
+            self.stop_talking()
+            self._live_active = False
+            self._set_stream_controls_sensitive(False)
+            self._set_stream_state("Stream stopped", "media-playback-stop-symbolic", "snapshot")
 
     # ------------------------------------------------------------------
     # Drag source
@@ -788,6 +946,13 @@ class CameraTile(Gtk.Frame):
         if n_press == 1 and not self._is_layout_editing():
             self._on_activate(self.device)
 
+    def _on_key_pressed(self, _controller, keyval: int, _keycode: int, _state) -> bool:
+        if keyval in {Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_space}:
+            if not self._is_layout_editing():
+                self._on_activate(self.device)
+            return True
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Cameras page
@@ -801,12 +966,14 @@ class CamerasPage(Gtk.Box):
         self,
         on_open_live_focus,
         *,
+        on_open_history=None,
         show_monitoring_controls: bool = False,
         grid_size_config_key: str = "camera_grid_size",
         camera_order_config_key: str = "camera_order",
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, hexpand=True, vexpand=True)
         self._on_open_live_focus = on_open_live_focus
+        self._on_open_history = on_open_history
         self._show_monitoring_controls = show_monitoring_controls
         self._grid_size_config_key = grid_size_config_key
         self._camera_order_config_key = camera_order_config_key
@@ -828,6 +995,7 @@ class CamerasPage(Gtk.Box):
         self._layout_editing = False
         self._monitoring_active = False
         self._active_monitoring_stream_ids: set[int] = set()
+        self._selected_device_id: int | None = None
 
         cfg = _cfg.load()
         default_size = (
@@ -841,17 +1009,12 @@ class CamerasPage(Gtk.Box):
         self._layout_records: list[dict] = []
         self._current_saved_layout_id: str | None = None
         self._current_layout_label = live_layouts.DEFAULT_LAYOUT_NAME
-        self._theme_handler_id: int | None = None
-
         self._build_ui()
-        self._theme_handler_id = theme_icons.connect_theme_changed(self._refresh_theme_icons)
 
     def do_unroot(self) -> None:
         self.stop_live_monitoring()
         self.deactivate_snapshot_updates()
         self._clear_grid()
-        theme_icons.disconnect_theme_changed(self._theme_handler_id)
-        self._theme_handler_id = None
         Gtk.Box.do_unroot(self)
 
     # ------------------------------------------------------------------
@@ -861,135 +1024,48 @@ class CamerasPage(Gtk.Box):
     def _build_ui(self) -> None:
         grid_box = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
+            spacing=14,
             hexpand=True,
             vexpand=True,
         )
-        self.append(grid_box)
-
-        toolbar = Gtk.CenterBox(
-            margin_top=6,
-            margin_bottom=6,
-            margin_start=12,
-            margin_end=12,
-        )
-        grid_box.append(toolbar)
+        if self._show_monitoring_controls:
+            grid_box.add_css_class("monitor-canvas")
+            grid_box.set_margin_top(18)
+            grid_box.set_margin_bottom(18)
+            grid_box.set_margin_start(20)
+            grid_box.set_margin_end(20)
 
         if self._show_monitoring_controls:
-            layout_box = Gtk.Box(
+            title_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            self._layout_status_label = Gtk.Label(
+                label="Default layout",
+                xalign=0,
+                hexpand=True,
+            )
+            self._layout_status_label.add_css_class("heading")
+            self._layout_status_label.add_css_class("dim-label")
+            title_row.append(self._layout_status_label)
+            self._inspector_toggle = Gtk.ToggleButton(
+                icon_name="sidebar-show-right-symbolic",
+                tooltip_text="Show selected camera",
+                active=True,
+            )
+            self._inspector_toggle.add_css_class("flat")
+            self._inspector_toggle.connect("toggled", self._on_inspector_toggled)
+            title_row.append(self._inspector_toggle)
+            grid_box.append(title_row)
+            grid_box.append(self._build_monitoring_toolbar())
+        else:
+            toolbar = Gtk.Box(
                 orientation=Gtk.Orientation.HORIZONTAL,
-                spacing=6,
-                halign=Gtk.Align.START,
+                spacing=8,
+                halign=Gtk.Align.END,
             )
-            self._layout_menu_box = Gtk.Box(
-                orientation=Gtk.Orientation.VERTICAL,
-                spacing=2,
-                margin_top=8,
-                margin_bottom=8,
-                margin_start=8,
-                margin_end=8,
-            )
-            self._layout_popover = Gtk.Popover()
-            self._layout_popover.set_child(self._layout_menu_box)
-            self._layout_select_btn = Gtk.MenuButton(
-                label=live_layouts.DEFAULT_LAYOUT_NAME,
-                tooltip_text="Choose saved layout",
-                popover=self._layout_popover,
-            )
-            layout_box.append(self._layout_select_btn)
-
-            self._save_layout_btn = Gtk.Button(
-                icon_name="document-save-symbolic",
-                tooltip_text="Save Current Layout",
-            )
-            self._save_layout_btn.connect("clicked", self._on_save_live_layout)
-            layout_box.append(self._save_layout_btn)
-
-            self._rename_layout_btn = Gtk.Button(
-                icon_name="document-edit-symbolic",
-                tooltip_text="Rename Saved Layout",
-                visible=False,
-            )
-            self._rename_layout_btn.connect("clicked", self._on_rename_live_layout)
-            layout_box.append(self._rename_layout_btn)
-
-            self._delete_layout_btn = Gtk.Button(
-                icon_name="user-trash-symbolic",
-                tooltip_text="Delete Saved Layout",
-                visible=False,
-            )
-            self._delete_layout_btn.connect("clicked", self._on_delete_live_layout)
-            layout_box.append(self._delete_layout_btn)
-            toolbar.set_start_widget(layout_box)
-
-            play_box = Gtk.Box(css_classes=["linked"], spacing=0)
-            self._play_btn = Gtk.Button(
-                icon_name="media-playback-start-symbolic",
-                tooltip_text="Start live monitoring",
-            )
-            self._play_btn.connect("clicked", self._on_monitoring_play)
-            play_box.append(self._play_btn)
-
-            self._stop_btn = Gtk.Button(
-                icon_name="media-playback-stop-symbolic",
-                tooltip_text="Stop live monitoring",
-                sensitive=False,
-            )
-            self._stop_btn.connect("clicked", self._on_monitoring_stop)
-            play_box.append(self._stop_btn)
-            toolbar.set_center_widget(play_box)
-
-        size_box = Gtk.Box(css_classes=["linked"], spacing=0)
-        self._size_btns: dict[str, Gtk.ToggleButton] = {}
-        first_btn = None
-        for mode, label, tip in [
-            ("small", "S", "Small tiles — 4 per row"),
-            ("medium", "M", "Medium tiles — 2 per row"),
-            ("large", "L", "Large tiles — 1 per row, full width"),
-        ]:
-            btn = Gtk.ToggleButton(label=label, tooltip_text=tip)
-            if first_btn is None:
-                first_btn = btn
-            else:
-                btn.set_group(first_btn)
-            btn.set_active(mode == self._size_mode)
-            btn.connect("toggled", self._on_size_toggled, mode)
-            size_box.append(btn)
-            self._size_btns[mode] = btn
-
-        self._layout_btn = Gtk.ToggleButton(
-            icon_name="view-grid-symbolic",
-            tooltip_text="Edit camera layout",
-        )
-        self._layout_btn.connect("toggled", self._on_layout_toggled)
-
-        right_controls = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL,
-            spacing=8,
-            halign=Gtk.Align.END,
-        )
-        if self._show_monitoring_controls:
-            self._camera_filter_box = Gtk.Box(
-                orientation=Gtk.Orientation.VERTICAL,
-                spacing=2,
-                margin_top=8,
-                margin_bottom=8,
-                margin_start=8,
-                margin_end=8,
-            )
-            filter_popover = Gtk.Popover()
-            filter_popover.set_child(self._camera_filter_box)
-            self._camera_filter_btn = Gtk.MenuButton(
-                label="Cameras",
-                icon_name="camera-video-symbolic",
-                tooltip_text="Choose cameras to display",
-                popover=filter_popover,
-            )
-            right_controls.append(self._camera_filter_btn)
-
-        right_controls.append(size_box)
-        right_controls.append(self._layout_btn)
-        toolbar.set_end_widget(right_controls)
-        grid_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+            toolbar.append(Gtk.Label(label="Density", css_classes=["dim-label"]))
+            toolbar.append(self._build_density_controls())
+            self._layout_btn = self._build_reorder_button()
+            toolbar.append(self._layout_btn)
+            grid_box.append(toolbar)
 
         self._status_page = Adw.StatusPage(
             icon_name="camera-video-symbolic",
@@ -1000,29 +1076,418 @@ class CamerasPage(Gtk.Box):
         self._status_page.set_visible(True)
         grid_box.append(self._status_page)
 
-        scroll = Gtk.ScrolledWindow(
+        self._scroll = Gtk.ScrolledWindow(
             vexpand=True,
             visible=False,
             hscrollbar_policy=Gtk.PolicyType.NEVER,
             vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
         )
-        grid_box.append(scroll)
-        self._scroll = scroll
+        grid_box.append(self._scroll)
 
         self._grid = Gtk.Grid(
-            column_spacing=5,
-            row_spacing=5,
-            margin_top=5,
-            margin_bottom=5,
-            margin_start=5,
-            margin_end=5,
+            column_spacing=16,
+            row_spacing=16,
+            margin_top=2,
+            margin_bottom=2,
+            margin_start=2,
+            margin_end=2,
             hexpand=True,
             vexpand=False,
             halign=Gtk.Align.FILL,
             valign=Gtk.Align.START,
         )
+        self._grid.add_css_class("camera-grid")
         self._apply_size_mode_layout(self._size_mode)
-        scroll.set_child(self._grid)
+        self._scroll.set_child(self._grid)
+
+        if not self._show_monitoring_controls:
+            self.append(grid_box)
+            return
+
+        self._monitor_split = Adw.OverlaySplitView(
+            hexpand=True,
+            vexpand=True,
+            sidebar_position=Gtk.PackType.END,
+            min_sidebar_width=320,
+            max_sidebar_width=380,
+            sidebar_width_fraction=0.31,
+            collapsed=False,
+            show_sidebar=True,
+        )
+        self._monitor_split.set_content(grid_box)
+        self._monitor_split.set_sidebar(self._build_monitoring_inspector())
+        self._monitor_split.connect("notify::show-sidebar", self._sync_inspector_toggle)
+        self.append(self._monitor_split)
+
+    @property
+    def inspector_split_view(self) -> Adw.OverlaySplitView | None:
+        return getattr(self, "_monitor_split", None)
+
+    def _build_density_controls(self) -> Gtk.Widget:
+        size_box = Gtk.Box(css_classes=["linked"], spacing=0)
+        self._size_btns: dict[str, Gtk.ToggleButton] = {}
+        first_btn = None
+        for mode, label in (("small", "S"), ("medium", "M"), ("large", "L")):
+            columns = _density_columns(mode)
+            noun = "camera" if columns == 1 else "cameras"
+            btn = Gtk.ToggleButton(
+                label=label,
+                tooltip_text=f"{mode.title()} - {columns} {noun} per row",
+            )
+            btn.update_property(
+                [Gtk.AccessibleProperty.LABEL],
+                [f"{mode.title()} density, {columns} {noun} per row"],
+            )
+            if first_btn is None:
+                first_btn = btn
+            else:
+                btn.set_group(first_btn)
+            btn.set_active(mode == self._size_mode)
+            btn.connect("toggled", self._on_size_toggled, mode)
+            size_box.append(btn)
+            self._size_btns[mode] = btn
+        return size_box
+
+    def _refresh_density_control_labels(self) -> None:
+        for mode, button in self._size_btns.items():
+            columns = _density_columns(mode)
+            noun = "camera" if columns == 1 else "cameras"
+            button.set_tooltip_text(f"{mode.title()} - {columns} {noun} per row")
+            button.update_property(
+                [Gtk.AccessibleProperty.LABEL],
+                [f"{mode.title()} density, {columns} {noun} per row"],
+            )
+
+    def _build_reorder_button(self) -> Gtk.ToggleButton:
+        button = Gtk.ToggleButton(
+            icon_name="view-list-symbolic",
+            tooltip_text="Edit camera layout",
+        )
+        button.add_css_class("flat")
+        button.connect("toggled", self._on_layout_toggled)
+        return button
+
+    def _build_monitoring_toolbar(self) -> Gtk.Widget:
+        controls = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        controls.add_css_class("monitor-controls")
+
+        layout_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
+        layout_row.append(Gtk.Label(label="Layout", xalign=0))
+        self._layout_menu_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=2,
+            margin_top=8,
+            margin_bottom=8,
+            margin_start=8,
+            margin_end=8,
+        )
+        self._layout_popover = Gtk.Popover(child=self._layout_menu_box)
+        self._layout_select_btn = Gtk.MenuButton(
+            label=live_layouts.DEFAULT_LAYOUT_NAME,
+            tooltip_text="Choose saved layout",
+            popover=self._layout_popover,
+            hexpand=True,
+        )
+        layout_row.append(self._layout_select_btn)
+        self._save_layout_btn = Gtk.Button(
+            icon_name="document-save-symbolic", tooltip_text="Save current layout"
+        )
+        self._save_layout_btn.connect("clicked", self._on_save_live_layout)
+        layout_row.append(self._save_layout_btn)
+        self._rename_layout_btn = Gtk.Button(
+            icon_name="document-edit-symbolic",
+            tooltip_text="Rename saved layout",
+            visible=False,
+        )
+        self._rename_layout_btn.connect("clicked", self._on_rename_live_layout)
+        layout_row.append(self._rename_layout_btn)
+        self._delete_layout_btn = Gtk.Button(
+            icon_name="edit-delete-symbolic",
+            tooltip_text="Delete saved layout",
+            visible=False,
+        )
+        self._delete_layout_btn.connect("clicked", self._on_delete_live_layout)
+        layout_row.append(self._delete_layout_btn)
+        controls.append(layout_row)
+
+        stream_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._camera_filter_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=2,
+            margin_top=8,
+            margin_bottom=8,
+            margin_start=8,
+            margin_end=8,
+        )
+        filter_popover = Gtk.Popover(child=self._camera_filter_box)
+        self._camera_filter_btn = Gtk.MenuButton(
+            label="Cameras",
+            icon_name="camera-video-symbolic",
+            tooltip_text="Choose cameras to display",
+            popover=filter_popover,
+            hexpand=True,
+            halign=Gtk.Align.START,
+        )
+        stream_row.append(self._camera_filter_btn)
+        self._play_btn = Gtk.Button(
+            label="Start all",
+            icon_name="media-playback-start-symbolic",
+            tooltip_text="Start live monitoring",
+        )
+        self._play_btn.connect("clicked", self._on_monitoring_play)
+        stream_row.append(self._play_btn)
+        self._stop_btn = Gtk.Button(
+            icon_name="media-playback-stop-symbolic",
+            tooltip_text="Stop live monitoring",
+            sensitive=False,
+        )
+        self._stop_btn.connect("clicked", self._on_monitoring_stop)
+        stream_row.append(self._stop_btn)
+        controls.append(stream_row)
+
+        display_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        display_row.set_halign(Gtk.Align.END)
+        display_row.append(Gtk.Label(label="Density", css_classes=["dim-label"]))
+        display_row.append(self._build_density_controls())
+        self._layout_btn = self._build_reorder_button()
+        display_row.append(self._layout_btn)
+        controls.append(display_row)
+        return controls
+
+    def _build_monitoring_inspector(self) -> Gtk.Widget:
+        inspector = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            hexpand=False,
+            vexpand=True,
+        )
+        inspector.add_css_class("monitor-inspector")
+        scroller = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            vexpand=True,
+        )
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        content.add_css_class("inspector-content")
+        scroller.set_child(content)
+        inspector.append(scroller)
+
+        self._selected_name = Gtk.Label(label="Select a camera", xalign=0, wrap=True)
+        self._selected_name.add_css_class("title-2")
+        content.append(self._selected_name)
+        self._selected_model = Gtk.Label(label="Camera controls and health", xalign=0)
+        self._selected_model.add_css_class("dim-label")
+        content.append(self._selected_model)
+
+        self._inspector_open_btn = Gtk.Button(
+            label="Open camera",
+            icon_name="view-fullscreen-symbolic",
+            sensitive=False,
+        )
+        self._inspector_open_btn.add_css_class("suggested-action")
+        self._inspector_open_btn.connect("clicked", self._on_inspector_open)
+        content.append(self._inspector_open_btn)
+
+        content.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+        health_title = Gtk.Label(label="Camera health", xalign=0)
+        health_title.add_css_class("heading")
+        content.append(health_title)
+        health = Gtk.Grid(column_spacing=16, row_spacing=9)
+        self._selected_status = self._add_inspector_detail(health, 0, "Status")
+        self._selected_network = self._add_inspector_detail(health, 1, "Network")
+        self._selected_power = self._add_inspector_detail(health, 2, "Power")
+        self._selected_motion = self._add_inspector_detail(health, 3, "Motion")
+        content.append(health)
+
+        content.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+        controls_title = Gtk.Label(label="Audio and controls", xalign=0)
+        controls_title.add_css_class("heading")
+        content.append(controls_title)
+
+        audio_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        audio_copy = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1, hexpand=True)
+        incoming = Gtk.Label(label="Incoming audio", xalign=0)
+        incoming.add_css_class("heading")
+        audio_copy.append(incoming)
+        audio_note = Gtk.Label(label="Hear sound from this camera", xalign=0, wrap=True)
+        audio_note.add_css_class("dim-label")
+        audio_copy.append(audio_note)
+        audio_row.append(audio_copy)
+        self._audio_controls_slot = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=6,
+            valign=Gtk.Align.CENTER,
+        )
+        audio_row.append(self._audio_controls_slot)
+        content.append(audio_row)
+
+        command_grid = Gtk.Grid(column_homogeneous=True, column_spacing=8, row_spacing=8)
+        self._talk_control_slot = Gtk.Box(hexpand=True)
+        self._light_control_slot = Gtk.Box(hexpand=True)
+        self._siren_control_slot = Gtk.Box(hexpand=True)
+        command_grid.attach(self._talk_control_slot, 0, 0, 1, 1)
+        command_grid.attach(self._light_control_slot, 1, 0, 1, 1)
+        command_grid.attach(self._siren_control_slot, 0, 1, 2, 1)
+        content.append(command_grid)
+
+        content.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+        navigation = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        navigation.add_css_class("linked")
+        self._inspector_history_btn = Gtk.Button(
+            label="History",
+            icon_name="document-open-recent-symbolic",
+            hexpand=True,
+            sensitive=False,
+        )
+        self._inspector_history_btn.connect("clicked", self._on_inspector_history)
+        navigation.append(self._inspector_history_btn)
+        self._inspector_settings_btn = Gtk.Button(
+            label="Settings",
+            icon_name="preferences-system-symbolic",
+            hexpand=True,
+            sensitive=False,
+        )
+        self._inspector_settings_btn.connect("clicked", self._on_inspector_settings)
+        navigation.append(self._inspector_settings_btn)
+        content.append(navigation)
+        return inspector
+
+    @staticmethod
+    def _add_inspector_detail(grid: Gtk.Grid, row: int, key: str) -> Gtk.Label:
+        key_label = Gtk.Label(label=key, xalign=0)
+        key_label.add_css_class("dim-label")
+        grid.attach(key_label, 0, row, 1, 1)
+        value = Gtk.Label(label="Not available", xalign=0, wrap=True, hexpand=True)
+        grid.attach(value, 1, row, 1, 1)
+        return value
+
+    @staticmethod
+    def _remove_all_children(container: Gtk.Box) -> None:
+        while (child := container.get_first_child()) is not None:
+            container.remove(child)
+
+    @staticmethod
+    def _append_reparented(container: Gtk.Box, widget: Gtk.Widget | None) -> None:
+        if widget is None:
+            return
+        parent = widget.get_parent()
+        if parent is container:
+            return
+        if parent is not None and hasattr(parent, "remove"):
+            parent.remove(widget)
+        container.append(widget)
+
+    def _clear_inspector_controls(self) -> None:
+        if not self._show_monitoring_controls or not hasattr(self, "_audio_controls_slot"):
+            return
+        for container in (
+            self._audio_controls_slot,
+            self._talk_control_slot,
+            self._light_control_slot,
+            self._siren_control_slot,
+        ):
+            self._remove_all_children(container)
+
+    def _select_monitoring_camera(self, device, *, reveal: bool = True) -> None:
+        if not self._show_monitoring_controls:
+            return
+        device_id = int(device.id)
+        tile = self._cards.get(device_id)
+        if tile is None:
+            return
+        previous_tile = self._cards.get(self._selected_device_id)
+        if previous_tile is not None and previous_tile is not tile:
+            previous_tile.stop_talking()
+        self._selected_device_id = device_id
+        for candidate_id, candidate in self._cards.items():
+            candidate.set_selected(candidate_id == device_id)
+
+        self._selected_name.set_label(device_names.display_name(device))
+        self._selected_model.set_label(_safe_device_text(device, "model", "Ring camera"))
+        self._inspector_open_btn.set_sensitive(True)
+        self._inspector_settings_btn.set_sensitive(True)
+        self._inspector_history_btn.set_sensitive(self._on_open_history is not None)
+
+        self._refresh_monitoring_inspector()
+        self._clear_inspector_controls()
+        self._append_reparented(self._audio_controls_slot, tile._volume_btn)
+        self._append_reparented(self._audio_controls_slot, tile._volume_scale)
+        self._append_reparented(self._talk_control_slot, tile._mic_btn)
+        self._append_reparented(self._light_control_slot, tile._light_btn)
+        self._append_reparented(self._siren_control_slot, tile._siren_btn)
+        self._talk_control_slot.set_visible(tile._mic_btn.get_visible())
+        self._light_control_slot.set_visible(tile._light_btn is not None)
+        self._siren_control_slot.set_visible(tile._siren_btn is not None)
+        if reveal and self._monitor_split.get_collapsed():
+            self._monitor_split.set_show_sidebar(True)
+
+    def _refresh_monitoring_inspector(self) -> None:
+        if not self._show_monitoring_controls or self._selected_device_id is None:
+            return
+        tile = self._cards.get(self._selected_device_id)
+        if tile is None:
+            return
+        session = get_live_session_manager().session_for(self._selected_device_id)
+        if session is not None and session.active:
+            state = getattr(session.state, "value", str(session.state))
+            status = "Live" if state == "active" else "Connecting"
+        else:
+            status = tile._stream_state_label.get_label()
+        self._selected_status.set_label(status)
+        self._selected_network.set_label(camera_network_status(tile.device).tooltip)
+        self._selected_power.set_label(camera_power_status(tile.device).tooltip)
+        self._selected_motion.set_label(
+            "Motion alerts on"
+            if getattr(tile.device, "motion_detection", True)
+            else "Motion detection off"
+        )
+
+    def _show_empty_monitoring_inspector(self) -> None:
+        if not self._show_monitoring_controls or not hasattr(self, "_selected_name"):
+            return
+        self._clear_inspector_controls()
+        self._selected_name.set_label("Select a camera")
+        self._selected_model.set_label("Camera controls and health")
+        for label in (
+            self._selected_status,
+            self._selected_network,
+            self._selected_power,
+            self._selected_motion,
+        ):
+            label.set_label("Not available")
+        self._inspector_open_btn.set_sensitive(False)
+        self._inspector_history_btn.set_sensitive(False)
+        self._inspector_settings_btn.set_sensitive(False)
+
+    def _on_inspector_toggled(self, button: Gtk.ToggleButton) -> None:
+        if hasattr(self, "_monitor_split") and (
+            self._monitor_split.get_show_sidebar() != button.get_active()
+        ):
+            self._monitor_split.set_show_sidebar(button.get_active())
+
+    def _sync_inspector_toggle(self, split_view: Adw.OverlaySplitView, _param) -> None:
+        if not split_view.get_show_sidebar():
+            tile = self._selected_tile()
+            if tile is not None:
+                tile.stop_talking()
+        if self._inspector_toggle.get_active() != split_view.get_show_sidebar():
+            self._inspector_toggle.set_active(split_view.get_show_sidebar())
+
+    def _selected_tile(self) -> CameraTile | None:
+        if self._selected_device_id is None:
+            return None
+        return self._cards.get(self._selected_device_id)
+
+    def _on_inspector_open(self, *_args) -> None:
+        if (tile := self._selected_tile()) is not None:
+            self._show_live(tile.device)
+
+    def _on_inspector_history(self, *_args) -> None:
+        if (tile := self._selected_tile()) is not None and self._on_open_history is not None:
+            self._on_open_history(int(tile.device.id))
+
+    def _on_inspector_settings(self, *_args) -> None:
+        if (tile := self._selected_tile()) is not None:
+            self._show_camera_settings(tile.device)
 
     # ------------------------------------------------------------------
     # Live monitoring controls
@@ -1032,14 +1497,15 @@ class CamerasPage(Gtk.Box):
         if not self._can_start_live_monitoring():
             self._update_monitoring_buttons()
             return
-        self._monitoring_active = True
         self._start_visible_monitoring_streams()
         self._update_monitoring_buttons()
+        self._refresh_monitoring_inspector()
 
     def _on_monitoring_stop(self, *_args) -> None:
         self._monitoring_active = False
         self._stop_monitoring_streams()
         self._update_monitoring_buttons()
+        self._refresh_monitoring_inspector()
 
     def _update_monitoring_buttons(self) -> None:
         if not self._show_monitoring_controls:
@@ -1071,10 +1537,12 @@ class CamerasPage(Gtk.Box):
                 self.stop_live_monitoring()
                 return
             try:
-                tile.start_live_monitoring(
+                started = tile.start_live_monitoring(
                     start_volume,
                     max_streams=self._max_live_monitoring_streams(),
                 )
+                if not started:
+                    self._active_monitoring_stream_ids.discard(int(tile.device.id))
             except StreamLimitExceeded:
                 _log.error(
                     "Live Monitoring stream manager denied %s after reaching max; "
@@ -1083,6 +1551,20 @@ class CamerasPage(Gtk.Box):
                 )
                 self.stop_live_monitoring()
                 return
+        self._sync_monitoring_activity()
+
+    def _sync_monitoring_activity(self) -> None:
+        manager = get_live_session_manager()
+        self._active_monitoring_stream_ids = {
+            device_id
+            for device_id in self._cards
+            if (
+                (session := manager.session_for(device_id)) is not None
+                and session.active
+                and LIVE_MONITORING_OWNER in session.owners
+            )
+        }
+        self._monitoring_active = bool(self._active_monitoring_stream_ids)
 
     def _stop_monitoring_streams(self) -> None:
         if not self._show_monitoring_controls:
@@ -1227,6 +1709,10 @@ class CamerasPage(Gtk.Box):
 
         self._current_layout_label = label
         self._layout_select_btn.set_label(label)
+        if hasattr(self, "_layout_status_label"):
+            count = len(self._current_visible_ids())
+            noun = "camera" if count == 1 else "cameras"
+            self._layout_status_label.set_label(f"{label} layout - {count} {noun}")
         is_default = label == live_layouts.DEFAULT_LAYOUT_NAME
         has_saved_match = self._current_saved_layout_id is not None
         self._save_layout_btn.set_sensitive(not is_default)
@@ -1494,7 +1980,7 @@ class CamerasPage(Gtk.Box):
             button.set_icon_name("document-save-symbolic")
             button.set_tooltip_text("Save camera layout")
         else:
-            button.set_icon_name("view-grid-symbolic")
+            button.set_icon_name("view-list-symbolic")
             button.set_tooltip_text("Edit camera layout")
             self._save_camera_order()
 
@@ -1504,7 +1990,7 @@ class CamerasPage(Gtk.Box):
             )
 
     def _apply_size_mode_layout(self, mode: str) -> None:
-        self._grid.set_column_homogeneous(mode in {"small", "medium"})
+        self._grid.set_column_homogeneous(_density_columns(mode) > 1)
         self._grid.set_row_homogeneous(False)
         self._rebuild_grid()
 
@@ -1526,16 +2012,13 @@ class CamerasPage(Gtk.Box):
         _cfg.save(cfg)
         self._refresh_live_layout_state()
 
-    def _refresh_theme_icons(self) -> None:
-        for tile in self._cards.values():
-            tile.refresh_theme_icons()
-
     # ------------------------------------------------------------------
     # Public refresh
     # ------------------------------------------------------------------
 
     def refresh(self) -> None:
         """Re-fetch device list and repopulate the grid."""
+        self._refresh_density_control_labels()
         client = get_client()
         if client is None or not client.is_authenticated:
             self.deactivate_snapshot_updates()
@@ -1566,6 +2049,7 @@ class CamerasPage(Gtk.Box):
         self._snapshot_cache.clear()
         self._monitoring_active = False
         self._update_monitoring_buttons()
+        self._show_empty_monitoring_inspector()
         self._status_page.set_title("Not signed in")
         self._status_page.set_description(
             "You are not signed into your Ring account. To view camera feeds, please sign in"
@@ -1590,6 +2074,7 @@ class CamerasPage(Gtk.Box):
         if generation is not None and generation != self._devices_request_generation:
             return GLib.SOURCE_REMOVE
 
+        previous_selected_id = self._selected_device_id
         self._clear_grid()
 
         if not devices:
@@ -1599,6 +2084,7 @@ class CamerasPage(Gtk.Box):
             self._scroll.set_visible(False)
             self._devices = []
             self._order = []
+            self._show_empty_monitoring_inspector()
             self._refresh_live_layout_state()
             return GLib.SOURCE_REMOVE
 
@@ -1630,6 +2116,7 @@ class CamerasPage(Gtk.Box):
             self._status_page.set_visible(True)
             self._scroll.set_visible(False)
             self._order = [device.id for device in ordered]
+            self._show_empty_monitoring_inspector()
             self._refresh_live_layout_state()
             return GLib.SOURCE_REMOVE
 
@@ -1637,12 +2124,13 @@ class CamerasPage(Gtk.Box):
             tile = CameraTile(
                 device,
                 on_reorder=self._on_reorder,
-                on_activate=self._show_live,
+                on_activate=self._on_tile_activated,
                 on_camera_settings=self._show_camera_settings,
                 is_layout_editing=lambda: self._layout_editing,
                 live_monitoring=self._show_monitoring_controls,
                 on_light_toggle=self._on_tile_light_toggle,
                 on_siren_toggle=self._on_tile_siren_toggle,
+                on_stream_status_changed=self._on_tile_stream_status_changed,
             )
             tile.set_tooltip_text(
                 "Drag to reorder camera layout" if self._layout_editing else "Open live view"
@@ -1659,6 +2147,12 @@ class CamerasPage(Gtk.Box):
         self._order = [device.id for device in ordered]
         self._rebuild_grid()
         self._refresh_live_layout_state()
+        if self._show_monitoring_controls:
+            selected = next(
+                (device for device in visible_devices if int(device.id) == previous_selected_id),
+                visible_devices[0],
+            )
+            self._select_monitoring_camera(selected, reveal=False)
         if self._show_monitoring_controls and (
             self._monitoring_active or _cfg.load().get("live_monitoring_autostart", False)
         ):
@@ -1668,6 +2162,7 @@ class CamerasPage(Gtk.Box):
             else:
                 self._monitoring_active = False
             self._update_monitoring_buttons()
+            self._refresh_monitoring_inspector()
 
         return GLib.SOURCE_REMOVE
 
@@ -1850,7 +2345,23 @@ class CamerasPage(Gtk.Box):
     # Tile activation → live stream
     # ------------------------------------------------------------------
 
+    def _on_tile_activated(self, device) -> None:
+        if self._show_monitoring_controls:
+            self._select_monitoring_camera(device)
+        else:
+            self._show_live(device)
+
+    def _on_tile_stream_status_changed(self, device, status: str) -> None:
+        if self._selected_device_id == int(device.id):
+            self._selected_status.set_label(status)
+        if status in {"Stream failed", "Stream unavailable", "Stream stopped"}:
+            self._sync_monitoring_activity()
+            self._update_monitoring_buttons()
+
     def _show_live(self, device) -> None:
+        tile = self._cards.get(int(device.id))
+        if tile is not None:
+            tile.stop_talking()
         if self._show_monitoring_controls and not _cfg.load().get(
             "live_monitoring_keep_streams_in_focus", False
         ):
@@ -2068,6 +2579,18 @@ class CamerasPage(Gtk.Box):
         self._monitoring_active = bool(active_ids)
         self._update_monitoring_buttons()
 
+    def resume_after_focused(self) -> None:
+        """Resume event updates without rebuilding and disconnecting reused streams."""
+        client = get_client()
+        if client is None or not client.is_authenticated:
+            self.refresh()
+            return
+        self._activate_snapshot_updates(client)
+        for device_id in self._cards:
+            self._start_refresh_timer(device_id)
+        self._refresh_monitoring_inspector()
+        self._update_monitoring_buttons()
+
     def enforce_live_monitoring_limits(self) -> None:
         """Stop monitoring if current state exceeds the active stream cap."""
         if not self._show_monitoring_controls:
@@ -2100,6 +2623,8 @@ class CamerasPage(Gtk.Box):
     def on_page_hidden(self) -> None:
         """Apply page-exit live stream policy before navigating away."""
         self.deactivate_snapshot_updates()
+        for tile in self._cards.values():
+            tile.stop_talking()
         if self._show_monitoring_controls and not _cfg.load().get(
             "live_monitoring_continue_on_page_exit", False
         ):
@@ -2170,21 +2695,38 @@ class CamerasPage(Gtk.Box):
         self._snapshot_inflight_generations.clear()
         self._snapshot_pending_events.clear()
         self._snapshot_restart_timer_ids.clear()
+        self._clear_inspector_controls()
         for tile in self._cards.values():
             tile.cleanup()
         self._cards.clear()
+        self._selected_device_id = None
         self._active_monitoring_stream_ids.clear()
         while (child := self._grid.get_first_child()) is not None:
             self._grid.remove(child)
+        self._show_empty_monitoring_inspector()
 
     def _rebuild_grid(self) -> None:
         while (child := self._grid.get_first_child()) is not None:
             self._grid.remove(child)
 
-        children_per_line = _SIZE_MODES[self._size_mode]
+        children_per_line = _density_columns(self._size_mode)
         ordered_ids = [did for did in self._order if did in self._cards]
 
         for index, device_id in enumerate(ordered_ids):
             tile = self._cards[device_id]
             tile.update_ratio(self._size_mode)
             self._grid.attach(tile, index % children_per_line, index // children_per_line, 1, 1)
+        self._update_tile_compactness(self._scroll.get_allocated_width())
+
+    def do_size_allocate(self, width: int, height: int, baseline: int) -> None:
+        Gtk.Box.do_size_allocate(self, width, height, baseline)
+        self._update_tile_compactness(self._scroll.get_allocated_width())
+
+    def _update_tile_compactness(self, grid_width: int) -> None:
+        if grid_width <= 0:
+            return
+        columns = _density_columns(self._size_mode)
+        available = max(1, grid_width - 4 - (16 * max(0, columns - 1)))
+        compact = self._size_mode == "small" or available / columns < 180
+        for tile in self._cards.values():
+            tile.set_compact_presentation(compact)

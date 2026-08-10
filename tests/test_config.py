@@ -28,6 +28,7 @@ def test_load_defaults(tmp_path, monkeypatch):
     assert cfg["custom_motion_message"] == ""
     assert cfg["custom_alarm_message"] == ""
     assert cfg["camera_grid_size"] == "medium"
+    assert cfg["camera_grid_density_preset"] == "balanced"
     assert cfg["camera_order"] == []
     assert cfg["live_monitoring_grid_size"] == "medium"
     assert cfg["live_monitoring_camera_order"] == []
@@ -94,6 +95,7 @@ def test_save_and_reload(tmp_path, monkeypatch):
             "custom_motion_message": "Motion custom",
             "custom_alarm_message": "Alarm custom",
             "camera_grid_size": "large",
+            "camera_grid_density_preset": "dense",
             "camera_order": [20, 10],
             "live_monitoring_grid_size": "small",
             "live_monitoring_camera_order": [40, 50],
@@ -127,6 +129,7 @@ def test_save_and_reload(tmp_path, monkeypatch):
     assert loaded["custom_motion_message"] == "Motion custom"
     assert loaded["custom_alarm_message"] == "Alarm custom"
     assert loaded["camera_grid_size"] == "large"
+    assert loaded["camera_grid_density_preset"] == "dense"
     assert loaded["camera_order"] == [20, 10]
     assert loaded["live_monitoring_grid_size"] == "small"
     assert loaded["live_monitoring_camera_order"] == [40, 50]
@@ -156,8 +159,16 @@ class _FakeVariant:
         return self._value
 
 
+class _FakeSettingsSchema:
+    def __init__(self, keys):
+        self._keys = tuple(keys)
+
+    def list_keys(self):
+        return self._keys
+
+
 class _FakeSettings:
-    def __init__(self):
+    def __init__(self, *, unavailable_keys=()):
         self._values = {
             "show-notifications": False,
             "notify-doorbell": False,
@@ -170,6 +181,7 @@ class _FakeSettings:
             "custom-motion-message": "Motion custom",
             "custom-alarm-message": "Alarm custom",
             "camera-grid-size": "small",
+            "camera-grid-density-preset": "dense",
             "camera-order": [3, 1, 2],
             "live-monitoring-grid-size": "large",
             "live-monitoring-camera-order": [4, 5],
@@ -189,6 +201,9 @@ class _FakeSettings:
             "create-camera-subfolders": True,
             "open-folder-after-save": True,
         }
+        for key in unavailable_keys:
+            self._values.pop(key)
+        self.settings_schema = _FakeSettingsSchema(self._values)
         self._user_values = set(self._values)
         self.reset_keys = []
 
@@ -223,6 +238,7 @@ def config_default_for_settings_key(key):
         "custom-motion-message": "",
         "custom-alarm-message": "",
         "camera-grid-size": "medium",
+        "camera-grid-density-preset": "balanced",
         "camera-order": [],
         "live-monitoring-grid-size": "medium",
         "live-monitoring-camera-order": [],
@@ -261,6 +277,7 @@ def test_load_gsettings_maps_schema_keys():
     assert loaded["custom_motion_message"] == "Motion custom"
     assert loaded["custom_alarm_message"] == "Alarm custom"
     assert loaded["camera_grid_size"] == "small"
+    assert loaded["camera_grid_density_preset"] == "dense"
     assert loaded["camera_order"] == [3, 1, 2]
     assert loaded["live_monitoring_grid_size"] == "large"
     assert loaded["live_monitoring_camera_order"] == [4, 5]
@@ -279,6 +296,20 @@ def test_load_gsettings_maps_schema_keys():
     assert loaded["video_dir"] == "/tmp/videos"
     assert loaded["create_camera_subfolders"] is True
     assert loaded["open_folder_after_save"] is True
+
+
+def test_gsettings_migration_skips_keys_missing_from_installed_schema(tmp_path, monkeypatch):
+    from halo_gtk import config
+
+    _redirect_config_store(config, monkeypatch, tmp_path)
+    fake_settings = _FakeSettings(unavailable_keys={"camera-grid-density-preset"})
+    monkeypatch.setattr(config, "_settings", lambda: fake_settings)
+
+    loaded = config.load()
+
+    assert loaded["camera_grid_density_preset"] == "balanced"
+    assert "camera-grid-density-preset" not in fake_settings.reset_keys
+    assert config.CONFIG_FILE.exists()
 
 
 def test_normalise_disables_background_autostart_without_background_service():
@@ -316,6 +347,7 @@ def test_normalise_tolerates_malformed_json_values():
         {
             "show_notifications": "false",
             "camera_grid_size": "huge",
+            "camera_grid_density_preset": "contradictory",
             "camera_order": ["10", "bad", None, 20],
             "live_monitoring_grid_size": "medium",
             "live_monitoring_camera_order": "1,2,3",
@@ -327,6 +359,7 @@ def test_normalise_tolerates_malformed_json_values():
 
     assert data["show_notifications"] is False
     assert data["camera_grid_size"] == "medium"
+    assert data["camera_grid_density_preset"] == "balanced"
     assert data["camera_order"] == [10, 20]
     assert data["live_monitoring_grid_size"] == "medium"
     assert data["live_monitoring_camera_order"] == []

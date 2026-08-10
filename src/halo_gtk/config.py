@@ -30,6 +30,7 @@ _DEFAULTS: dict[str, Any] = {
     "custom_motion_message": "",
     "custom_alarm_message": "",
     "camera_grid_size": "medium",
+    "camera_grid_density_preset": "balanced",
     "camera_order": [],
     "live_monitoring_grid_size": "medium",
     "live_monitoring_camera_order": [],
@@ -62,6 +63,7 @@ _KEYS: dict[str, tuple[str, str]] = {
     "custom_motion_message": ("custom-motion-message", "str"),
     "custom_alarm_message": ("custom-alarm-message", "str"),
     "camera_grid_size": ("camera-grid-size", "str"),
+    "camera_grid_density_preset": ("camera-grid-density-preset", "str"),
     "camera_order": ("camera-order", "int-list"),
     "live_monitoring_grid_size": ("live-monitoring-grid-size", "str"),
     "live_monitoring_camera_order": ("live-monitoring-camera-order", "int-list"),
@@ -137,6 +139,11 @@ def _coerce_grid_size(value: Any, default: str) -> str:
     return result if result in _GRID_SIZES else default
 
 
+def _coerce_density_preset(value: Any, default: str) -> str:
+    result = str(value)
+    return result if result in {"balanced", "dense"} else default
+
+
 def _coerce_path(value: Any, default: str) -> str:
     result = str(value).strip()
     return result or default
@@ -195,6 +202,10 @@ def _normalise_config(config: dict[str, Any]) -> dict[str, Any]:
     data["custom_alarm_message"] = str(data["custom_alarm_message"])
     data["camera_grid_size"] = _coerce_grid_size(
         data["camera_grid_size"], _DEFAULTS["camera_grid_size"]
+    )
+    data["camera_grid_density_preset"] = _coerce_density_preset(
+        data["camera_grid_density_preset"],
+        _DEFAULTS["camera_grid_density_preset"],
     )
     data["camera_order"] = _coerce_int_list(data["camera_order"])
     data["live_monitoring_grid_size"] = _coerce_grid_size(
@@ -259,7 +270,10 @@ def _load_json() -> dict[str, Any]:
 
 def _load_gsettings(settings) -> dict[str, Any]:
     config = dict(_DEFAULTS)
+    available_keys = _available_gsettings_keys(settings)
     for app_key, (settings_key, value_type) in _KEYS.items():
+        if settings_key not in available_keys:
+            continue
         if value_type == "bool":
             config[app_key] = settings.get_boolean(settings_key)
         elif value_type == "str":
@@ -275,8 +289,24 @@ def _write_json_file(config: dict[str, Any]) -> None:
 
 
 def _reset_gsettings(settings) -> None:
+    available_keys = _available_gsettings_keys(settings)
     for settings_key, _value_type in _KEYS.values():
-        settings.reset(settings_key)
+        if settings_key in available_keys:
+            settings.reset(settings_key)
+
+
+def _available_gsettings_keys(settings) -> set[str]:
+    """Return keys from the schema actually installed on this system."""
+    schema = getattr(settings, "settings_schema", None)
+    if schema is None:
+        try:
+            schema = settings.get_property("settings-schema")
+        except (AttributeError, TypeError):
+            return set()
+    try:
+        return set(schema.list_keys())
+    except (AttributeError, TypeError):
+        return set()
 
 
 def _migrate_existing_config_to_json() -> None:
@@ -300,9 +330,11 @@ def _migrate_existing_config_to_json() -> None:
     settings = _settings()
     if settings is None:
         return
+    available_keys = _available_gsettings_keys(settings)
     has_gsettings_values = any(
         settings.get_user_value(settings_key) is not None
         for settings_key, _value_type in _KEYS.values()
+        if settings_key in available_keys
     )
     if not has_gsettings_values:
         return

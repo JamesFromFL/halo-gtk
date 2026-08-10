@@ -4,15 +4,12 @@ from __future__ import annotations
 
 from contextlib import suppress
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
-
-from halo_gtk.theme_icons import themed_icon_path
 
 
 @dataclass(frozen=True)
 class NetworkStatus:
-    icon_path: Path
+    icon_name: str
     tooltip: str
 
 
@@ -24,12 +21,12 @@ def camera_network_status(device: Any) -> NetworkStatus:
 
     if connection_kind == "ethernet":
         return NetworkStatus(
-            _connection_icon_path("network-ethernet"),
+            "network-wired-symbolic",
             _tooltip("Ethernet", percent),
         )
 
     return NetworkStatus(
-        _connection_icon_path(_wireless_icon_stem(percent)),
+        _wireless_icon_name(percent),
         _tooltip(label, percent),
     )
 
@@ -104,22 +101,18 @@ def _label_for_percent(percent: int) -> str:
     return "Excellent"
 
 
-def _wireless_icon_stem(percent: int) -> str:
+def _wireless_icon_name(percent: int) -> str:
     if percent <= 0:
-        return "network-wireless-disconnected-0"
+        return "network-offline-symbolic"
     if percent <= 24:
-        return "network-wireless-poor-1-24"
+        return "network-wireless-signal-none-symbolic"
     if percent <= 49:
-        return "network-wireless-bad-25-49"
+        return "network-wireless-signal-weak-symbolic"
     if percent <= 69:
-        return "network-wireless-moderate-50-69"
+        return "network-wireless-signal-ok-symbolic"
     if percent <= 84:
-        return "network-wireless-good-70-84"
-    return "network-wireless-excellent-84-100"
-
-
-def _connection_icon_path(stem: str) -> Path:
-    return themed_icon_path("connection", stem)
+        return "network-wireless-signal-good-symbolic"
+    return "network-wireless-signal-excellent-symbolic"
 
 
 def _tooltip(label: str, percent: int) -> str:

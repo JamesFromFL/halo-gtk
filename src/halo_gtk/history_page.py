@@ -127,12 +127,7 @@ def _time_label(dt: datetime) -> str:
 
 
 def _set_activity_image(image: Gtk.Image, event: dict | None) -> None:
-    try:
-        texture = Gdk.Texture.new_from_filename(str(activity_icons.activity_icon_path(event)))
-    except GLib.Error as exc:
-        _log.debug("Failed to load activity icon: %s", exc)
-        return
-    image.set_from_paintable(texture)
+    image.set_from_icon_name(activity_icons.activity_icon_name(event))
 
 
 def _filter_icon_event(key: str) -> dict:
@@ -278,7 +273,15 @@ class _VideoPlayer(Gtk.Box):
 
     def _build_ui(self) -> None:
         overlay = Gtk.Overlay(hexpand=True, vexpand=True)
-        self.append(overlay)
+        video_frame = Gtk.AspectFrame(
+            ratio=16 / 9,
+            obey_child=False,
+            hexpand=True,
+        )
+        video_frame.add_css_class("video-frame")
+        video_frame.set_overflow(Gtk.Overflow.HIDDEN)
+        video_frame.set_child(overlay)
+        self.append(video_frame)
 
         if self._paintable is not None:
             self._video_view = ZoomPaintableView()
@@ -322,6 +325,10 @@ class _VideoPlayer(Gtk.Box):
         self._scrubber = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 1.0, 0.001)
         self._scrubber.set_draw_value(False)
         self._scrubber.set_hexpand(True)
+        self._scrubber.update_property(
+            [Gtk.AccessibleProperty.LABEL],
+            ["Playback position"],
+        )
         # GTK4: use GestureClick instead of the removed button-press/release-event signals.
         press_gesture = Gtk.GestureClick.new()
         press_gesture.connect("pressed", lambda *_: setattr(self, "_seeking", True))
@@ -338,14 +345,38 @@ class _VideoPlayer(Gtk.Box):
         )
         progress_row.append(self._time_label)
 
-        # Playback controls.
-        controls_row = Gtk.CenterBox(
+        # Primary transport stays centered at every width.
+        ctrl_box = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL,
-            margin_bottom=8,
-            margin_start=8,
-            margin_end=8,
+            spacing=4,
+            halign=Gtk.Align.CENTER,
+            margin_bottom=6,
         )
-        self.append(controls_row)
+        self.append(ctrl_box)
+
+        def _btn(icon, tip, cb):
+            b = Gtk.Button(icon_name=icon, tooltip_text=tip, css_classes=["flat"])
+            b.connect("clicked", cb)
+            ctrl_box.append(b)
+            return b
+
+        _btn("media-skip-backward-symbolic", "Previous event", self._on_previous_clicked)
+        self._play_btn = _btn("media-playback-start-symbolic", "Play / Pause", self._on_play_pause)
+        _btn("media-skip-forward-symbolic", "Next event", self._on_next_clicked)
+
+        # Viewing controls wrap into two lines on compact windows.
+        viewing_controls = Gtk.FlowBox(
+            selection_mode=Gtk.SelectionMode.NONE,
+            min_children_per_line=1,
+            max_children_per_line=2,
+            row_spacing=6,
+            column_spacing=12,
+            margin_bottom=8,
+            margin_start=12,
+            margin_end=12,
+            hexpand=True,
+        )
+        self.append(viewing_controls)
 
         zoom_box = Gtk.Box(css_classes=["linked"], spacing=0, halign=Gtk.Align.START)
         zoom_out = Gtk.Button(icon_name="zoom-out-symbolic", tooltip_text="Zoom out")
@@ -359,33 +390,13 @@ class _VideoPlayer(Gtk.Box):
         reset = Gtk.Button(icon_name="zoom-fit-best-symbolic", tooltip_text="Reset zoom")
         reset.connect("clicked", lambda *_: self._set_zoom(1.0))
         zoom_box.append(reset)
-        controls_row.set_start_widget(zoom_box)
+        viewing_controls.append(zoom_box)
 
-        # Centred playback buttons.
-        ctrl_box = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL,
-            spacing=4,
-            halign=Gtk.Align.CENTER,
-            hexpand=True,
-        )
-        controls_row.set_center_widget(ctrl_box)
-
-        def _btn(icon, tip, cb):
-            b = Gtk.Button(icon_name=icon, tooltip_text=tip, css_classes=["flat"])
-            b.connect("clicked", cb)
-            ctrl_box.append(b)
-            return b
-
-        _btn("media-skip-backward-symbolic", "Previous event", self._on_previous_clicked)
-        self._play_btn = _btn("media-playback-start-symbolic", "Play / Pause", self._on_play_pause)
-        _btn("media-skip-forward-symbolic", "Next event", self._on_next_clicked)
-
-        # Volume control, right-aligned.
         vol_box = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL,
             spacing=4,
             valign=Gtk.Align.CENTER,
-            halign=Gtk.Align.END,
+            halign=Gtk.Align.START,
         )
         self._mute_btn = Gtk.Button(
             icon_name="audio-volume-high-symbolic",
@@ -398,6 +409,10 @@ class _VideoPlayer(Gtk.Box):
         self._vol_scale.set_value(1.0)
         self._vol_scale.set_draw_value(False)
         self._vol_scale.set_size_request(80, -1)
+        self._vol_scale.update_property(
+            [Gtk.AccessibleProperty.LABEL],
+            ["Playback volume"],
+        )
         self._vol_scale.connect("value-changed", self._on_volume_changed)
         vol_box.append(self._vol_scale)
 
@@ -408,7 +423,7 @@ class _VideoPlayer(Gtk.Box):
         )
         self._fullscreen_btn.connect("clicked", self._on_fullscreen_clicked)
         vol_box.append(self._fullscreen_btn)
-        controls_row.set_end_widget(vol_box)
+        viewing_controls.append(vol_box)
 
     # ------------------------------------------------------------------
     # Public API
@@ -447,6 +462,7 @@ class _VideoPlayer(Gtk.Box):
         self._play_btn.set_icon_name("media-playback-start-symbolic")
         self._scrubber.set_value(0)
         self._update_time_label(0)
+        self._placeholder.set_visible(True)
 
     def deactivate(self) -> None:
         """Stop playback and close any detached fullscreen presentation."""
@@ -757,12 +773,10 @@ class HistoryPage(Gtk.Box):
         self._playback_request_generation = 0
         self._build_ui()
 
-    def do_size_allocate(self, width: int, height: int, baseline: int) -> None:
-        """Collapse the NavigationSplitView when the page is narrower than 700 px."""
-        Gtk.Box.do_size_allocate(self, width, height, baseline)
-        should_collapse = width < 700
-        if self._nav_split.get_collapsed() != should_collapse:
-            self._nav_split.set_collapsed(should_collapse)
+    @property
+    def split_view(self) -> Adw.NavigationSplitView:
+        """Expose the adaptive list/detail container to the application window."""
+        return self._nav_split
 
     def do_unroot(self) -> None:
         self._history_request_generation += 1
@@ -830,7 +844,7 @@ class HistoryPage(Gtk.Box):
         controls_row.append(self._device_filter_button)
 
         filter_btn_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        filter_btn_box.append(Gtk.Image(icon_name="view-filter-symbolic"))
+        filter_btn_box.append(Gtk.Image(icon_name="view-sort-descending-symbolic"))
         filter_btn_box.append(Gtk.Label(label="Filter", css_classes=["caption"]))
         self._filter_panel_button = Gtk.Button(
             child=filter_btn_box,
@@ -869,6 +883,15 @@ class HistoryPage(Gtk.Box):
 
         content_toolbar = Adw.ToolbarView()
 
+        self._content_header = Adw.HeaderBar(
+            show_start_title_buttons=False,
+            show_end_title_buttons=False,
+        )
+        self._content_header.set_title_widget(Adw.WindowTitle(title="Event Playback"))
+        self._content_header.set_visible(self._nav_split.get_collapsed())
+        self._nav_split.connect("notify::collapsed", self._sync_content_header)
+        content_toolbar.add_top_bar(self._content_header)
+
         content_box = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
             hexpand=True,
@@ -885,25 +908,37 @@ class HistoryPage(Gtk.Box):
         )
         content_box.append(self._player)
 
-        self._details_row = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL,
-            spacing=12,
+        self._details_row = Gtk.FlowBox(
+            selection_mode=Gtk.SelectionMode.NONE,
+            min_children_per_line=1,
+            max_children_per_line=2,
+            row_spacing=8,
+            column_spacing=12,
             margin_start=16,
             margin_end=16,
             margin_bottom=14,
-            valign=Gtk.Align.CENTER,
+            hexpand=True,
         )
         content_box.append(self._details_row)
 
-        self._event_icon = Gtk.Image(pixel_size=38, valign=Gtk.Align.CENTER)
-        self._details_row.append(self._event_icon)
+        identity = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=12,
+            hexpand=True,
+            valign=Gtk.Align.CENTER,
+        )
+        self._details_row.append(identity)
+
+        self._event_icon = Gtk.Image(pixel_size=24, valign=Gtk.Align.CENTER)
+        self._event_icon.add_css_class("event-symbol")
+        identity.append(self._event_icon)
 
         event_text = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
             hexpand=True,
             valign=Gtk.Align.CENTER,
         )
-        self._details_row.append(event_text)
+        identity.append(event_text)
 
         self._event_type_label = Gtk.Label(
             xalign=0,
@@ -937,7 +972,7 @@ class HistoryPage(Gtk.Box):
         )
         self._favorite_btn = _action_btn("non-starred-symbolic", "Favorite", self._on_favorite)
         actions_box.append(self._favorite_btn)
-        actions_box.append(_action_btn("share-symbolic", "Copy recording URL", self._on_share))
+        actions_box.append(_action_btn("send-to-symbolic", "Copy recording URL", self._on_share))
         actions_box.append(
             _action_btn(
                 "document-save-symbolic", "Download to ~/Videos/halo-gtk/", self._on_download
@@ -945,6 +980,9 @@ class HistoryPage(Gtk.Box):
         )
         actions_box.append(_action_btn("edit-delete-symbolic", "Delete event", self._on_delete))
         self._clear_event_details()
+
+    def _sync_content_header(self, split_view: Adw.NavigationSplitView, _pspec) -> None:
+        self._content_header.set_visible(split_view.get_collapsed())
 
     def _build_filter_sidebar(self) -> Gtk.Box:
         sidebar = Gtk.Box(
@@ -1009,7 +1047,8 @@ class HistoryPage(Gtk.Box):
         for key, label, _section, _visible in filters:
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             row.set_margin_bottom(2)
-            image = Gtk.Image(pixel_size=24)
+            image = Gtk.Image(pixel_size=20)
+            image.add_css_class("event-symbol")
             _set_activity_image(image, _filter_icon_event(key))
             row.append(image)
 
@@ -1033,6 +1072,7 @@ class HistoryPage(Gtk.Box):
         self._history_loading = False
         self._pending_event_id = None
         self._player.deactivate()
+        self._nav_split.set_show_content(False)
 
     def refresh(
         self,
@@ -1050,6 +1090,7 @@ class HistoryPage(Gtk.Box):
         if select_event_id is not None:
             self._pending_event_id = select_event_id
 
+        self._nav_split.set_show_content(False)
         self._list_placeholder.set_title("Loading…")
         self._list_placeholder.set_description("")
         self._clear_event_list()
@@ -1303,7 +1344,8 @@ class HistoryPage(Gtk.Box):
         row._event_data = event  # type: ignore[attr-defined]
 
         icon = Gtk.Image()
-        icon.set_pixel_size(30)
+        icon.set_pixel_size(20)
+        icon.add_css_class("event-symbol")
         _set_activity_image(icon, event)
         row.add_prefix(icon)
 

@@ -144,9 +144,9 @@ def _device_payload(device, *, power_only: bool) -> dict[str, Any]:
     return {
         "device_api_id": _sanitize(_safe_getattr(device, "device_api_id")),
         "family": _sanitize(_safe_getattr(device, "family")),
-        "halo_power_icon": status.icon_path.name,
+        "halo_power_icon": status.icon_name,
         "halo_power_tooltip": status.tooltip,
-        "halo_network_icon": network_status.icon_path.name,
+        "halo_network_icon": network_status.icon_name,
         "halo_network_tooltip": network_status.tooltip,
         "kind": _sanitize(_safe_getattr(device, "kind")),
         "model": _sanitize(_safe_getattr(device, "model")),

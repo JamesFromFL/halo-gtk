@@ -188,13 +188,143 @@ async def test_talkback_activates_camera_speaker_before_microphone(monkeypatch):
         client=object(),
         session_id="session-2",
         mic_track=microphone,
+        connected=True,
+        talkback_generation=1,
+        talkback_requested=True,
     )
     view = make_bare_view(resources)
 
-    await view._async_start_talking(resources)
+    await view._async_start_talking(resources, 1)
 
     assert calls == [("speaker", "session-2"), ("microphone", None)]
     assert microphone.start_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_talkback_stop_invalidates_delayed_speaker_activation(monkeypatch):
+    import halo_gtk.live_stream as live_stream
+
+    activation_started = asyncio.Event()
+    finish_activation = asyncio.Event()
+
+    async def activate(_device, _session_id):
+        activation_started.set()
+        await finish_activation.wait()
+
+    monkeypatch.setattr(live_stream, "activate_ring_camera_speaker", activate)
+    client = LoopClient()
+    microphone = FakeMicrophoneTrack()
+    resources = _StreamResources(
+        token=3,
+        device=FakeDevice(),
+        client=client,
+        session_id="session-3",
+        mic_track=microphone,
+        connected=True,
+    )
+    view = make_bare_view(resources)
+
+    view.start_talking()
+    await activation_started.wait()
+    view.stop_talking()
+    await asyncio.sleep(0)
+    finish_activation.set()
+    await asyncio.gather(*client.tasks)
+
+    assert microphone.start_calls == 0
+    assert microphone.stop_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_talkback_requested_while_connecting_starts_when_track_is_ready(monkeypatch):
+    import halo_gtk.live_stream as live_stream
+
+    activated = []
+
+    async def activate(_device, session_id):
+        activated.append(session_id)
+
+    monkeypatch.setattr(live_stream, "activate_ring_camera_speaker", activate)
+    client = LoopClient()
+    resources = _StreamResources(
+        token=4,
+        device=FakeDevice(),
+        client=client,
+        session_id="session-4",
+    )
+    view = make_bare_view(resources)
+
+    view.start_talking()
+    await asyncio.sleep(0)
+    microphone = FakeMicrophoneTrack()
+    resources.mic_track = microphone
+    resources.connected = True
+    await asyncio.gather(*client.tasks)
+
+    assert activated == ["session-4"]
+    assert microphone.start_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_talkback_waits_for_connected_stream_before_speaker_activation(monkeypatch):
+    import halo_gtk.live_stream as live_stream
+
+    activated = []
+
+    async def activate(_device, session_id):
+        activated.append(session_id)
+
+    monkeypatch.setattr(live_stream, "activate_ring_camera_speaker", activate)
+    client = LoopClient()
+    microphone = FakeMicrophoneTrack()
+    resources = _StreamResources(
+        token=5,
+        device=FakeDevice(),
+        client=client,
+        session_id="session-5",
+        mic_track=microphone,
+    )
+    view = make_bare_view(resources)
+
+    view.start_talking()
+    await asyncio.sleep(0.02)
+    assert activated == []
+    assert microphone.start_calls == 0
+
+    resources.connected = True
+    await asyncio.gather(*client.tasks)
+
+    assert activated == ["session-5"]
+    assert microphone.start_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_talkback_cancelled_while_connecting_never_starts(monkeypatch):
+    import halo_gtk.live_stream as live_stream
+
+    activated = []
+
+    async def activate(_device, session_id):
+        activated.append(session_id)
+
+    monkeypatch.setattr(live_stream, "activate_ring_camera_speaker", activate)
+    client = LoopClient()
+    resources = _StreamResources(
+        token=6,
+        device=FakeDevice(),
+        client=client,
+        session_id="session-6",
+    )
+    view = make_bare_view(resources)
+
+    view.start_talking()
+    await asyncio.sleep(0)
+    view.stop_talking()
+    resources.mic_track = FakeMicrophoneTrack()
+    await asyncio.gather(*client.tasks)
+
+    assert activated == []
+    assert resources.mic_track.start_calls == 0
 
 
 @pytest.mark.asyncio

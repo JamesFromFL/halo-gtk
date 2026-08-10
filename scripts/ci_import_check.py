@@ -10,65 +10,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-_PACKAGE_ICON_FILES = tuple(
-    Path("assets") / "icons" / category / filename
-    for category, filenames in {
-        "apps": ("io.github.JamesFromFL.HaloGtk.png",),
-        "defaults": (
-            "default-ring.png",
-            "favorite.png",
-        ),
-        "controls": (
-            "light-off-dark-theme.png",
-            "light-off-light-theme.png",
-            "light-on.png",
-            "siren.png",
-        ),
-        "events": (
-            "event-answered-ring.png",
-            "event-linked.png",
-            "event-live-view.png",
-            "event-missed-ring.png",
-            "event-motion-detected.png",
-            "event-package.png",
-            "event-person-detected.png",
-            "event-vehicle-detected.png",
-        ),
-        "power": (
-            "power-battery-100-76.png",
-            "power-battery-75-51.png",
-            "power-battery-50-26.png",
-            "power-battery-25-6.png",
-            "power-battery-5-0.png",
-            "power-battery-unknown.png",
-            "power-charging-battery-100-76.png",
-            "power-charging-battery-75-51.png",
-            "power-charging-battery-50-26.png",
-            "power-charging-battery-25-6.png",
-            "power-charging-battery-5-0.png",
-            "power-hardwired-dark-theme.png",
-            "power-hardwired-light-theme.png",
-            "power-unknown.png",
-        ),
-        "connection": (
-            "network-ethernet-dark-theme.png",
-            "network-ethernet-light-theme.png",
-            "network-wireless-bad-25-49-dark-theme.png",
-            "network-wireless-bad-25-49-light-theme.png",
-            "network-wireless-disconnected-0-dark-theme.png",
-            "network-wireless-disconnected-0-light-theme.png",
-            "network-wireless-excellent-84-100-dark-theme.png",
-            "network-wireless-excellent-84-100-light-theme.png",
-            "network-wireless-good-70-84-dark-theme.png",
-            "network-wireless-good-70-84-light-theme.png",
-            "network-wireless-moderate-50-69-dark-theme.png",
-            "network-wireless-moderate-50-69-light-theme.png",
-            "network-wireless-poor-1-24-dark-theme.png",
-            "network-wireless-poor-1-24-light-theme.png",
-        ),
-    }.items()
-    for filename in filenames
-)
+_PACKAGE_ICON_FILES = (Path("assets") / "icons" / "apps" / "io.github.JamesFromFL.HaloGtk.png",)
 
 _SOURCE_REQUIRED_FILES = (
     Path("data/io.github.JamesFromFL.HaloGtk.desktop"),

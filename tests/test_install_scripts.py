@@ -115,6 +115,9 @@ def test_installer_validates_live_media_runtime_contract():
     for namespace in ("Adw", "GdkPixbuf", "GioUnix", "Graphene", "Gst", "Gtk", "Notify", "Secret"):
         assert f"require_gi_namespace {namespace} " in installer
 
+    assert "require_adw_version" in installer
+    assert "(1, 5)" in installer
+
     for element in (
         "appsink",
         "appsrc",

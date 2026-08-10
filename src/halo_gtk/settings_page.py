@@ -32,7 +32,7 @@ _RING_ACCOUNT_URL = "https://account.ring.com/account/control-center/account-man
 
 
 class SettingsPage(Gtk.Box):
-    """Two-pane settings page with categories on the left."""
+    """Adaptive settings browser with category and detail routes."""
 
     def __init__(self) -> None:
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL, hexpand=True, vexpand=True)
@@ -44,51 +44,116 @@ class SettingsPage(Gtk.Box):
         self.refresh()
 
     def _build_ui(self) -> None:
+        self._split_view = Adw.NavigationSplitView(
+            hexpand=True,
+            vexpand=True,
+            min_sidebar_width=220,
+            max_sidebar_width=280,
+            sidebar_width_fraction=0.28,
+            show_content=False,
+        )
+        self._split_view.connect("notify::collapsed", self._on_split_collapsed_changed)
+        self.append(self._split_view)
+
+        sidebar_toolbar = Adw.ToolbarView()
+        self._sidebar_header = Adw.HeaderBar(
+            title_widget=Adw.WindowTitle(title="Settings"),
+            show_end_title_buttons=False,
+        )
+        sidebar_toolbar.add_top_bar(self._sidebar_header)
+
+        category_scrolled = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            hexpand=True,
+            vexpand=True,
+        )
         self._category_list = Gtk.ListBox(
             css_classes=["navigation-sidebar"],
             selection_mode=Gtk.SelectionMode.SINGLE,
-            width_request=240,
+            activate_on_single_click=True,
             margin_top=8,
             margin_bottom=8,
             margin_start=8,
             margin_end=8,
         )
         self._category_list.connect("row-selected", self._on_category_selected)
-        self.append(self._category_list)
+        self._category_list.connect("row-activated", self._on_category_activated)
+        category_scrolled.set_child(self._category_list)
+        sidebar_toolbar.set_content(category_scrolled)
+        self._split_view.set_sidebar(
+            Adw.NavigationPage(child=sidebar_toolbar, title="Settings"),
+        )
 
-        separator = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
-        self.append(separator)
+        content_toolbar = Adw.ToolbarView()
+        self._content_title = Adw.WindowTitle(title="General")
+        self._content_header = Adw.HeaderBar(
+            title_widget=self._content_title,
+            show_back_button=False,
+            show_start_title_buttons=False,
+        )
+        self._back_button = Gtk.Button(
+            icon_name="go-previous-symbolic",
+            tooltip_text="Back to Settings Categories",
+            visible=False,
+        )
+        self._back_button.update_property(
+            [Gtk.AccessibleProperty.LABEL],
+            ["Back to Settings Categories"],
+        )
+        self._back_button.connect("clicked", self._on_back_clicked)
+        self._content_header.pack_start(self._back_button)
+        content_toolbar.add_top_bar(self._content_header)
 
         self._stack = Gtk.Stack(
             transition_type=Gtk.StackTransitionType.CROSSFADE,
             hexpand=True,
             vexpand=True,
         )
-        self.append(self._stack)
+        content_toolbar.set_content(self._stack)
+        self._split_view.set_content(
+            Adw.NavigationPage(child=content_toolbar, title="Settings Detail"),
+        )
 
-        self._add_category("account", "Account", self._build_account_page())
-        self._add_category("background", "Background Service", self._build_background_page())
-        self._add_category("live-monitoring", "Live Monitoring", self._build_live_monitoring_page())
-        self._add_category("playback", "Playback", self._build_playback_page())
-        self._add_category("notifications", "Notifications", self._build_notifications_page())
-        self._add_category("directories", "Directories", self._build_directories_page())
-        self._add_category("privacy", "Privacy", self._build_privacy_page())
-        self._add_category("advanced", "Advanced", self._build_advanced_page())
-        self._category_list.select_row(self._rows["account"])
+        self._add_category(
+            "general", "General", "preferences-system-symbolic", self._build_general_page()
+        )
+        self._add_category(
+            "live-view", "Live View", "camera-video-symbolic", self._build_live_view_page()
+        )
+        self._add_category(
+            "events", "Events", "document-open-recent-symbolic", self._build_events_page()
+        )
+        self._add_category("storage", "Storage", "folder-symbolic", self._build_storage_page())
+        self._add_category(
+            "account", "Account", "avatar-default-symbolic", self._build_account_page()
+        )
+        self._add_category(
+            "advanced", "Advanced", "applications-system-symbolic", self._build_advanced_page()
+        )
+        self._category_list.select_row(self._rows["general"])
 
-    def _add_category(self, name: str, label: str, page: Gtk.Widget) -> None:
+    def _add_category(
+        self,
+        name: str,
+        label: str,
+        icon_name: str,
+        page: Gtk.Widget,
+    ) -> None:
         row = Gtk.ListBoxRow()
         row._settings_page_name = name  # type: ignore[attr-defined]
-        row.set_child(
-            Gtk.Label(
-                label=label,
-                halign=Gtk.Align.START,
-                margin_top=10,
-                margin_bottom=10,
-                margin_start=12,
-                margin_end=12,
-            )
+        row._settings_page_title = label  # type: ignore[attr-defined]
+        content = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=10,
+            margin_top=10,
+            margin_bottom=10,
+            margin_start=12,
+            margin_end=12,
         )
+        content.append(Gtk.Image(icon_name=icon_name))
+        content.append(Gtk.Label(label=label, halign=Gtk.Align.START))
+        row.set_child(content)
         self._category_list.append(row)
         self._rows[name] = row
         self._stack.add_named(page, name)
@@ -112,24 +177,24 @@ class SettingsPage(Gtk.Box):
         group = Adw.PreferencesGroup(title="Ring Account")
         page.add(group)
 
-        self._login_status_row = Adw.ActionRow(title="Status")
+        self._login_status_row = Adw.ActionRow(title="Connection Status")
         group.add(self._login_status_row)
 
-        self._account_email_row = Adw.ActionRow(title="Email")
+        self._account_email_row = Adw.ActionRow(title="Account Email")
         group.add(self._account_email_row)
 
         self._refresh_session_button = self._add_button_row(
             group,
-            "Refresh Session",
-            "Refreshes the saved Ring session. You may be asked to sign in again if"
+            "Refresh Ring Connection",
+            "Reconnect using the saved Ring session. You may be asked to sign in again if"
             " Ring rejects it.",
             "Refresh",
             self._on_refresh_session_clicked,
         )
         self._add_button_row(
             group,
-            "Account Control Center",
-            "Open Ring Account Control Center in your browser.",
+            "Ring Account Settings",
+            "Manage the Ring account in your browser.",
             "Open",
             self._on_open_ring_account_clicked,
         )
@@ -147,7 +212,7 @@ class SettingsPage(Gtk.Box):
 
         return scrolled
 
-    def _build_playback_page(self) -> Gtk.Widget:
+    def _build_events_page(self) -> Gtk.Widget:
         scrolled = Gtk.ScrolledWindow(
             hscrollbar_policy=Gtk.PolicyType.NEVER,
             vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
@@ -155,7 +220,7 @@ class SettingsPage(Gtk.Box):
             vexpand=True,
         )
         page = Adw.PreferencesPage(
-            title="Playback",
+            title="Events",
             margin_top=12,
             margin_bottom=12,
             margin_start=12,
@@ -163,18 +228,19 @@ class SettingsPage(Gtk.Box):
         )
         scrolled.set_child(page)
 
-        history_group = Adw.PreferencesGroup(title="Event History")
+        history_group = Adw.PreferencesGroup(title="Event Playback")
         page.add(history_group)
         self._event_history_next_auto_play_switch = self._add_switch_row(
             history_group,
-            "Next Auto Play",
-            "Automatically play the next visible event when the current recording ends.",
+            "Play Next Event Automatically",
+            "Play the next visible event when the current recording ends.",
             config_key="event_history_next_auto_play",
         )
 
+        self._add_notification_groups(page)
         return scrolled
 
-    def _build_directories_page(self) -> Gtk.Widget:
+    def _build_storage_page(self) -> Gtk.Widget:
         scrolled = Gtk.ScrolledWindow(
             hscrollbar_policy=Gtk.PolicyType.NEVER,
             vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
@@ -182,7 +248,7 @@ class SettingsPage(Gtk.Box):
             vexpand=True,
         )
         page = Adw.PreferencesPage(
-            title="Directories",
+            title="Storage",
             margin_top=12,
             margin_bottom=12,
             margin_start=12,
@@ -195,23 +261,23 @@ class SettingsPage(Gtk.Box):
 
         self._snapshot_dir_row = self._add_folder_row(
             locations_group,
-            "Snapshots Folder",
+            "Snapshot Folder",
             "snapshot_dir",
         )
         self._video_dir_row = self._add_folder_row(
             locations_group,
-            "Videos Folder",
+            "Recording Downloads Folder",
             "video_dir",
         )
         self._add_button_row(
             locations_group,
-            "Favorites Folder",
+            "Favorites Archive",
             "Open locally archived favorite event clips.",
             "Open",
             self._on_open_favorites_folder_clicked,
         )
 
-        options_group = Adw.PreferencesGroup(title="Options")
+        options_group = Adw.PreferencesGroup(title="Saving Behavior")
         page.add(options_group)
         self._camera_subfolders_switch = self._add_switch_row(
             options_group,
@@ -227,15 +293,28 @@ class SettingsPage(Gtk.Box):
         )
         self._add_button_row(
             options_group,
-            "Reset to Defaults",
-            "Restore Halo's default snapshot and video folders.",
+            "Reset Storage Settings",
+            "Restore the default folders and saving behavior.",
             "Reset",
             self._on_reset_directories_clicked,
         )
 
+        local_group = Adw.PreferencesGroup(title="Local Data")
+        page.add(local_group)
+        self._add_button_row(
+            local_group,
+            "Clear Preview Cache",
+            "Delete cached previews while keeping saved favorites and media.",
+            "Clear",
+            self._on_clear_preview_cache_clicked,
+            destructive=True,
+        )
+        self._storage_message_row = Adw.ActionRow(title="Last Action", visible=False)
+        local_group.add(self._storage_message_row)
+
         return scrolled
 
-    def _build_background_page(self) -> Gtk.Widget:
+    def _build_general_page(self) -> Gtk.Widget:
         scrolled = Gtk.ScrolledWindow(
             hscrollbar_policy=Gtk.PolicyType.NEVER,
             vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
@@ -243,7 +322,7 @@ class SettingsPage(Gtk.Box):
             vexpand=True,
         )
         page = Adw.PreferencesPage(
-            title="Background Service",
+            title="General",
             margin_top=12,
             margin_bottom=12,
             margin_start=12,
@@ -251,38 +330,56 @@ class SettingsPage(Gtk.Box):
         )
         scrolled.set_child(page)
 
-        group = Adw.PreferencesGroup()
+        grid_group = Adw.PreferencesGroup(
+            title="Camera Grid",
+            description="Shared by Dashboard and Live View.",
+        )
+        page.add(grid_group)
+        self._grid_density_combo = Adw.ComboRow(
+            title="Grid Density",
+            subtitle="Sets the camera columns used by Small, Medium, and Large.",
+            model=Gtk.StringList.new(
+                [
+                    "Balanced - 4 / 2 / 1",
+                    "Dense - 5 / 3 / 2",
+                ]
+            ),
+        )
+        self._grid_density_combo.connect("notify::selected", self._on_grid_density_selected)
+        grid_group.add(self._grid_density_combo)
+
+        group = Adw.PreferencesGroup(title="Startup and Background")
         page.add(group)
 
         self._background_switch = self._add_switch_row(
             group,
-            "Enable Background Service",
-            "Halo is active in the background when the window is closed.",
+            "Keep Halo Running in the Background",
+            "Keep Halo active after its window is closed.",
             self._on_background_toggled,
         )
         self._autostart_switch = self._add_switch_row(
             group,
-            "Autostart on Login",
-            "Halo is launched at user startup.",
+            "Launch at Login",
+            "Start Halo when you sign in to the computer.",
             self._on_autostart_toggled,
         )
         self._autostart_background_row, self._autostart_background_switch = self._add_switch_row(
             group,
-            "Autostart in Background",
-            "Halo is launched in the background at user startup.",
+            "Start Hidden",
+            "Launch without opening the Halo window.",
             self._on_autostart_background_toggled,
             indent=True,
         )
         self._tray_switch = self._add_switch_row(
             group,
-            "Show Tray icon",
-            None,
+            "Show Tray Icon",
+            "Show Halo in the desktop status area when available.",
             self._on_tray_toggled,
         )
 
         return scrolled
 
-    def _build_live_monitoring_page(self) -> Gtk.Widget:
+    def _build_live_view_page(self) -> Gtk.Widget:
         scrolled = Gtk.ScrolledWindow(
             hscrollbar_policy=Gtk.PolicyType.NEVER,
             vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
@@ -290,7 +387,7 @@ class SettingsPage(Gtk.Box):
             vexpand=True,
         )
         page = Adw.PreferencesPage(
-            title="Live Monitoring",
+            title="Live View",
             margin_top=12,
             margin_bottom=12,
             margin_start=12,
@@ -298,46 +395,38 @@ class SettingsPage(Gtk.Box):
         )
         scrolled.set_child(page)
 
-        behavior_group = Adw.PreferencesGroup(title="Behavior")
+        behavior_group = Adw.PreferencesGroup(title="Streaming Behavior")
         page.add(behavior_group)
         self._live_monitoring_autostart_switch = self._add_switch_row(
             behavior_group,
-            "Start camera live stream when Live Monitoring opened",
-            "Start all visible cameras when the Live Monitoring page opens.",
+            "Start Streams Automatically",
+            "Start visible cameras when Live View opens.",
             config_key="live_monitoring_autostart",
         )
         self._live_monitoring_continue_switch = self._add_switch_row(
             behavior_group,
-            "Continue Live Monitoring on page exit",
-            "Keep visible camera streams alive when navigating to another page.",
+            "Keep Streaming When Leaving the Page",
+            "Keep visible camera streams active while viewing another page.",
             config_key="live_monitoring_continue_on_page_exit",
         )
         self._live_monitoring_keep_focus_switch = self._add_switch_row(
             behavior_group,
-            "Keep all Live Monitoring alive when in camera focus",
-            "Keep grid streams alive when opening one camera in focused view.",
+            "Keep Grid Streams Running in Focused View",
+            "Keep grid streams active while one camera is focused.",
             config_key="live_monitoring_keep_streams_in_focus",
         )
         self._live_monitoring_unmute_switch = self._add_switch_row(
             behavior_group,
-            "Unmute on Live Monitoring start",
-            "Start Live Monitoring streams at 100% volume instead of muted.",
+            "Start Unmuted",
+            "Begin Live View with monitoring audio enabled.",
             config_key="live_monitoring_unmute_on_start",
         )
-        self._live_monitoring_allow_six_switch = self._add_switch_row(
-            behavior_group,
-            "Allow Experimental 6-Camera Monitoring",
-            "Allows up to 6 simultaneous streams. Ring officially supports 4 on desktop;"
-            " reliability may vary.",
-            self._on_live_monitoring_allow_six_toggled,
-        )
-
-        layouts_group = Adw.PreferencesGroup(title="Layouts")
+        layouts_group = Adw.PreferencesGroup(title="Saved Layouts")
         page.add(layouts_group)
         self._add_button_row(
             layouts_group,
-            "Delete All Saved Custom Layouts",
-            "Remove all saved custom layouts from Live Monitoring.",
+            "Delete All Saved Layouts",
+            "Remove every saved Live View camera layout.",
             "Delete",
             self._on_delete_live_monitoring_layouts_clicked,
             destructive=True,
@@ -347,35 +436,20 @@ class SettingsPage(Gtk.Box):
 
         return scrolled
 
-    def _build_notifications_page(self) -> Gtk.Widget:
-        scrolled = Gtk.ScrolledWindow(
-            hscrollbar_policy=Gtk.PolicyType.NEVER,
-            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
-            hexpand=True,
-            vexpand=True,
-        )
-        page = Adw.PreferencesPage(
-            title="Notifications",
-            margin_top=12,
-            margin_bottom=12,
-            margin_start=12,
-            margin_end=12,
-        )
-        scrolled.set_child(page)
-
+    def _add_notification_groups(self, page: Adw.PreferencesPage) -> None:
         desktop_group = Adw.PreferencesGroup(title="Desktop Notifications")
         page.add(desktop_group)
 
         self._notifications_switch = self._add_switch_row(
             desktop_group,
-            "Desktop Notifications",
-            "Show Ring event notifications.",
+            "Enable Desktop Notifications",
+            "Show Ring event notifications from Halo.",
             self._on_notifications_toggled,
         )
         self._doorbell_notifications_row, self._doorbell_notifications_switch = (
             self._add_switch_row(
                 desktop_group,
-                "Doorbell Ring Notification",
+                "Doorbell Rings",
                 None,
                 config_key="notify_doorbell",
                 indent=True,
@@ -383,14 +457,14 @@ class SettingsPage(Gtk.Box):
         )
         self._motion_notifications_row, self._motion_notifications_switch = self._add_switch_row(
             desktop_group,
-            "Motion Notifications",
+            "Motion Events",
             None,
             config_key="notify_motion",
             indent=True,
         )
         self._alarm_notifications_row, self._alarm_notifications_switch = self._add_switch_row(
             desktop_group,
-            "Alarm Notification",
+            "Alarm Events",
             "Urgent alert. Do not rely on Halo for emergency monitoring.",
             config_key="notify_alarm",
             indent=True,
@@ -400,25 +474,25 @@ class SettingsPage(Gtk.Box):
         page.add(content_group)
         self._notification_preview_switch = self._add_switch_row(
             content_group,
-            "Notification Preview Images",
-            "Include snapshots or preview images when available.",
+            "Preview Images",
+            "Include a camera preview when one is available.",
             config_key="notification_preview_images",
         )
         self._notification_summaries_switch = self._add_switch_row(
             content_group,
-            "Ring Notification Summaries",
+            "Ring Event Summaries",
             "Use Ring event descriptions when available.",
             config_key="notification_summaries",
         )
         self._custom_notification_messages_switch = self._add_switch_row(
             content_group,
-            "Custom Notification Messages",
+            "Use Custom Messages",
             "Use custom body text for supported notification types.",
             self._on_custom_notification_messages_toggled,
         )
         self._custom_doorbell_message_row = self._add_entry_row(
             content_group,
-            "Doorbell Ring Press",
+            "Doorbell Ring",
             "custom_doorbell_message",
         )
         self._custom_motion_message_row = self._add_entry_row(
@@ -431,49 +505,6 @@ class SettingsPage(Gtk.Box):
             "Alarm",
             "custom_alarm_message",
         )
-
-        return scrolled
-
-    def _build_privacy_page(self) -> Gtk.Widget:
-        scrolled = Gtk.ScrolledWindow(
-            hscrollbar_policy=Gtk.PolicyType.NEVER,
-            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
-            hexpand=True,
-            vexpand=True,
-        )
-        page = Adw.PreferencesPage(
-            title="Privacy",
-            margin_top=12,
-            margin_bottom=12,
-            margin_start=12,
-            margin_end=12,
-        )
-        scrolled.set_child(page)
-
-        local_group = Adw.PreferencesGroup(title="Local Data")
-        page.add(local_group)
-
-        self._add_button_row(
-            local_group,
-            "Clear Cached Thumbnails/Previews",
-            "Delete local cached camera preview images and generated thumbnails.",
-            "Clear",
-            self._on_clear_preview_cache_clicked,
-            destructive=True,
-        )
-        self._add_button_row(
-            local_group,
-            "Clear Debug Log",
-            "Clear Halo debug logs stored on this computer.",
-            "Clear",
-            self._on_clear_debug_log_clicked,
-            destructive=True,
-        )
-
-        self._privacy_message_row = Adw.ActionRow(title="Last Action", visible=False)
-        local_group.add(self._privacy_message_row)
-
-        return scrolled
 
     def _build_advanced_page(self) -> Gtk.Widget:
         scrolled = Gtk.ScrolledWindow(
@@ -491,6 +522,15 @@ class SettingsPage(Gtk.Box):
         )
         scrolled.set_child(page)
 
+        experimental_group = Adw.PreferencesGroup(title="Experimental")
+        page.add(experimental_group)
+        self._live_monitoring_allow_six_switch = self._add_switch_row(
+            experimental_group,
+            "Allow Six Simultaneous Streams",
+            "Experimental. Ring officially supports four desktop streams; reliability may vary.",
+            self._on_live_monitoring_allow_six_toggled,
+        )
+
         diagnostics_group = Adw.PreferencesGroup(title="Diagnostics")
         page.add(diagnostics_group)
         self._add_button_row(
@@ -500,13 +540,21 @@ class SettingsPage(Gtk.Box):
             "Export",
             self._on_export_logs_clicked,
         )
+        self._add_button_row(
+            diagnostics_group,
+            "Clear Debug Logs",
+            "Clear Halo debug logs stored on this computer.",
+            "Clear",
+            self._on_clear_debug_log_clicked,
+            destructive=True,
+        )
 
-        settings_group = Adw.PreferencesGroup(title="Settings")
+        settings_group = Adw.PreferencesGroup(title="Reset")
         page.add(settings_group)
         self._add_button_row(
             settings_group,
-            "Reset Settings",
-            "Restore Halo settings to defaults without removing your Ring session.",
+            "Reset App Settings",
+            "Restore defaults without removing the Ring session or saved media.",
             "Reset",
             self._on_reset_settings_clicked,
             destructive=True,
@@ -582,18 +630,24 @@ class SettingsPage(Gtk.Box):
         cfg = _config.load()
         try:
             self._refresh_account()
-            self._set_switch_active(self._background_switch, cfg.get("background_service", False))
+            background_enabled = cfg.get("background_service", False)
+            self._set_switch_active(self._background_switch, background_enabled)
             autostart_enabled = cfg.get("autostart_login", False) or autostart.is_enabled()
             self._set_switch_active(
                 self._autostart_switch,
                 autostart_enabled,
             )
-            self._autostart_background_row.set_visible(autostart_enabled)
+            self._autostart_background_row.set_visible(
+                bool(background_enabled and autostart_enabled)
+            )
             self._set_switch_active(
                 self._autostart_background_switch,
                 cfg.get("autostart_background", False),
             )
             self._set_switch_active(self._tray_switch, cfg.get("show_tray_icon", True))
+            self._grid_density_combo.set_selected(
+                1 if cfg.get("camera_grid_density_preset") == "dense" else 0
+            )
             self._refresh_live_monitoring(cfg)
             self._refresh_playback(cfg)
             self._refresh_directories(cfg)
@@ -737,6 +791,28 @@ class SettingsPage(Gtk.Box):
         if name is not None:
             self._stack.set_visible_child_name(name)
 
+        title = getattr(row, "_settings_page_title", None)
+        if title is not None:
+            self._content_title.set_title(title)
+
+    def _on_category_activated(self, list_box: Gtk.ListBox, row: Gtk.ListBoxRow) -> None:
+        self._on_category_selected(list_box, row)
+        self._split_view.set_show_content(True)
+
+    def _on_back_clicked(self, _button: Gtk.Button) -> None:
+        self._split_view.set_show_content(False)
+        self._category_list.grab_focus()
+
+    def _on_split_collapsed_changed(self, split_view: Adw.NavigationSplitView, _pspec) -> None:
+        collapsed = split_view.get_collapsed()
+        self._back_button.set_visible(collapsed)
+        self._sidebar_header.set_show_end_title_buttons(collapsed)
+
+    @property
+    def split_view(self) -> Adw.NavigationSplitView:
+        """Return the adaptive container for window breakpoint wiring."""
+        return self._split_view
+
     def _on_background_toggled(self, switch: Gtk.Switch, _pspec) -> None:
         if self._refreshing:
             return
@@ -791,7 +867,17 @@ class SettingsPage(Gtk.Box):
         _config.save(cfg)
         self._apply_app_settings()
 
+    def _on_grid_density_selected(self, combo: Adw.ComboRow, _pspec) -> None:
+        if self._refreshing:
+            return
+        cfg = _config.load()
+        cfg["camera_grid_density_preset"] = "dense" if combo.get_selected() == 1 else "balanced"
+        _config.save(cfg)
+        self._refresh_main_window()
+
     def _on_live_monitoring_allow_six_toggled(self, switch: Gtk.Switch, _pspec) -> None:
+        if self._refreshing:
+            return
         self._save_bool_setting("live_monitoring_allow_six_streams", switch)
         self._refresh_main_window()
 
@@ -887,8 +973,8 @@ class SettingsPage(Gtk.Box):
 
     def _on_delete_live_monitoring_layouts_clicked(self, *_args) -> None:
         dialog = Adw.AlertDialog(
-            heading="Delete all saved custom layouts in Live Monitoring?",
-            body="This removes every saved custom Live Monitoring layout.",
+            heading="Delete all saved Live View layouts?",
+            body="This removes every saved custom camera layout.",
         )
         dialog.add_response("cancel", "No")
         dialog.add_response("delete", "Yes")
@@ -910,30 +996,30 @@ class SettingsPage(Gtk.Box):
         self._live_monitoring_message_row.set_visible(True)
 
     def _on_clear_preview_cache_clicked(self, *_args) -> None:
-        self._confirm_privacy_action(
+        self._confirm_destructive_action(
             "Clear cached previews?",
             "This deletes local cached camera preview images and generated thumbnails.",
             self._clear_preview_cache,
         )
 
     def _on_clear_debug_log_clicked(self, *_args) -> None:
-        self._confirm_privacy_action(
+        self._confirm_destructive_action(
             "Clear debug log?",
             "This clears Halo debug logs stored on this computer.",
             self._clear_debug_log,
         )
 
-    def _confirm_privacy_action(self, heading: str, body: str, callback) -> None:
+    def _confirm_destructive_action(self, heading: str, body: str, callback) -> None:
         dialog = Adw.AlertDialog(heading=heading, body=body)
         dialog.add_response("cancel", "Cancel")
         dialog.add_response("clear", "Clear")
         dialog.set_response_appearance("clear", Adw.ResponseAppearance.DESTRUCTIVE)
         dialog.set_default_response("cancel")
         dialog.set_close_response("cancel")
-        dialog.connect("response", self._on_privacy_confirmed, callback)
+        dialog.connect("response", self._on_destructive_action_confirmed, callback)
         dialog.present(self)
 
-    def _on_privacy_confirmed(self, _dialog, response: str, callback) -> None:
+    def _on_destructive_action_confirmed(self, _dialog, response: str, callback) -> None:
         if response == "clear":
             callback()
 
@@ -942,30 +1028,30 @@ class SettingsPage(Gtk.Box):
             removed = privacy.clear_preview_cache()
         except Exception as exc:
             _log.warning("Failed to clear cached previews: %s", exc)
-            self._set_privacy_message(f"Could not clear cached previews: {exc}")
+            self._set_storage_message(f"Could not clear cached previews: {exc}")
             return
 
         if removed:
-            self._set_privacy_message("Cleared cached thumbnails and previews.")
+            self._set_storage_message("Cleared cached thumbnails and previews.")
         else:
-            self._set_privacy_message("No cached thumbnails or previews found.")
+            self._set_storage_message("No cached thumbnails or previews found.")
 
     def _clear_debug_log(self) -> None:
         try:
             touched = privacy.clear_debug_logs()
         except Exception as exc:
             _log.warning("Failed to clear debug logs: %s", exc)
-            self._set_privacy_message(f"Could not clear debug logs: {exc}")
+            self._set_advanced_message(f"Could not clear debug logs: {exc}")
             return
 
         if touched:
-            self._set_privacy_message("Cleared debug logs.")
+            self._set_advanced_message("Cleared debug logs.")
         else:
-            self._set_privacy_message("No debug logs found.")
+            self._set_advanced_message("No debug logs found.")
 
-    def _set_privacy_message(self, message: str) -> None:
-        self._privacy_message_row.set_subtitle(message)
-        self._privacy_message_row.set_visible(True)
+    def _set_storage_message(self, message: str) -> None:
+        self._storage_message_row.set_subtitle(message)
+        self._storage_message_row.set_visible(True)
 
     def _on_export_logs_clicked(self, *_args) -> None:
         dialog = Gtk.FileChooserNative(

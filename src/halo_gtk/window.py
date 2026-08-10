@@ -7,15 +7,17 @@ Right content: Gtk.Stack switching between dashboard, cameras, events, devices, 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import gi
 
 gi.require_version("Adw", "1")
+gi.require_version("Gdk", "4.0")
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import Adw, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, GdkPixbuf, Gtk  # noqa: E402
 
-from halo_gtk import APP_ID, device_names, theme_icons  # noqa: E402
+from halo_gtk import APP_ID, device_names  # noqa: E402
 from halo_gtk.alarm_page import AlarmPage  # noqa: E402
 from halo_gtk.cameras_page import CamerasPage  # noqa: E402
 from halo_gtk.dashboard_page import DashboardPage  # noqa: E402
@@ -31,6 +33,7 @@ from halo_gtk.ring_client import (  # noqa: E402
     listener_state,
     remove_connection_state_callback,
 )
+from halo_gtk.ui_style import install_ui_style  # noqa: E402
 
 _log = logging.getLogger(__name__)
 
@@ -39,7 +42,7 @@ _NAV_ITEMS = [
     ("dashboard", "Dashboard", "view-grid-symbolic"),
     ("cameras", "Live Monitoring", "camera-video-symbolic"),
     ("history", "Event History", "document-open-recent-symbolic"),
-    ("devices", "Devices", "computer-symbolic"),
+    ("devices", "Devices", "preferences-system-devices-symbolic"),
     ("alarm", "Alarm", "security-high-symbolic"),
 ]
 
@@ -58,15 +61,15 @@ class RingWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs) -> None:
         super().__init__(
             title="Halo",
-            default_width=1100,
-            default_height=720,
+            default_width=1360,
+            default_height=880,
             **kwargs,
         )
         # Absolute minimum the app will attempt to render into.  Tiled
         # Wayland compositors (e.g. Hyprland) can force any size; setting a
         # size_request gives GTK a floor so it never allocates zero pixels
         # to widgets.
-        self.set_size_request(400, 300)
+        self.set_size_request(360, 480)
         self.connect("close-request", self._on_close_request)
         self._build_ui()
         add_connection_state_callback(self._on_listener_state)
@@ -77,107 +80,100 @@ class RingWindow(Adw.ApplicationWindow):
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        # Root: OverlaySplitView — full-height sidebar + content area.
+        install_ui_style()
+
+        # Full-height navigation ribbon which becomes an overlay on narrow windows.
         self._split_view = Adw.OverlaySplitView(
+            sidebar_position=Gtk.PackType.START,
+            min_sidebar_width=218,
+            max_sidebar_width=248,
             sidebar_width_fraction=0.20,
             collapsed=False,
+            show_sidebar=True,
         )
         self._split_view.connect("notify::collapsed", self._on_collapsed_changed)
         self._split_view.connect("notify::show-sidebar", self._on_sidebar_visibility_changed)
         self.set_content(self._split_view)
 
-        # Content ToolbarView holds the window title bar, page content, and
-        # sign-in banner. The sidebar remains a full-height app ribbon.
         content_toolbar = Adw.ToolbarView()
 
         self._content_header = Adw.HeaderBar()
         self._header_title = Adw.WindowTitle(title="Dashboard")
         self._content_header.set_title_widget(self._header_title)
+
         self._sidebar_toggle_btn = Gtk.Button(
-            icon_name="sidebar-hide-symbolic",
-            tooltip_text="Collapse sidebar",
+            icon_name="sidebar-show-symbolic",
+            tooltip_text="Show navigation",
+            visible=False,
+        )
+        self._sidebar_toggle_btn.update_property(
+            [Gtk.AccessibleProperty.LABEL],
+            ["Show navigation"],
         )
         self._sidebar_toggle_btn.connect("clicked", self._on_sidebar_toggle_clicked)
         self._content_header.pack_start(self._sidebar_toggle_btn)
-        self._header_balance = Gtk.Box(width_request=42)
-        self._content_header.pack_end(self._header_balance)
-        content_toolbar.add_top_bar(self._content_header)
 
-        # Sign-in banner (shown when not authenticated).
-        self._banner = Adw.Banner(title="Not signed in to Ring", button_label="Sign In")
-        self._banner.connect("button-clicked", self._on_sign_in)
-        content_toolbar.add_top_bar(self._banner)
-
-        # Real-time event connection status — shown only when signed in but the
-        # Ring FCM listener is reconnecting or offline.
-        self._events_banner = Adw.Banner(title="Reconnecting to Ring events…")
-        self._events_banner.set_revealed(False)
-        content_toolbar.add_top_bar(self._events_banner)
-
-        # ------------------------------------------------------------------
-        # Sidebar — primary product areas
-        # ------------------------------------------------------------------
-
-        sidebar_box = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL,
-            spacing=0,
-        )
-
-        chrome_row = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL,
-            spacing=4,
-            margin_top=8,
-            margin_bottom=6,
-            margin_start=8,
-            margin_end=8,
-        )
         self._back_btn = Gtk.Button(
             icon_name="go-previous-symbolic",
             tooltip_text="Back",
             sensitive=False,
-            css_classes=["flat"],
+            visible=False,
+        )
+        self._back_btn.update_property(
+            [Gtk.AccessibleProperty.LABEL],
+            ["Back"],
         )
         self._back_btn.connect("clicked", self._on_back_clicked)
-        chrome_row.append(self._back_btn)
-
-        halo_label = Gtk.Label(
-            label="Halo",
-            css_classes=["heading"],
-            hexpand=True,
-            halign=Gtk.Align.CENTER,
-        )
-        chrome_row.append(halo_label)
+        self._content_header.pack_start(self._back_btn)
 
         menu_btn = Gtk.MenuButton(
             icon_name="open-menu-symbolic",
-            tooltip_text="Menu",
-            css_classes=["flat"],
+            tooltip_text="Main menu",
+            menu_model=self._build_menu(),
         )
-        menu_btn.set_menu_model(self._build_menu())
-        chrome_row.append(menu_btn)
-        sidebar_box.append(chrome_row)
+        menu_btn.update_property(
+            [Gtk.AccessibleProperty.LABEL],
+            ["Main menu"],
+        )
+        self._content_header.pack_end(menu_btn)
+        content_toolbar.add_top_bar(self._content_header)
 
-        logo_box = Gtk.Box(
+        self._banner = Adw.Banner(title="Not signed in to Ring", button_label="Sign In")
+        self._banner.connect("button-clicked", self._on_sign_in)
+        content_toolbar.add_top_bar(self._banner)
+
+        self._events_banner = Adw.Banner(title="Reconnecting to Ring events…")
+        self._events_banner.set_revealed(False)
+        content_toolbar.add_top_bar(self._events_banner)
+
+        sidebar_box = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
-            halign=Gtk.Align.CENTER,
-            margin_top=12,
-            margin_bottom=16,
-            margin_start=12,
-            margin_end=12,
+            spacing=10,
+            width_request=218,
         )
-        logo_box.append(self._make_sidebar_logo(192))
-        sidebar_box.append(logo_box)
+        sidebar_box.add_css_class("navigation-ribbon")
+
+        brand = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=12,
+            valign=Gtk.Align.CENTER,
+        )
+        brand.add_css_class("ribbon-brand")
+        self._brand_icon = self._make_sidebar_logo(64)
+        brand.append(self._brand_icon)
+        brand_name = Gtk.Label(label="Halo", xalign=0, hexpand=True)
+        brand_name.add_css_class("title-3")
+        brand.append(brand_name)
+        sidebar_box.append(brand)
         sidebar_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
         self._nav_list = Gtk.ListBox(
-            css_classes=["navigation-sidebar"],
             selection_mode=Gtk.SelectionMode.SINGLE,
-            margin_top=8,
-            margin_bottom=8,
-            vexpand=True,
+            activate_on_single_click=True,
         )
+        self._nav_list.add_css_class("navigation-sidebar")
         self._nav_selected_handler_id = self._nav_list.connect(
-            "row-selected",
+            "row-activated",
             self._on_nav_selected,
         )
         sidebar_box.append(self._nav_list)
@@ -188,31 +184,32 @@ class RingWindow(Adw.ApplicationWindow):
             self._nav_list.append(row)
             self._nav_rows[name] = row
 
-        self._split_view.set_sidebar(sidebar_box)
+        sidebar_box.append(Gtk.Box(vexpand=True))
 
-        # ------------------------------------------------------------------
-        # Content area — stack
-        # ------------------------------------------------------------------
+        settings_btn = Gtk.Button(css_classes=["flat"])
+        settings_btn.add_css_class("ribbon-settings")
+        settings_content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=11)
+        settings_content.append(Gtk.Image.new_from_icon_name("preferences-system-symbolic"))
+        settings_content.append(Gtk.Label(label="Settings", xalign=0, hexpand=True))
+        settings_btn.set_child(settings_content)
+        settings_btn.set_tooltip_text("Open Settings")
+        settings_btn.update_property(
+            [Gtk.AccessibleProperty.LABEL],
+            ["Open Settings"],
+        )
+        settings_btn.set_action_name("app.settings")
+        sidebar_box.append(settings_btn)
+
+        self._split_view.set_sidebar(sidebar_box)
 
         self._content_stack = Gtk.Stack(
             transition_type=Gtk.StackTransitionType.CROSSFADE,
+            hhomogeneous=False,
+            vhomogeneous=False,
             hexpand=True,
             vexpand=True,
         )
-        # Wrap the page stack in a scroll container.  This caps the minimum
-        # height reported to the OverlaySplitView at ~0 so the window can
-        # shrink freely without clipping the header bar.  Each page handles
-        # its own internal scrolling; this wrapper only scrolls when a page
-        # has no vexpand and its natural height exceeds the viewport (i.e.
-        # the Home page when the window is very short).
-        content_scroll = Gtk.ScrolledWindow(
-            hscrollbar_policy=Gtk.PolicyType.NEVER,
-            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
-            hexpand=True,
-            vexpand=True,
-        )
-        content_scroll.set_child(self._content_stack)
-        content_toolbar.set_content(content_scroll)
+        content_toolbar.set_content(self._content_stack)
         self._split_view.set_content(content_toolbar)
 
         self._dashboard_cameras_page = CamerasPage(
@@ -223,6 +220,7 @@ class RingWindow(Adw.ApplicationWindow):
 
         self._cameras_page = CamerasPage(
             on_open_live_focus=self._open_focused_live,
+            on_open_history=self.open_history,
             show_monitoring_controls=True,
             grid_size_config_key="live_monitoring_grid_size",
             camera_order_config_key="live_monitoring_camera_order",
@@ -235,12 +233,10 @@ class RingWindow(Adw.ApplicationWindow):
         )
         self._content_stack.add_named(self._focused_live_page, "focused_live")
 
-        self._history_page = HistoryPage(
-            on_title_change=lambda name: self._update_title("history", name),
-        )
+        self._history_page = HistoryPage(on_title_change=self._on_history_title_change)
         self._content_stack.add_named(self._history_page, "history")
 
-        self._devices_page = DevicesPage()
+        self._devices_page = DevicesPage(on_show_cameras=lambda: self._show_page("dashboard"))
         self._content_stack.add_named(self._devices_page, "devices")
 
         self._alarm_page = AlarmPage()
@@ -248,42 +244,50 @@ class RingWindow(Adw.ApplicationWindow):
 
         # Default to Dashboard.
         self._active_page_name = "dashboard"
+        self._focused_source_page: str | None = None
         self._page_history: list[str] = []
         self._nav_list.select_row(self._nav_rows["dashboard"])
         self._sync_sidebar_buttons()
         self._update_back_button()
 
+        compact = Adw.Breakpoint.new(
+            Adw.BreakpointCondition.parse("max-width: 900px"),
+        )
+        compact.add_setter(self._split_view, "collapsed", True)
+        compact.add_setter(self._sidebar_toggle_btn, "visible", True)
+        compact.add_setter(self._history_page.split_view, "collapsed", True)
+        self.add_breakpoint(compact)
+
     def _make_nav_row(self, label: str, icon: str) -> Gtk.ListBoxRow:
-        row = Gtk.ListBoxRow()
+        row = Gtk.ListBoxRow(activatable=True)
         box = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL,
-            spacing=10,
-            margin_top=8,
-            margin_bottom=8,
-            margin_start=12,
-            margin_end=12,
+            spacing=11,
         )
+        box.add_css_class("ribbon-row")
         box.append(Gtk.Image(icon_name=icon))
         box.append(Gtk.Label(label=label, halign=Gtk.Align.START, hexpand=True))
         row.set_child(box)
         return row
 
     @staticmethod
-    def _make_sidebar_logo(pixel_size: int) -> Gtk.Image:
+    def _make_sidebar_logo(pixel_size: int) -> Gtk.Picture:
         """Load the app logo for the full-height sidebar."""
-        icon = Gtk.Image.new_from_icon_name(APP_ID)
-        icon.set_pixel_size(pixel_size)
+        icon_path = Path(__file__).resolve().parent / "assets" / "icons" / "apps" / f"{APP_ID}.png"
+        pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+            str(icon_path),
+            pixel_size,
+            pixel_size,
+            True,
+        )
+        icon = Gtk.Picture(
+            paintable=Gdk.Texture.new_for_pixbuf(pixbuf),
+            content_fit=Gtk.ContentFit.CONTAIN,
+            can_shrink=False,
+        )
+        icon.set_size_request(pixel_size, pixel_size)
         icon.set_halign(Gtk.Align.CENTER)
-
-        display = icon.get_display()
-        theme = Gtk.IconTheme.get_for_display(display) if display is not None else None
-        if theme is not None and not theme.has_icon(APP_ID):
-            png = theme_icons.icon_path("apps", f"{APP_ID}.png")
-            if png.exists():
-                icon = Gtk.Image.new_from_file(str(png))
-                icon.set_pixel_size(pixel_size)
-                icon.set_halign(Gtk.Align.CENTER)
-
+        icon.set_valign(Gtk.Align.CENTER)
         return icon
 
     def _build_menu(self):
@@ -312,6 +316,10 @@ class RingWindow(Adw.ApplicationWindow):
             self._header_title.set_title(page_label)
             self.set_title(f"Halo \u2022 {page_label}")
 
+    def _on_history_title_change(self, name: str | None) -> None:
+        if getattr(self, "_active_page_name", None) == "history":
+            self._update_title("history", name)
+
     def _on_nav_selected(self, list_box: Gtk.ListBox, row: Gtk.ListBoxRow | None) -> None:
         if row is None:
             return
@@ -322,13 +330,16 @@ class RingWindow(Adw.ApplicationWindow):
 
     def _show_page(self, name: str, *, record_history: bool = True) -> None:
         previous_page = self._active_page_name
-        if record_history and previous_page != name:
+        returning_to_monitoring = (
+            previous_page == "focused_live"
+            and name == "cameras"
+            and self._focused_source_page == "cameras"
+        )
+        if record_history and previous_page != name and previous_page != "focused_live":
             self._page_history.append(previous_page)
 
         if previous_page == "focused_live" and name != "focused_live":
-            self._focused_live_page.leave()
-            if name == "cameras":
-                self._cameras_page.reattach_live_monitoring_sessions()
+            self._leave_focused_live(name)
         if previous_page == "dashboard" and name != "dashboard":
             self._dashboard_cameras_page.on_page_hidden()
         elif previous_page == "cameras" and name != "cameras":
@@ -346,13 +357,19 @@ class RingWindow(Adw.ApplicationWindow):
         if name == "dashboard":
             self._dashboard_page.refresh()
         elif name == "cameras":
-            self._cameras_page.refresh()
+            if returning_to_monitoring:
+                self._cameras_page.resume_after_focused()
+            else:
+                self._cameras_page.refresh()
         elif name == "history":
             self._history_page.refresh()
         elif name == "devices":
             self._devices_page.refresh()
         elif name == "alarm":
             self._alarm_page.refresh()
+        split_view = getattr(self, "_split_view", None)
+        if split_view is not None and split_view.get_collapsed():
+            split_view.set_show_sidebar(False)
         self._update_back_button()
 
     def _on_back_clicked(self, *_args) -> None:
@@ -362,7 +379,9 @@ class RingWindow(Adw.ApplicationWindow):
         self._show_page(previous_page, record_history=False)
 
     def _update_back_button(self) -> None:
-        self._back_btn.set_sensitive(bool(self._page_history))
+        can_go_back = bool(self._page_history)
+        self._back_btn.set_sensitive(can_go_back)
+        self._back_btn.set_visible(can_go_back)
 
     def open_history(self, device_id: int | None = None) -> None:
         """Show Event History, optionally filtered to one camera."""
@@ -381,7 +400,7 @@ class RingWindow(Adw.ApplicationWindow):
             elif self._active_page_name == "cameras":
                 self._cameras_page.on_page_hidden()
             elif self._active_page_name == "focused_live":
-                self._focused_live_page.leave()
+                self._leave_focused_live("history")
                 append_history = False
             if append_history:
                 self._page_history.append(self._active_page_name)
@@ -423,6 +442,7 @@ class RingWindow(Adw.ApplicationWindow):
         initial_snapshot: bytes | None = None,
     ) -> None:
         if self._active_page_name == "focused_live":
+            source_page = self._focused_source_page or source_page
             self._focused_live_page.leave()
         elif source_page == "dashboard":
             self._dashboard_cameras_page.deactivate_snapshot_updates()
@@ -432,6 +452,7 @@ class RingWindow(Adw.ApplicationWindow):
             self._history_page.on_page_hidden()
         if self._active_page_name != "focused_live":
             self._page_history.append(self._active_page_name)
+        self._focused_source_page = source_page
         self._active_page_name = "focused_live"
         self._clear_nav_selection()
         self._content_stack.set_visible_child_name("focused_live")
@@ -442,6 +463,18 @@ class RingWindow(Adw.ApplicationWindow):
             initial_snapshot=initial_snapshot,
         )
         self._update_back_button()
+
+    def _leave_focused_live(self, destination: str) -> None:
+        """Release focused ownership and settle its source page lifecycle."""
+        source_page = self._focused_source_page
+        self._focused_live_page.leave()
+        if destination == "cameras" and source_page == "cameras":
+            self._cameras_page.reattach_live_monitoring_sessions()
+        elif source_page == "cameras":
+            self._cameras_page.on_page_hidden()
+        elif source_page == "dashboard" and destination != "dashboard":
+            self._dashboard_cameras_page.on_page_hidden()
+        self._focused_source_page = None
 
     def _refresh_camera_names(self) -> None:
         self._dashboard_cameras_page._refresh_device_names()
@@ -463,24 +496,23 @@ class RingWindow(Adw.ApplicationWindow):
 
     def _sync_sidebar_buttons(self) -> None:
         show_sidebar = self._split_view.get_show_sidebar()
-        self._sidebar_toggle_btn.set_icon_name(
-            "sidebar-show-symbolic" if show_sidebar else "sidebar-hide-symbolic"
-        )
-        self._sidebar_toggle_btn.set_tooltip_text(
-            "Collapse sidebar" if show_sidebar else "Show sidebar"
+        self._sidebar_toggle_btn.set_icon_name("sidebar-show-symbolic")
+        label = "Hide navigation" if show_sidebar else "Show navigation"
+        self._sidebar_toggle_btn.set_tooltip_text(label)
+        self._sidebar_toggle_btn.update_property(
+            [Gtk.AccessibleProperty.LABEL],
+            [label],
         )
 
     def do_size_allocate(self, width: int, height: int, baseline: int) -> None:
-        """Auto-collapse the sidebar when the window is narrower than 500 px.
-
-        Tiled Wayland compositors can set any window size regardless of the
-        size_request hint, so we must react to the actual allocated width here
-        rather than relying on requested sizes.
-        """
+        """Adapt the Live Monitoring inspector around its docking threshold."""
         Adw.ApplicationWindow.do_size_allocate(self, width, height, baseline)
-        should_collapse = width < 500
-        if self._split_view.get_collapsed() != should_collapse:
-            self._split_view.set_collapsed(should_collapse)
+        inspector = self._cameras_page.inspector_split_view
+        if inspector is not None:
+            collapse_inspector = width <= 1100
+            if inspector.get_collapsed() != collapse_inspector:
+                inspector.set_collapsed(collapse_inspector)
+                inspector.set_show_sidebar(not collapse_inspector)
 
     def _on_close_request(self, *_) -> bool:
         app = self.get_application()

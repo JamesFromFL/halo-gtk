@@ -8,11 +8,195 @@ from ring_doorbell.const import PUSH_ACTION_DING
 
 from halo_gtk.cameras_page import (
     CamerasPage,
+    CameraTile,
     _apply_preview_blur,
+    _density_columns,
     _motion_off_base_font_size,
     _preview_blur_radius,
     _reorder_ids,
 )
+
+
+class _FakeToggle:
+    def __init__(self, active=False):
+        self.active = active
+
+    def get_active(self):
+        return self.active
+
+    def set_active(self, active):
+        self.active = active
+
+    def handler_block_by_func(self, _callback):
+        pass
+
+    def handler_unblock_by_func(self, _callback):
+        pass
+
+
+def test_density_columns_follow_shared_preset(monkeypatch):
+    from halo_gtk import config
+
+    monkeypatch.setattr(config, "load", lambda: {"camera_grid_density_preset": "balanced"})
+    assert [_density_columns(mode) for mode in ("small", "medium", "large")] == [4, 2, 1]
+
+    monkeypatch.setattr(config, "load", lambda: {"camera_grid_density_preset": "dense"})
+    assert [_density_columns(mode) for mode in ("small", "medium", "large")] == [5, 3, 2]
+
+
+def test_dense_large_uses_fixed_ratio_for_two_column_grid(monkeypatch):
+    from halo_gtk import config
+
+    ratios = []
+    details = []
+    tile = SimpleNamespace(
+        _size_mode="medium",
+        _native_h=3,
+        _native_w=4,
+        _live_monitoring=False,
+        aspect_box=SimpleNamespace(set_ratio=ratios.append),
+        _details_grid=SimpleNamespace(set_visible=details.append),
+    )
+    monkeypatch.setattr(config, "load", lambda: {"camera_grid_density_preset": "dense"})
+
+    CameraTile.update_ratio(tile, "large")
+
+    assert ratios == [9 / 16]
+    assert details == [True]
+
+
+def test_compact_tile_presentation_tracks_physical_column_width(monkeypatch):
+    from halo_gtk import config
+
+    compact_states = []
+    page = CamerasPage.__new__(CamerasPage)
+    page._size_mode = "medium"
+    page._cards = {1: SimpleNamespace(set_compact_presentation=compact_states.append)}
+    monkeypatch.setattr(config, "load", lambda: {"camera_grid_density_preset": "dense"})
+
+    page._update_tile_compactness(344)
+    page._update_tile_compactness(1000)
+
+    assert compact_states == [True, False]
+
+
+def test_camera_tile_keyboard_activation_selects_camera():
+    activated = []
+    device = SimpleNamespace(id=7)
+    tile = SimpleNamespace(
+        device=device,
+        _is_layout_editing=lambda: False,
+        _on_activate=activated.append,
+    )
+
+    assert CameraTile._on_key_pressed(tile, None, 0xFF0D, 0, None) is True
+    assert activated == [device]
+
+
+def test_camera_tile_stops_active_talkback_before_releasing_owner():
+    calls = []
+    toggle = _FakeToggle(active=True)
+    tile = SimpleNamespace(
+        _mic_btn=toggle,
+        _live_session=SimpleNamespace(stop_talking=lambda: calls.append("stop")),
+        _on_mic_toggled=lambda *_: None,
+    )
+
+    CameraTile.stop_talking(tile)
+
+    assert calls == ["stop"]
+    assert toggle.active is False
+
+
+def test_camera_tile_reports_immediate_stream_start_failure(monkeypatch):
+    from halo_gtk import cameras_page
+
+    class FailedManager:
+        def acquire(self, *_args, **_kwargs):
+            raise RuntimeError("failed")
+
+    states = []
+    tile = SimpleNamespace(
+        _live_monitoring=True,
+        _live_active=False,
+        _stream_start_failed=False,
+        _set_volume_state=lambda _volume: None,
+        _set_stream_state=lambda *args: states.append(args),
+        device=SimpleNamespace(id=7, name="Camera"),
+    )
+    monkeypatch.setattr(cameras_page, "get_live_session_manager", FailedManager)
+
+    started = CameraTile.start_live_monitoring(tile)
+
+    assert started is False
+    assert tile._stream_start_failed is True
+    assert states == [("Stream failed", "dialog-error-symbolic", "offline")]
+
+
+def test_async_stream_failure_clears_tile_active_state_for_retry(monkeypatch):
+    from halo_gtk import cameras_page
+
+    session = SimpleNamespace(active=False, owners={"live-monitoring"})
+    manager = SimpleNamespace(session_for=lambda _device_id: session)
+    states = []
+    sensitivity = []
+    tile = SimpleNamespace(
+        device=SimpleNamespace(id=7),
+        _live_active=True,
+        _stream_start_failed=False,
+        stop_talking=lambda: states.append(("stop-talking",)),
+        _set_stream_controls_sensitive=sensitivity.append,
+        _set_stream_state=lambda *args: states.append(args),
+    )
+    monkeypatch.setattr(cameras_page, "get_live_session_manager", lambda: manager)
+
+    CameraTile._refresh_stream_state(tile)
+
+    assert tile._live_active is False
+    assert sensitivity == [False]
+    assert states == [
+        ("stop-talking",),
+        ("Stream unavailable", "dialog-error-symbolic", "offline"),
+    ]
+
+
+def test_opening_focused_view_stops_grid_talkback(monkeypatch):
+    from halo_gtk import cameras_page
+
+    calls = []
+    device = SimpleNamespace(id=7)
+    page = CamerasPage.__new__(CamerasPage)
+    page._cards = {7: SimpleNamespace(stop_talking=lambda: calls.append("stop-talking"))}
+    page._show_monitoring_controls = True
+    page._stop_monitoring_streams_except = lambda device_id: calls.append(("keep", device_id))
+    page._update_monitoring_buttons = lambda: None
+    page._on_open_live_focus = lambda *args: calls.append(("focus", args))
+    page._snapshot_cache = {}
+    monkeypatch.setattr(
+        cameras_page._cfg,
+        "load",
+        lambda: {"live_monitoring_keep_streams_in_focus": True},
+    )
+
+    page._show_live(device)
+
+    assert calls[0] == "stop-talking"
+    assert calls[1][0] == "focus"
+
+
+def test_hiding_inspector_stops_selected_camera_talkback():
+    calls = []
+    toggle = _FakeToggle(active=True)
+    page = SimpleNamespace(
+        _selected_tile=lambda: SimpleNamespace(stop_talking=lambda: calls.append("stop")),
+        _inspector_toggle=toggle,
+    )
+    split = SimpleNamespace(get_show_sidebar=lambda: False)
+
+    CamerasPage._sync_inspector_toggle(page, split, None)
+
+    assert calls == ["stop"]
+    assert toggle.active is False
 
 
 def test_reorder_ids_moves_source_before_destination():
@@ -277,3 +461,25 @@ def test_legacy_doorbell_push_refreshes_matching_camera_snapshot():
 
     assert cancelled == [12]
     assert queued == [(device, event, {"restart_timer": True})]
+
+
+def test_leaving_monitoring_stops_talkback_even_when_video_continues(monkeypatch):
+    from halo_gtk import cameras_page
+
+    calls = []
+    page = CamerasPage.__new__(CamerasPage)
+    page._cards = {
+        1: SimpleNamespace(stop_talking=lambda: calls.append("stop-talking")),
+    }
+    page._show_monitoring_controls = True
+    page.deactivate_snapshot_updates = lambda: calls.append("deactivate-snapshots")
+    page.stop_live_monitoring = lambda: calls.append("stop-video")
+    monkeypatch.setattr(
+        cameras_page._cfg,
+        "load",
+        lambda: {"live_monitoring_continue_on_page_exit": True},
+    )
+
+    page.on_page_hidden()
+
+    assert calls == ["deactivate-snapshots", "stop-talking"]

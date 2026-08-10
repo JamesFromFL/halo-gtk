@@ -18,23 +18,27 @@ class SettingsWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs) -> None:
         super().__init__(
             title="Settings",
-            default_width=780,
-            default_height=560,
+            default_width=920,
+            default_height=650,
             **kwargs,
         )
-        self.set_size_request(620, 420)
+        self.set_size_request(360, 480)
         self.connect("close-request", self._on_close_request)
         self._build_ui()
 
     def _build_ui(self) -> None:
-        toolbar_view = Adw.ToolbarView()
-        self.set_content(toolbar_view)
-
-        header = Adw.HeaderBar()
-        toolbar_view.add_top_bar(header)
-
         self._settings_page = SettingsPage()
-        toolbar_view.set_content(self._settings_page)
+        self.set_content(self._settings_page)
+
+        # Start compact so the first size negotiation does not inherit the
+        # combined minimum width of both split-view panes. The breakpoint then
+        # expands Settings when the window has enough room.
+        self._settings_page.split_view.set_collapsed(True)
+        wide = Adw.Breakpoint.new(
+            Adw.BreakpointCondition.parse("min-width: 600px"),
+        )
+        wide.add_setter(self._settings_page.split_view, "collapsed", False)
+        self.add_breakpoint(wide)
 
     def refresh(self) -> None:
         self._settings_page.refresh()

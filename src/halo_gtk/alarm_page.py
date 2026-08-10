@@ -16,34 +16,53 @@ class AlarmPage(Gtk.Box):
     def __init__(self) -> None:
         super().__init__(
             orientation=Gtk.Orientation.VERTICAL,
-            spacing=18,
-            margin_top=24,
-            margin_bottom=32,
-            margin_start=24,
-            margin_end=24,
             hexpand=True,
             vexpand=True,
         )
         self._build_ui()
 
     def _build_ui(self) -> None:
-        heading = Gtk.Label(
-            label="Alarm",
-            css_classes=["title-1"],
-            halign=Gtk.Align.START,
-        )
-        self.append(heading)
-
-        status = Adw.StatusPage(
-            icon_name="security-high-symbolic",
-            title="Ring Alarm Support",
-            description=(
-                "Alarm state, sensors, and confirmed arm/disarm controls will live here "
-                "after the alarm backend is added."
-            ),
+        content = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=14,
+            halign=Gtk.Align.CENTER,
+            valign=Gtk.Align.CENTER,
+            hexpand=True,
             vexpand=True,
+            margin_top=24,
+            margin_bottom=24,
+            margin_start=24,
+            margin_end=24,
         )
-        self.append(status)
+
+        icon = Gtk.Image.new_from_icon_name("security-high-symbolic")
+        icon.set_pixel_size(48)
+        icon.add_css_class("dim-label")
+        content.append(icon)
+
+        title = Gtk.Label(
+            label="Ring Alarm isn't available in Halo yet",
+            justify=Gtk.Justification.CENTER,
+            wrap=True,
+        )
+        title.add_css_class("title-2")
+        content.append(title)
+
+        description = Gtk.Label(
+            label=(
+                "Halo cannot arm, disarm, or monitor your Ring Alarm. "
+                "Use the Ring app for alarm control and emergency alerts."
+            ),
+            justify=Gtk.Justification.CENTER,
+            wrap=True,
+            max_width_chars=64,
+        )
+        description.add_css_class("dim-label")
+        content.append(description)
+
+        clamp = Adw.Clamp(maximum_size=680, tightening_threshold=520)
+        clamp.set_child(content)
+        self.append(clamp)
 
     def refresh(self) -> None:
         return

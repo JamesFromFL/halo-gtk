@@ -33,6 +33,14 @@ require_gi_namespace() {
   fi
 }
 
+require_adw_version() {
+  if ! "$REPO_ROOT/.venv/bin/python" -c "import gi; gi.require_version('Adw', '1'); from gi.repository import Adw; raise SystemExit(0 if (Adw.get_major_version(), Adw.get_minor_version()) >= (1, 5) else 1)" >/dev/null 2>&1; then
+    printf 'Halo requires libadwaita 1.5 or newer.\n' >&2
+    printf 'Upgrade the system libadwaita package before installing Halo.\n' >&2
+    exit 1
+  fi
+}
+
 require_gst_element() {
   local element="$1"
   local package_hint="$2"
@@ -128,6 +136,7 @@ install_schema() {
 
 validate_runtime() {
   require_gi_namespace Adw 1 libadwaita
+  require_adw_version
   require_gi_namespace GdkPixbuf 2.0 gdk-pixbuf2
   require_gi_namespace GioUnix 2.0 glib2
   require_gi_namespace Graphene 1.0 graphene

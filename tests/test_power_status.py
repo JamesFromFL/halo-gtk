@@ -31,38 +31,34 @@ class _BrokenDevice:
 def test_camera_power_status_uses_plugged_icon_when_no_battery_metadata():
     status = power_status.camera_power_status(_Device())
 
-    assert status.icon_path.name in {
-        "power-hardwired-dark-theme.png",
-        "power-hardwired-light-theme.png",
-    }
-    assert status.icon_path.is_file()
+    assert status.icon_name == "ac-adapter-symbolic"
     assert status.tooltip == "Plugged-In / Hardwired"
 
 
 def test_camera_power_status_uses_unknown_icon_when_metadata_is_unavailable():
     status = power_status.camera_power_status(_BrokenDevice())
 
-    assert status.icon_path.name.endswith("power-unknown.png")
+    assert status.icon_name == "dialog-question-symbolic"
     assert status.tooltip == "Unknown / Error"
 
 
 def test_camera_power_status_uses_expected_battery_ranges():
     expected = {
-        100: "power-battery-100-76.png",
-        76: "power-battery-100-76.png",
-        75: "power-battery-75-51.png",
-        51: "power-battery-75-51.png",
-        50: "power-battery-50-26.png",
-        26: "power-battery-50-26.png",
-        25: "power-battery-25-6.png",
-        6: "power-battery-25-6.png",
-        5: "power-battery-5-0.png",
-        0: "power-battery-5-0.png",
+        100: "battery-level-100-symbolic",
+        76: "battery-level-100-symbolic",
+        75: "battery-level-60-symbolic",
+        51: "battery-level-60-symbolic",
+        50: "battery-level-40-symbolic",
+        26: "battery-level-40-symbolic",
+        25: "battery-level-20-symbolic",
+        6: "battery-level-20-symbolic",
+        5: "battery-level-0-symbolic",
+        0: "battery-level-0-symbolic",
     }
 
     for percent, icon_name in expected.items():
         status = power_status.camera_power_status(_Device(percent))
-        assert status.icon_path.name.endswith(icon_name)
+        assert status.icon_name == icon_name
         assert status.tooltip == f"Battery: {percent}%"
 
 
@@ -77,10 +73,7 @@ def test_camera_power_status_prioritizes_external_power_over_battery_field():
         )
     )
 
-    assert status.icon_path.name in {
-        "power-hardwired-dark-theme.png",
-        "power-hardwired-light-theme.png",
-    }
+    assert status.icon_name == "ac-adapter-symbolic"
     assert status.tooltip == "Plugged-In / Hardwired"
 
 
@@ -95,14 +88,29 @@ def test_camera_power_status_uses_charging_battery_icon_for_battery_on_external_
         )
     )
 
-    assert status.icon_path.name.endswith("power-charging-battery-75-51.png")
+    assert status.icon_name == "battery-level-60-charging-symbolic"
     assert status.tooltip == "Battery charging: 63%"
+
+
+def test_camera_power_status_uses_available_icon_for_high_charging_battery():
+    status = power_status.camera_power_status(
+        _Device(
+            100,
+            attrs={
+                "external_connection": True,
+                "battery_present": True,
+            },
+        )
+    )
+
+    assert status.icon_name == "battery-level-90-charging-symbolic"
+    assert status.tooltip == "Battery charging: 100%"
 
 
 def test_camera_power_status_uses_battery_unknown_icon_when_battery_has_no_percent():
     status = power_status.camera_power_status(_Device(attrs={"battery_present": True}))
 
-    assert status.icon_path.name.endswith("power-battery-unknown.png")
+    assert status.icon_name == "battery-missing-symbolic"
     assert status.tooltip == "Battery: Unknown"
 
 
@@ -116,18 +124,12 @@ def test_camera_power_status_treats_external_power_without_battery_as_hardwired(
         )
     )
 
-    assert status.icon_path.name in {
-        "power-hardwired-dark-theme.png",
-        "power-hardwired-light-theme.png",
-    }
+    assert status.icon_name == "ac-adapter-symbolic"
     assert status.tooltip == "Plugged-In / Hardwired"
 
 
 def test_camera_power_status_uses_capability_to_classify_wired_devices():
     status = power_status.camera_power_status(_Device(100, battery_capable=False))
 
-    assert status.icon_path.name in {
-        "power-hardwired-dark-theme.png",
-        "power-hardwired-light-theme.png",
-    }
+    assert status.icon_name == "ac-adapter-symbolic"
     assert status.tooltip == "Plugged-In / Hardwired"

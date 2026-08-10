@@ -1,24 +1,22 @@
-"""Ring activity classification for event labels and packaged icons."""
+"""Ring activity classification for labels and standard symbolic icons."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from halo_gtk.ring_events import normalized_event_kind
-from halo_gtk.theme_icons import icon_path
 
-_ICON_FILES = {
-    "answered_ring": ("events", "event-answered-ring.png"),
-    "default_ring": ("defaults", "default-ring.png"),
-    "favorite": ("defaults", "favorite.png"),
-    "linked_motion": ("events", "event-linked.png"),
-    "live_view": ("events", "event-live-view.png"),
-    "missed_ring": ("events", "event-missed-ring.png"),
-    "motion": ("events", "event-motion-detected.png"),
-    "package": ("events", "event-package.png"),
-    "person": ("events", "event-person-detected.png"),
-    "vehicle": ("events", "event-vehicle-detected.png"),
+_ICON_NAMES = {
+    "answered_ring": "call-start-symbolic",
+    "default_ring": "alarm-symbolic",
+    "favorite": "starred-symbolic",
+    "linked_motion": "insert-link-symbolic",
+    "live_view": "camera-video-symbolic",
+    "missed_ring": "call-stop-symbolic",
+    "motion": "media-record-symbolic",
+    "package": "package-x-generic-symbolic",
+    "person": "system-users-symbolic",
+    "vehicle": "media-record-symbolic",
 }
 
 _LABELS = {
@@ -66,10 +64,9 @@ def activity_label(event: dict[str, Any] | None) -> str:
     return _LABELS[activity_key(event)]
 
 
-def activity_icon_path(event: dict[str, Any] | None) -> Path:
-    """Return the packaged PNG icon path for *event*."""
-    category, filename = _ICON_FILES[activity_key(event)]
-    return icon_path(category, filename)
+def activity_icon_name(event: dict[str, Any] | None) -> str:
+    """Return the standard symbolic icon name for *event*."""
+    return _ICON_NAMES[activity_key(event)]
 
 
 def _motion_activity_key(event: dict[str, Any]) -> str:

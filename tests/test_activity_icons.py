@@ -48,11 +48,9 @@ def test_ring_and_live_event_kinds_map_to_activity_icons():
     assert activity_icons.activity_key({"kind": "on_demand_link"}) == "linked_motion"
 
 
-def test_activity_icon_path_uses_packaged_assets():
-    path = activity_icons.activity_icon_path({"kind": "on_demand"})
-
-    assert path.name == "event-live-view.png"
-    assert path.is_file()
+def test_activity_icons_use_standard_symbolic_names():
+    assert activity_icons.activity_icon_name({"kind": "on_demand"}) == "camera-video-symbolic"
+    assert activity_icons.activity_icon_name({"kind": "motion"}) == "media-record-symbolic"
 
 
 def test_local_favorites_and_missing_metadata_have_favorite_icon_and_missing_label():

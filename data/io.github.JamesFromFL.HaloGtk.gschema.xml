@@ -45,6 +45,10 @@
       <default>'medium'</default>
       <summary>Camera grid tile size</summary>
     </key>
+    <key name="camera-grid-density-preset" type="s">
+      <default>'balanced'</default>
+      <summary>Column counts used by the camera grid size controls</summary>
+    </key>
     <key name="camera-order" type="ai">
       <default>[]</default>
       <summary>Camera grid device order</summary>

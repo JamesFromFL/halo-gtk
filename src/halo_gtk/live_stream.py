@@ -54,6 +54,8 @@ class _StreamResources:
     cleanup_started: bool = False
     terminal_notified: bool = False
     connected: bool = False
+    talkback_generation: int = 0
+    talkback_requested: bool = False
 
     async def cleanup(self) -> None:
         if self.cleanup_started:
@@ -71,6 +73,8 @@ class _StreamResources:
                 _log.debug("%s cleanup failed: %s", label, exc)
 
         if self.mic_track is not None:
+            self.talkback_generation += 1
+            self.talkback_requested = False
             await run_step(self.mic_track.stop_capture(), "Microphone")
 
         current = asyncio.current_task()
@@ -279,6 +283,8 @@ class LiveStreamView(Gtk.Box):
         resources = self._resources
         self._resources = None
         if resources is not None:
+            resources.talkback_generation += 1
+            resources.talkback_requested = False
             self._schedule_cleanup(resources)
         if self._pipeline is not None:
             self._pipeline.set_state(Gst.State.NULL)
@@ -300,31 +306,60 @@ class LiveStreamView(Gtk.Box):
     def start_talking(self) -> None:
         """Begin sending microphone audio to Ring.  Safe to call from GTK thread."""
         resources = self._resources
-        if resources is None or resources.mic_track is None:
+        if resources is None:
             return
+        resources.talkback_generation += 1
+        resources.talkback_requested = True
+        generation = resources.talkback_generation
         self._submit(
             resources.client,
-            self._async_start_talking(resources),
+            self._async_start_talking(resources, generation),
             "Microphone start",
         )
 
-    async def _async_start_talking(self, resources: _StreamResources) -> None:
+    async def _async_start_talking(
+        self,
+        resources: _StreamResources,
+        generation: int,
+    ) -> None:
         """Activate the camera speaker before sending microphone samples."""
-        if not self._is_current_resources(resources):
+        while self._talkback_request_is_current(resources, generation):
+            if resources.connected and resources.mic_track is not None:
+                break
+            await asyncio.sleep(0.01)
+        if not self._talkback_request_is_current(resources, generation):
             return
         await activate_ring_camera_speaker(resources.device, resources.session_id)
-        if self._is_current_resources(resources) and resources.mic_track is not None:
+        if (
+            self._talkback_request_is_current(resources, generation)
+            and resources.mic_track is not None
+        ):
             await resources.mic_track.start_capture()
 
     def stop_talking(self) -> None:
         """Stop sending microphone audio.  Safe to call from GTK thread."""
         resources = self._resources
-        if resources is None or resources.mic_track is None:
+        if resources is None:
+            return
+        resources.talkback_generation += 1
+        resources.talkback_requested = False
+        if resources.mic_track is None:
             return
         self._submit(
             resources.client,
             resources.mic_track.stop_capture(),
             "Microphone stop",
+        )
+
+    def _talkback_request_is_current(
+        self,
+        resources: _StreamResources,
+        generation: int,
+    ) -> bool:
+        return (
+            self._is_current_resources(resources)
+            and resources.talkback_requested
+            and resources.talkback_generation == generation
         )
 
     def get_current_frame_png(self) -> bytes | None:

@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
-
-from halo_gtk.theme_icons import hardwired_power_icon_path, icon_path
 
 
 @dataclass(frozen=True)
 class PowerStatus:
-    icon_path: Path
+    icon_name: str
     tooltip: str
 
 
@@ -22,38 +19,38 @@ def camera_power_status(device: Any) -> PowerStatus:
     battery_present = _battery_present(device)
 
     if battery_present is False and (hardwired or external_power):
-        return PowerStatus(hardwired_power_icon_path(), "Plugged-In / Hardwired")
+        return PowerStatus("ac-adapter-symbolic", "Plugged-In / Hardwired")
 
     if hardwired and battery_present is not True:
-        return PowerStatus(hardwired_power_icon_path(), "Plugged-In / Hardwired")
+        return PowerStatus("ac-adapter-symbolic", "Plugged-In / Hardwired")
 
     battery = _battery_percent(device)
     if external_power and not hardwired:
         if battery is not None:
             return PowerStatus(
-                _power_icon_path(_battery_icon_stem(battery, charging=True)),
+                _battery_icon_name(battery, charging=True),
                 f"Battery charging: {battery}%",
             )
-        return PowerStatus(_power_icon_path("power-battery-unknown"), "Battery: Unknown")
+        return PowerStatus("battery-missing-symbolic", "Battery: Unknown")
 
     if battery_present is True:
         if battery is None:
-            return PowerStatus(_power_icon_path("power-battery-unknown"), "Battery: Unknown")
+            return PowerStatus("battery-missing-symbolic", "Battery: Unknown")
         return PowerStatus(
-            _power_icon_path(_battery_icon_stem(battery)),
+            _battery_icon_name(battery),
             f"Battery: {battery}%",
         )
 
     if battery is not None and not hardwired:
         return PowerStatus(
-            _power_icon_path(_battery_icon_stem(battery)),
+            _battery_icon_name(battery),
             f"Battery: {battery}%",
         )
 
     if _has_accessible_metadata(device):
-        return PowerStatus(hardwired_power_icon_path(), "Plugged-In / Hardwired")
+        return PowerStatus("ac-adapter-symbolic", "Plugged-In / Hardwired")
 
-    return PowerStatus(_power_icon_path("power-unknown"), "Unknown / Error")
+    return PowerStatus("dialog-question-symbolic", "Unknown / Error")
 
 
 def _is_hardwired(device: Any) -> bool:
@@ -140,18 +137,18 @@ def _truthy(value: Any) -> bool:
     return value is True or value == 1 or str(value).lower() in {"true", "1", "yes"}
 
 
-def _battery_icon_stem(percent: int, *, charging: bool = False) -> str:
-    prefix = "power-charging-battery" if charging else "power-battery"
+def _battery_icon_name(percent: int, *, charging: bool = False) -> str:
     if percent >= 76:
-        return f"{prefix}-100-76"
-    if percent >= 51:
-        return f"{prefix}-75-51"
-    if percent >= 26:
-        return f"{prefix}-50-26"
-    if percent >= 6:
-        return f"{prefix}-25-6"
-    return f"{prefix}-5-0"
-
-
-def _power_icon_path(stem: str) -> Path:
-    return icon_path("power", f"{stem}.png")
+        level = 100
+    elif percent >= 51:
+        level = 60
+    elif percent >= 26:
+        level = 40
+    elif percent >= 6:
+        level = 20
+    else:
+        level = 0
+    if charging and level == 100:
+        return "battery-level-90-charging-symbolic"
+    suffix = "-charging" if charging else ""
+    return f"battery-level-{level}{suffix}-symbolic"

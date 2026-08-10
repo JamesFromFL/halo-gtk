@@ -27,36 +27,40 @@ class DashboardPage(Gtk.ScrolledWindow):
         self._inner = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
             spacing=18,
-            margin_top=24,
-            margin_bottom=32,
-            margin_start=24,
-            margin_end=24,
         )
-        self.set_child(self._inner)
+        self._inner.add_css_class("page-scroll-content")
+        clamp = Adw.Clamp(maximum_size=1180, tightening_threshold=900)
+        clamp.set_child(self._inner)
+        self.set_child(clamp)
 
         self._account_row: Adw.ActionRow | None = None
-        self._device_count_row: Adw.ActionRow | None = None
+        self._account_state_icon: Gtk.Image | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
-        status_group = Adw.PreferencesGroup(title="Ring Account")
+        status_group = Adw.PreferencesGroup()
         self._inner.append(status_group)
 
-        self._account_row = Adw.ActionRow(title="Session")
+        self._account_row = Adw.ActionRow(title="Ring account")
         self._account_row.add_prefix(Gtk.Image(icon_name="avatar-default-symbolic"))
+        self._account_state_icon = Gtk.Image(icon_name="network-offline-symbolic")
+        self._account_state_icon.set_tooltip_text("Not connected")
+        self._account_row.add_suffix(self._account_state_icon)
         status_group.add(self._account_row)
 
-        self._device_count_row = Adw.ActionRow(title="Ring Devices")
-        self._device_count_row.add_prefix(Gtk.Image(icon_name="computer-symbolic"))
-        status_group.add(self._device_count_row)
-
-        cameras_label = Gtk.Label(
-            label="Cameras",
-            css_classes=["title-3"],
-            halign=Gtk.Align.START,
-            margin_top=6,
+        cameras_heading = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        cameras_heading.add_css_class("section-heading")
+        cameras_title = Gtk.Label(label="Cameras", xalign=0)
+        cameras_title.add_css_class("title-3")
+        cameras_heading.append(cameras_title)
+        cameras_subtitle = Gtk.Label(
+            label="Live status and the most recent available snapshot",
+            xalign=0,
+            wrap=True,
         )
-        self._inner.append(cameras_label)
+        cameras_subtitle.add_css_class("dim-label")
+        cameras_heading.append(cameras_subtitle)
+        self._inner.append(cameras_heading)
 
         if self._camera_grid is not None:
             self._camera_grid.set_vexpand(True)
@@ -69,20 +73,21 @@ class DashboardPage(Gtk.ScrolledWindow):
 
         if self._account_row is not None:
             email = get_cached_account_email()
-            if signed_in and email:
-                self._account_row.set_subtitle(email)
-            elif signed_in:
-                self._account_row.set_subtitle("Signed in")
-            else:
-                self._account_row.set_subtitle("Not signed in")
-
-        if self._device_count_row is not None:
-            if not signed_in:
-                self._device_count_row.set_subtitle("Sign in to load Ring devices")
-            else:
+            if signed_in:
                 device_count = len(client.all_devices)
                 label = "device" if device_count == 1 else "devices"
-                self._device_count_row.set_subtitle(f"{device_count} {label} loaded")
+                self._account_row.set_title("Ring account connected")
+                detail = f"{device_count} {label} loaded"
+                self._account_row.set_subtitle(f"{email} - {detail}" if email else detail)
+                if self._account_state_icon is not None:
+                    self._account_state_icon.set_from_icon_name("object-select-symbolic")
+                    self._account_state_icon.set_tooltip_text("Connected")
+            else:
+                self._account_row.set_title("Ring account not connected")
+                self._account_row.set_subtitle("Sign in to load Ring devices")
+                if self._account_state_icon is not None:
+                    self._account_state_icon.set_from_icon_name("network-offline-symbolic")
+                    self._account_state_icon.set_tooltip_text("Not connected")
 
         if self._camera_grid is not None and hasattr(self._camera_grid, "refresh"):
             self._camera_grid.refresh()

@@ -9,6 +9,11 @@ home security on Linux. It is built to feel like a real GNOME application:
 fast navigation, useful camera controls, desktop notifications, local media
 tools, and a layout that stays out of the way while you monitor your home.
 
+The interface uses an adaptive left navigation ribbon on wide windows and an
+overlay drawer on compact windows. Camera imagery remains the primary content,
+with explicit snapshot, stream, connection, and device states shown in text as
+well as standard system icons.
+
 > Halo GTK is an unofficial project and is not affiliated with, endorsed by,
 > or supported by Ring or Amazon.
 
@@ -28,12 +33,15 @@ tools, and a layout that stays out of the way while you monitor your home.
 - Snapshot camera grid for a quick overview.
 - Camera cards with local Halo nicknames, latest snapshots, device power, network strength,
   and camera settings access.
+- Shared Balanced (`4 / 2 / 1`) and Dense (`5 / 3 / 2`) Small/Medium/Large grid presets.
 - Snapshot refresh on first load, Ring motion/ding events, and a fallback refresh timer.
 - Motion Detection Off handling with a consistent blurred snapshot overlay.
 
 ### Live Monitoring
 
 - Dedicated Live Monitoring page for multi-camera viewing.
+- Adaptive selected-camera inspector for health, talk, audio, light, siren, settings,
+  and history controls.
 - Saved custom layouts with camera visibility, camera order, and grid size.
 - Default layout uses the first four cameras in alphabetical order at medium size.
 - Layout save, rename, delete, and reset-to-default behavior.
@@ -53,9 +61,9 @@ tools, and a layout that stays out of the way while you monitor your home.
 - Reuses an existing Live Monitoring stream when a camera is already active.
 - Shows the latest cached frame or snapshot immediately while the live stream connects.
 - Keeps the final frame visible when the stream is stopped instead of cutting to a blank view.
-- Top status bar with power, network, camera settings, and camera event history access.
-- Bottom control bar with play, stop, microphone, screenshot, light, siren, mute, volume,
-  and zoom controls.
+- Image-first 16:9 monitor with direct play, stop, microphone, screenshot, light, siren,
+  mute, volume, and zoom controls.
+- Camera power, network, settings, and event-history access remain visible below the monitor.
 - Mouse-wheel zoom and drag-to-pan video inspection from 100% to 250%.
 - Screenshots capture the visible zoomed viewport.
 - Audio playback and two-way talk support through GStreamer and aiortc.
@@ -67,6 +75,7 @@ tools, and a layout that stays out of the way while you monitor your home.
 - Event classification for doorbell rings, on-demand views, motion, person, vehicle, package,
   linked events, and other Ring event kinds exposed by the API.
 - Ring recording playback with GStreamer.
+- Adaptive list/detail review with an image-only 16:9 playback surface and event metadata below it.
 - Progress bar, elapsed/total timer, previous/play/next controls, mute, volume, fullscreen,
   zoom, screenshot, favorite, share, download, and delete actions.
 - Video-only fullscreen behavior.
@@ -80,9 +89,9 @@ tools, and a layout that stays out of the way while you monitor your home.
 - Camera settings window with configurable Ring options when the device exposes them.
 - Device Info view for camera health, power, network, and raw device details.
 - Local Halo device nicknames stored outside Ring so device names can be customized per app.
-- Power status icons for hardwired/plugged-in devices, charging batteries, battery ranges,
-  and unknown/error states.
-- Network status icons for disconnected, poor, bad, moderate, good, excellent, and ethernet
+- Standard symbolic power states for hardwired/plugged-in devices, charging batteries,
+  battery ranges, and unknown/error states.
+- Standard symbolic network states for disconnected, wireless signal ranges, and ethernet
   connections.
 
 ### Notifications And Desktop Integration
@@ -93,6 +102,7 @@ tools, and a layout that stays out of the way while you monitor your home.
 - Optional tray/status indicator support.
 - User-local launcher, desktop file, hicolor icons, and GSettings schema installation.
 - GNOME light/dark style integration through libadwaita.
+- Six organized settings areas: General, Live View, Events, Storage, Account, and Advanced.
 
 ### Local Media And Privacy
 
@@ -124,8 +134,10 @@ For PipeWire audio output, also make sure the PipeWire GStreamer plugin is avail
 sudo pacman -S gst-plugin-pipewire
 ```
 
-Package names vary by distribution, but Halo needs GTK 4, libadwaita, libnotify,
-libsecret, GStreamer 1.0, common codec plugins, and the GTK 4 GStreamer paintable sink.
+Package names vary by distribution, but Halo needs GTK 4, **libadwaita 1.5 or newer**,
+libnotify, libsecret, GStreamer 1.0, common codec plugins, and the GTK 4 GStreamer
+paintable sink. Distributions shipping an older libadwaita, including Debian 12's base
+repositories, need a newer supported package source or distribution release.
 
 ### Python Dependencies
 
@@ -152,7 +164,7 @@ production dependencies, installs the launcher to `~/.local/bin/halo-gtk`, and i
 assets under `~/.local/share`. The launcher points into this checkout, so keep the checkout at the
 same path while Halo is installed.
 
-The wheel built in CI validates Halo's Python package and bundled runtime icons. It does not install
+The wheel built in CI validates Halo's Python package and bundled application icon. It does not install
 the desktop file, GSettings schema, or hicolor icons; `scripts/install.sh` remains the supported
 desktop installation path.
 

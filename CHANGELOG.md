@@ -20,6 +20,12 @@ This section tracks the work toward Halo GTK's first tagged release.
 - Automated lint, test, dependency-audit, schema, desktop-file, and installed-wheel checks.
 
 ### Changed
+- Rebuilt the application interface around an adaptive libadwaita navigation ribbon, image-first
+  camera surfaces, a selected-camera monitoring inspector, and compact list/detail history.
+- Reorganized settings into General, Live View, Events, Storage, Account, and Advanced areas.
+- Camera grid density can use Balanced 4/2/1 or Dense 5/3/2 Small/Medium/Large presets.
+- In-app activity, power, network, light, siren, and media controls now use standard symbolic
+  theme icons; Halo's unique application mark remains the only custom UI icon.
 - Ring authentication tokens moved from a legacy plaintext cache to Secret Service.
 - Configuration, layouts, nicknames, and favorites use validated, atomic JSON persistence.
 - Live media and Ring client resources now have explicit generation and ownership lifecycles.
@@ -38,3 +44,4 @@ This section tracks the work toward Halo GTK's first tagged release.
 - The obsolete in-repository headless bridge, RTSP spike utilities, embedded live-view
   fallback, and other unreachable compatibility code. The headless backend now lives in
   Halo Server.
+- The superseded custom event, power, network, light, and siren bitmap icon matrix.

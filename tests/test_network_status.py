@@ -15,36 +15,36 @@ class _Device:
 
 def test_camera_network_status_uses_percent_ranges():
     expected = {
-        0: ("network-wireless-disconnected-0", "Disconnected: 0%"),
-        1: ("network-wireless-poor-1-24", "Poor: 1%"),
-        24: ("network-wireless-poor-1-24", "Poor: 24%"),
-        25: ("network-wireless-bad-25-49", "Bad: 25%"),
-        49: ("network-wireless-bad-25-49", "Bad: 49%"),
-        50: ("network-wireless-moderate-50-69", "Moderate: 50%"),
-        69: ("network-wireless-moderate-50-69", "Moderate: 69%"),
-        70: ("network-wireless-good-70-84", "Good: 70%"),
-        84: ("network-wireless-good-70-84", "Good: 84%"),
-        85: ("network-wireless-excellent-84-100", "Excellent: 85%"),
-        100: ("network-wireless-excellent-84-100", "Excellent: 100%"),
+        0: ("network-offline-symbolic", "Disconnected: 0%"),
+        1: ("network-wireless-signal-none-symbolic", "Poor: 1%"),
+        24: ("network-wireless-signal-none-symbolic", "Poor: 24%"),
+        25: ("network-wireless-signal-weak-symbolic", "Bad: 25%"),
+        49: ("network-wireless-signal-weak-symbolic", "Bad: 49%"),
+        50: ("network-wireless-signal-ok-symbolic", "Moderate: 50%"),
+        69: ("network-wireless-signal-ok-symbolic", "Moderate: 69%"),
+        70: ("network-wireless-signal-good-symbolic", "Good: 70%"),
+        84: ("network-wireless-signal-good-symbolic", "Good: 84%"),
+        85: ("network-wireless-signal-excellent-symbolic", "Excellent: 85%"),
+        100: ("network-wireless-signal-excellent-symbolic", "Excellent: 100%"),
     }
 
-    for percent, (icon_stem, tooltip) in expected.items():
+    for percent, (icon_name, tooltip) in expected.items():
         status = network_status.camera_network_status(_Device({"wifi_signal_percentage": percent}))
-        assert status.icon_path.name.startswith(icon_stem)
+        assert status.icon_name == icon_name
         assert status.tooltip == tooltip
 
 
 def test_camera_network_status_converts_rssi_to_percent():
     status = network_status.camera_network_status(_Device({"rssi": -67}))
 
-    assert status.icon_path.name.startswith("network-wireless-moderate-50-69")
+    assert status.icon_name == "network-wireless-signal-ok-symbolic"
     assert status.tooltip == "Moderate: 66%"
 
 
 def test_camera_network_status_uses_category_when_percent_is_missing():
     status = network_status.camera_network_status(_Device({"rssi_category": "good"}))
 
-    assert status.icon_path.name.startswith("network-wireless-good-70-84")
+    assert status.icon_name == "network-wireless-signal-good-symbolic"
     assert status.tooltip == "Good: 77%"
 
 
@@ -53,5 +53,5 @@ def test_camera_network_status_uses_ethernet_icon_for_wired_connection():
         _Device({"connection_type": "ethernet", "signal_percentage": 100})
     )
 
-    assert status.icon_path.name.startswith("network-ethernet")
+    assert status.icon_name == "network-wired-symbolic"
     assert status.tooltip == "Ethernet: 100%"
