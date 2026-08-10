@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="io.github.JamesFromFL.HaloGtk" path="/io/github/JamesFromFL/HaloGtk/">
+    <key name="show-notifications" type="b">
+      <default>true</default>
+      <summary>Show desktop notifications for Ring events</summary>
+    </key>
+    <key name="notify-doorbell" type="b">
+      <default>true</default>
+      <summary>Show doorbell ring notifications</summary>
+    </key>
+    <key name="notify-motion" type="b">
+      <default>true</default>
+      <summary>Show motion notifications</summary>
+    </key>
+    <key name="notify-alarm" type="b">
+      <default>true</default>
+      <summary>Show Ring Alarm notifications</summary>
+    </key>
+    <key name="notification-preview-images" type="b">
+      <default>true</default>
+      <summary>Include preview images in notifications</summary>
+    </key>
+    <key name="notification-summaries" type="b">
+      <default>true</default>
+      <summary>Use Ring notification summaries when available</summary>
+    </key>
+    <key name="custom-notification-messages" type="b">
+      <default>false</default>
+      <summary>Use custom notification body messages</summary>
+    </key>
+    <key name="custom-doorbell-message" type="s">
+      <default>''</default>
+      <summary>Custom doorbell notification body</summary>
+    </key>
+    <key name="custom-motion-message" type="s">
+      <default>''</default>
+      <summary>Custom motion notification body</summary>
+    </key>
+    <key name="custom-alarm-message" type="s">
+      <default>''</default>
+      <summary>Custom alarm notification body</summary>
+    </key>
+    <key name="camera-grid-size" type="s">
+      <default>'medium'</default>
+      <summary>Camera grid tile size</summary>
+    </key>
+    <key name="camera-order" type="ai">
+      <default>[]</default>
+      <summary>Camera grid device order</summary>
+    </key>
+    <key name="live-monitoring-grid-size" type="s">
+      <default>'medium'</default>
+      <summary>Live Monitoring grid tile size</summary>
+    </key>
+    <key name="live-monitoring-camera-order" type="ai">
+      <default>[]</default>
+      <summary>Live Monitoring camera order</summary>
+    </key>
+    <key name="live-monitoring-hidden-camera-ids" type="ai">
+      <default>[]</default>
+      <summary>Hidden cameras in Live Monitoring</summary>
+    </key>
+    <key name="live-monitoring-autostart" type="b">
+      <default>false</default>
+      <summary>Start live streams when Live Monitoring opens</summary>
+    </key>
+    <key name="live-monitoring-continue-on-page-exit" type="b">
+      <default>false</default>
+      <summary>Keep Live Monitoring streams active when leaving the page</summary>
+    </key>
+    <key name="live-monitoring-keep-streams-in-focus" type="b">
+      <default>false</default>
+      <summary>Keep grid streams active when opening a focused camera view</summary>
+    </key>
+    <key name="live-monitoring-allow-six-streams" type="b">
+      <default>false</default>
+      <summary>Allow up to six experimental Live Monitoring streams</summary>
+    </key>
+    <key name="live-monitoring-unmute-on-start" type="b">
+      <default>false</default>
+      <summary>Unmute Live Monitoring streams when they start</summary>
+    </key>
+    <key name="event-history-next-auto-play" type="b">
+      <default>false</default>
+      <summary>Automatically play the next recorded event</summary>
+    </key>
+    <key name="background-service" type="b">
+      <default>false</default>
+      <summary>Keep Halo active when the window is closed</summary>
+    </key>
+    <key name="autostart-login" type="b">
+      <default>false</default>
+      <summary>Launch Halo at user startup</summary>
+    </key>
+    <key name="autostart-background" type="b">
+      <default>false</default>
+      <summary>Launch Halo in the background at user startup</summary>
+    </key>
+    <key name="show-tray-icon" type="b">
+      <default>true</default>
+      <summary>Show the Halo tray icon</summary>
+    </key>
+    <key name="snapshot-dir" type="s">
+      <default>''</default>
+      <summary>Directory for saved snapshots</summary>
+    </key>
+    <key name="video-dir" type="s">
+      <default>''</default>
+      <summary>Directory for saved recordings</summary>
+    </key>
+    <key name="create-camera-subfolders" type="b">
+      <default>false</default>
+      <summary>Create per-camera folders when saving media</summary>
+    </key>
+    <key name="open-folder-after-save" type="b">
+      <default>false</default>
+      <summary>Open the destination folder after saving media</summary>
+    </key>
+  </schema>
+</schemalist>

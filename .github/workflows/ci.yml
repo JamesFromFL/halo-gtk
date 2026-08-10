@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.24"
+          enable-cache: true
+      - run: uv lock --check
+      - run: uv sync --frozen --no-group audit
+      - run: .venv/bin/ruff check --no-cache src tests scripts
+      - run: .venv/bin/ruff format --check --no-cache src tests scripts
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.24"
+          enable-cache: true
+      - run: uv lock --check
+      - run: uv sync --frozen --only-group audit
+      - name: Export locked production dependencies
+        run: |
+          uv export \
+            --frozen \
+            --no-dev \
+            --no-group audit \
+            --no-emit-project \
+            --output-file /tmp/halo-requirements.txt
+      - name: Audit locked production dependencies
+        run: |
+          uv run --frozen --only-group audit pip-audit \
+            --require-hashes \
+            --disable-pip \
+            --progress-spinner off \
+            --requirement /tmp/halo-requirements.txt
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.24"
+          enable-cache: true
+      - run: uv lock --check
+      - name: Install GTK runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            desktop-file-utils \
+            gir1.2-adw-1 \
+            gir1.2-gdkpixbuf-2.0 \
+            gir1.2-gst-plugins-base-1.0 \
+            gir1.2-gtk-4.0 \
+            gir1.2-notify-0.7 \
+            gir1.2-secret-1 \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav \
+            libsecret-1-0 \
+            python3-gi
+      - run: uv venv --python /usr/bin/python3 --system-site-packages
+      - run: uv sync --frozen --no-group audit
+      - run: .venv/bin/pytest -q -p no:cacheprovider
+
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.24"
+          enable-cache: true
+      - run: uv lock --check
+      - name: Install GTK runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            desktop-file-utils \
+            gir1.2-adw-1 \
+            gir1.2-gdkpixbuf-2.0 \
+            gir1.2-gst-plugins-base-1.0 \
+            gir1.2-gtk-4.0 \
+            gir1.2-notify-0.7 \
+            gir1.2-secret-1 \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav \
+            libsecret-1-0 \
+            python3-gi
+      - run: uv venv --python /usr/bin/python3 --system-site-packages
+      - run: uv sync --frozen --no-group audit
+      - run: .venv/bin/python scripts/ci_import_check.py
+      - run: .venv/bin/python -m compileall -q src tests scripts
+      - run: glib-compile-schemas --strict --dry-run data
+      - run: desktop-file-validate data/io.github.JamesFromFL.HaloGtk.desktop
+      - name: Build artifacts
+        run: uv build --out-dir dist
+      - name: Export locked production dependencies
+        run: |
+          uv export \
+            --frozen \
+            --no-dev \
+            --no-group audit \
+            --no-emit-project \
+            --output-file /tmp/halo-runtime-requirements.txt
+      - name: Smoke test installed wheel
+        run: |
+          uv venv --python /usr/bin/python3 --system-site-packages /tmp/halo-artifact-venv
+          uv pip install \
+            --python /tmp/halo-artifact-venv/bin/python \
+            --require-hashes \
+            --requirements /tmp/halo-runtime-requirements.txt
+          uv pip install \
+            --python /tmp/halo-artifact-venv/bin/python \
+            --no-deps \
+            dist/*.whl
+          uv pip check --python /tmp/halo-artifact-venv/bin/python
+          /tmp/halo-artifact-venv/bin/python scripts/ci_import_check.py --installed
+      - name: Record artifact identity
+        run: |
+          printf 'commit=%s\n' "$GITHUB_SHA" > dist/BUILD-INFO
+          sha256sum dist/*.whl dist/*.tar.gz > dist/SHA256SUMS
+          cat dist/BUILD-INFO dist/SHA256SUMS

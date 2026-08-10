@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=Halo
+GenericName=Home Security
+Comment=Native GTK4 client for Ring home security
+Exec=halo-gtk
+Icon=io.github.JamesFromFL.HaloGtk
+Terminal=false
+Type=Application
+Categories=AudioVideo;Video;
+Keywords=ring;doorbell;security;camera;home;
+StartupNotify=true
+StartupWMClass=halo-gtk
+X-GNOME-UsesNotifications=true

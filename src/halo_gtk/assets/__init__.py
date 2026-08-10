@@ -1,0 +1,1 @@
+"""Packaged Halo GTK assets."""
