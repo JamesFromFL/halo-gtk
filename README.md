@@ -238,36 +238,43 @@ Screenshot and recording folders can be changed in Settings.
 
 </details>
 
-## Ring Alarm backend
+## Experimental Ring Alarm
 
-Halo now includes an **experimental, backend-only** Ring Alarm integration. It
-shares the same authenticated Ring session as the camera experience, keeps
-Alarm transport failures isolated by location, and publishes immutable,
-revisioned snapshots for hubs, panels, and reported sensors.
+Halo's Alarm page is connected to an **experimental** Ring Alarm backend that
+shares the same authenticated Ring session as the camera experience. Switch
+between reported Alarm locations, see the current mode, transition phase,
+connection, and inventory status, and review Entry, Motion, Safety, and System
+devices with their reported state and health details.
 
-The reserved Alarm page is not connected to this backend yet. The implementation
-uses undocumented Ring CLAP interfaces and has been validated only with bounded
-synthetic fixtures. Live, read-only hardware comparison must happen before any
-controlled mode testing.
+Disarmed, Home, and Away controls are available only when Halo has a current,
+writable Alarm snapshot. Every mode request requires confirmation, faulted
+sensors require a separate explicit bypass review, and Halo waits for Ring to
+confirm the result instead of assuming a change succeeded.
 
-Halo is not an emergency-monitoring interface. The backend intentionally does
-not expose panic, dispatch, Alarm siren, lock, switch, schedule, or device
-configuration commands. Its protocol behavior was independently implemented
-against a pinned
+This integration uses undocumented Ring CLAP interfaces and has been validated
+only with bounded synthetic fixtures. It has **not** been validated against live
+Alarm hardware, so treat the page as a preview rather than a primary control
+surface.
+
+Halo is not an emergency-monitoring service. The Alarm page does not provide
+panic, dispatch, Alarm siren, lock, switch, schedule, or device-configuration
+controls, and it does not replace Ring's emergency or life-safety workflows.
+Keep the official Ring app or keypad available for setup, verification, mode
+control, and critical security response. Halo's protocol behavior was
+independently implemented against a pinned
 [`ring-client-api` reference](https://github.com/koush/ring/tree/516e96a24ec279168c246795e623b6bfdf58ec45/packages/ring-client-api).
 
 ## Current status
 
 Halo is currently **0.1.0 Alpha**. Camera, live-view, history, notification, and
-desktop workflows are implemented, but Ring APIs are private and evolving.
-Availability varies by device, account permissions, region, subscription, and
-Ring service behavior. Keep the official Ring app available for setup,
-account management, and critical security workflows.
+desktop workflows are implemented. Ring Alarm visibility and mode controls are
+experimental and have not been validated against live hardware. Ring APIs are
+private and evolving, and availability varies by device, account permissions,
+region, subscription, and Ring service behavior. Keep the official Ring app
+available for setup, account management, and critical security workflows.
 
 ### Planned work
 
-- Connect the experimental Alarm backend to the reserved UI after controlled
-  read-only and mode-control validation with owned hardware.
 - Expand support for non-camera Ring devices.
 - Add broader Linux packaging, including AUR and Flatpak options.
 - Build a dedicated browser for locally saved Favorites and media.

@@ -29,6 +29,33 @@ def test_explicit_logout_stops_runtime_before_client_teardown(monkeypatch):
     assert order == ["stop-runtime", "logout-client"]
 
 
+def test_logout_cleanup_error_still_refreshes_retired_client_state():
+    calls = []
+    page = SettingsPage.__new__(SettingsPage)
+    page._account_email_cache = "person@example.com"
+    page._account_email_loading = True
+    page._set_account_buttons_sensitive = lambda value: calls.append(("buttons", value))
+    page._set_account_message = lambda message: calls.append(("message", message))
+    page.refresh = lambda: calls.append(("refresh-settings", None))
+    page._refresh_main_window = lambda: calls.append(("refresh-window", None))
+
+    result = page._finish_logout("secret service unavailable")
+
+    assert result == settings_page.GLib.SOURCE_REMOVE
+    assert page._account_email_cache is None
+    assert page._account_email_loading is False
+    assert calls == [
+        ("buttons", True),
+        (
+            "message",
+            "Logged out of Ring, but local credentials could not be cleared: "
+            "secret service unavailable",
+        ),
+        ("refresh-settings", None),
+        ("refresh-window", None),
+    ]
+
+
 def test_rejected_refresh_stops_runtime_before_expected_client_logout(monkeypatch):
     order = []
 

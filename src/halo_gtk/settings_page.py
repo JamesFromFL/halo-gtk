@@ -1234,9 +1234,11 @@ class SettingsPage(Gtk.Box):
     def _finish_logout(self, error: str | None) -> bool:
         self._set_account_buttons_sensitive(True)
         if error is not None:
-            self._set_account_message(f"Could not log out: {error}")
-            return GLib.SOURCE_REMOVE
-        self._set_account_message("Logged out of Ring.")
+            self._set_account_message(
+                f"Logged out of Ring, but local credentials could not be cleared: {error}"
+            )
+        else:
+            self._set_account_message("Logged out of Ring.")
         self._account_email_cache = None
         self._account_email_loading = False
         self.refresh()

@@ -194,3 +194,50 @@ def test_hidden_history_title_does_not_replace_active_page_title():
     RingWindow._on_history_title_change(page, "Front Door")
 
     assert titles == [("history", "Front Door")]
+
+
+def test_alarm_navigation_refreshes_and_closes_compact_sidebar():
+    calls = []
+
+    class SplitView:
+        @staticmethod
+        def get_collapsed():
+            return True
+
+        @staticmethod
+        def set_show_sidebar(visible):
+            calls.append(("sidebar", visible))
+
+    page = SimpleNamespace(
+        _active_page_name="dashboard",
+        _page_history=[],
+        _dashboard_cameras_page=SimpleNamespace(
+            on_page_hidden=lambda: calls.append(("hide", "dashboard"))
+        ),
+        _cameras_page=SimpleNamespace(on_page_hidden=lambda: None),
+        _history_page=SimpleNamespace(on_page_hidden=lambda: None),
+        _focused_live_page=SimpleNamespace(leave=lambda: None),
+        _alarm_page=SimpleNamespace(refresh=lambda: calls.append(("refresh", "alarm"))),
+        _nav_rows={"alarm": object()},
+        _content_stack=SimpleNamespace(
+            set_visible_child_name=lambda name: calls.append(("page", name))
+        ),
+        _split_view=SplitView(),
+        _select_nav_row=lambda name: calls.append(("select", name)),
+        _update_title=lambda name: calls.append(("title", name)),
+        _update_back_button=lambda: calls.append(("back", True)),
+    )
+
+    RingWindow._show_page(page, "alarm")
+
+    assert page._active_page_name == "alarm"
+    assert page._page_history == ["dashboard"]
+    assert calls == [
+        ("hide", "dashboard"),
+        ("select", "alarm"),
+        ("page", "alarm"),
+        ("title", "alarm"),
+        ("refresh", "alarm"),
+        ("sidebar", False),
+        ("back", True),
+    ]

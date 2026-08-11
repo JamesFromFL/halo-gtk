@@ -162,6 +162,37 @@ _CSS = """
   padding: 9px 14px;
   border-top: 1px solid alpha(@borders, 0.45);
 }
+
+.alarm-overview {
+  border: 1px solid alpha(@borders, 0.52);
+  border-radius: 8px;
+  background: @card_bg_color;
+  box-shadow: 0 1px 3px alpha(black, 0.10);
+}
+
+.alarm-overview-content {
+  padding: 20px;
+}
+
+.alarm-state-symbol {
+  min-width: 34px;
+  min-height: 34px;
+  padding: 10px;
+  border-radius: 8px;
+  background: alpha(@accent_bg_color, 0.12);
+}
+
+.alarm-state-symbol.success {
+  background: alpha(@success_bg_color, 0.14);
+}
+
+.alarm-state-symbol.warning {
+  background: alpha(@warning_bg_color, 0.14);
+}
+
+.alarm-state-symbol.error {
+  background: alpha(@error_bg_color, 0.14);
+}
 """
 
 
