@@ -1,5 +1,7 @@
 """Focused lifecycle tests for Ring account actions in Settings."""
 
+from types import SimpleNamespace
+
 from ring_doorbell import AuthenticationError
 
 from halo_gtk import settings_page
@@ -153,3 +155,47 @@ def test_refreshing_six_stream_switch_does_not_refresh_main_window():
     page._on_live_monitoring_allow_six_toggled(object(), None)
 
     assert refreshed == []
+
+
+def test_account_switch_discards_previous_account_email_cache(monkeypatch):
+    client = SimpleNamespace(is_authenticated=True)
+    subtitles = []
+    started = []
+    page = SimpleNamespace(
+        _account_email_client=object(),
+        _account_email_cache="old@example.com",
+        _account_email_loading=True,
+        _login_status_row=SimpleNamespace(set_subtitle=lambda _value: None),
+        _refresh_session_button=SimpleNamespace(set_sensitive=lambda _value: None),
+        _logout_button=SimpleNamespace(set_sensitive=lambda _value: None),
+        _account_email_row=SimpleNamespace(set_subtitle=subtitles.append),
+        _load_account_email=lambda _client: None,
+    )
+    monkeypatch.setattr(settings_page, "get_client", lambda: client)
+    monkeypatch.setattr(
+        settings_page.threading,
+        "Thread",
+        lambda **kwargs: SimpleNamespace(start=lambda: started.append(kwargs["args"])),
+    )
+
+    SettingsPage._refresh_account(page)
+
+    assert page._account_email_client is client
+    assert page._account_email_cache is None
+    assert subtitles == ["Loading..."]
+    assert started == [(client,)]
+
+
+def test_delayed_account_email_result_does_not_overwrite_new_account(monkeypatch):
+    current = object()
+    page = SimpleNamespace(
+        _account_email_client=current,
+        _account_email_cache="new@example.com",
+        _account_email_loading=True,
+    )
+    monkeypatch.setattr(settings_page, "get_client", lambda: current)
+
+    SettingsPage._finish_load_account_email(page, "old@example.com", object())
+
+    assert page._account_email_cache == "new@example.com"
+    assert page._account_email_loading is True

@@ -174,6 +174,13 @@ def test_notification_target_handles_bad_metadata():
         is None
     )
     assert notifications._notification_target(SimpleNamespace(doorbot_id=None)) is None
+    assert notifications._notification_target(SimpleNamespace(doorbot_id=float("inf"))) is None
+    assert (
+        notifications._notification_target(
+            SimpleNamespace(doorbot_id=12, now=float("nan"), expires_in=30)
+        )
+        is None
+    )
 
     target = notifications._notification_target(
         SimpleNamespace(doorbot_id=12, id=34, now=100.0, expires_in=30.0)

@@ -824,10 +824,24 @@ class CameraTile(Gtk.Frame):
             self._live_session.set_volume(volume)
 
     def _on_mic_toggled(self, btn: Gtk.ToggleButton) -> None:
+        import weakref
+
+        from halo_gtk.ui_feedback import microphone_state, show_toast
+
         if self._live_session is None:
             return
         if btn.get_active():
-            self._live_session.start_talking()
+            session = self._live_session
+            tile_ref = weakref.ref(self)
+
+            def on_state(state):
+                tile = tile_ref()
+                if tile is not None and tile._live_session is session:
+                    microphone_state(tile._mic_btn, tile._on_mic_toggled, state, update_icon=False)
+                    if state == "failed":
+                        show_toast(tile, "Microphone unavailable. Check your input device.")
+
+            session.start_talking(on_state_changed=on_state)
         else:
             self._live_session.stop_talking()
 
@@ -986,6 +1000,7 @@ class CamerasPage(Gtk.Box):
         # device_id → last good PNG bytes; survives grid rebuilds for cache-first display.
         self._snapshot_cache: dict[int, bytes] = {}
         self._snapshot_generation = 0
+        self._snapshot_cancel_event = threading.Event()
         self._snapshot_inflight_generations: dict[int, int] = {}
         self._snapshot_pending_events: dict[int, object | None] = {}
         self._snapshot_restart_timer_ids: set[int] = set()
@@ -1691,8 +1706,8 @@ class CamerasPage(Gtk.Box):
         self._layout_records = [
             layout for layout in loaded_layouts if not self._layout_is_default_equivalent(layout)
         ]
-        if self._devices and len(self._layout_records) != len(loaded_layouts):
-            live_layouts.save_layouts(self._layout_records)
+        # Equivalence uses only the currently available cameras. A missing device
+        # must not turn an ordinary refresh into deletion of a saved layout.
         self._current_saved_layout_id = None
         if self._is_default_live_layout():
             label = live_layouts.DEFAULT_LAYOUT_NAME
@@ -2199,37 +2214,52 @@ class CamerasPage(Gtk.Box):
             return
 
         self._snapshot_inflight_generations[device_id] = generation
+        cancel_event = getattr(self, "_snapshot_cancel_event", None)
         threading.Thread(
             target=self._load_snapshot_guarded,
-            args=(device, event, generation),
+            args=(device, event, generation, cancel_event),
             daemon=True,
         ).start()
 
-    def _load_snapshot_guarded(self, device, event=None, generation: int = 0) -> None:
+    def _load_snapshot_guarded(
+        self, device, event=None, generation: int = 0, cancel_event=None
+    ) -> None:
         try:
-            self._load_snapshot(device, event, generation)
+            self._load_snapshot(device, event, generation, cancel_event=cancel_event)
         finally:
             GLib.idle_add(self._finish_snapshot_load, int(device.id), generation)
 
-    def _load_snapshot(self, device, event=None, generation: int | None = None) -> None:
+    def _load_snapshot(
+        self, device, event=None, generation: int | None = None, *, cancel_event=None
+    ) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            return
         client = get_client()
         if client is None:
             return
+
+        def fetch(method, *args):
+            if cancel_event is not None and cancel_event.is_set():
+                return None
+            kwargs = {"cancel_event": cancel_event} if cancel_event is not None else {}
+            return getattr(client, method)(*args, **kwargs)
 
         if self._show_monitoring_controls:
             png_bytes: bytes | None = None
             if event is not None:
                 try:
-                    png_bytes = client.event_preview_for_device(device, event)
+                    png_bytes = fetch("event_preview_for_device", device, event)
                 except Exception as exc:
                     _log.debug("Event preview fetch failed for %s: %s", device.name, exc)
             try:
                 if not png_bytes:
-                    png_bytes = client.snapshot_for_device(device)
+                    png_bytes = fetch("snapshot_for_device", device)
             except Exception as exc:
                 _log.debug("Snapshot fetch failed for %s: %s", device.name, exc)
             if not png_bytes:
-                png_bytes = client.last_event_frame_for_device(device)
+                png_bytes = fetch("last_event_frame_for_device", device)
+            if cancel_event is not None and cancel_event.is_set():
+                return
             base = bytes(png_bytes) if png_bytes else _make_dark_placeholder()
             img = _apply_preview_blur(base)
             if img:
@@ -2240,11 +2270,13 @@ class CamerasPage(Gtk.Box):
             png_bytes = None
             if event is not None:
                 try:
-                    png_bytes = client.event_preview_for_device(device, event)
+                    png_bytes = fetch("event_preview_for_device", device, event)
                 except Exception as exc:
                     _log.debug("Event preview fetch failed for %s: %s", device.name, exc)
             if not png_bytes:
-                png_bytes = client.last_event_frame_for_device(device)
+                png_bytes = fetch("last_event_frame_for_device", device)
+            if cancel_event is not None and cancel_event.is_set():
+                return
             base = bytes(png_bytes) if png_bytes else _make_dark_placeholder()
             img = _apply_motion_off_overlay(base)
             if img:
@@ -2254,12 +2286,14 @@ class CamerasPage(Gtk.Box):
         png_bytes: bytes | None = None
         try:
             if event is not None:
-                png_bytes = client.event_preview_for_device(device, event)
+                png_bytes = fetch("event_preview_for_device", device, event)
             if not png_bytes:
-                png_bytes = client.snapshot_for_device(device)
+                png_bytes = fetch("snapshot_for_device", device)
         except Exception as exc:
             _log.debug("Snapshot fetch failed for %s: %s", device.name, exc)
 
+        if cancel_event is not None and cancel_event.is_set():
+            return
         if png_bytes:
             self._queue_card_snapshot_update(device.id, bytes(png_bytes), False, generation)
         else:
@@ -2454,13 +2488,20 @@ class CamerasPage(Gtk.Box):
         dialog.set_default_response("cancel")
         dialog.set_close_response("cancel")
         dialog.set_response_appearance("activate", Adw.ResponseAppearance.DESTRUCTIVE)
-        dialog.connect("response", self._on_siren_confirmed, device)
+        dialog.connect("response", self._on_siren_confirmed, device, client)
         root = self.get_root()
         dialog.present(root if isinstance(root, Gtk.Window) else self)
 
-    def _on_siren_confirmed(self, _dialog, response: str, device) -> None:
-        if response == "activate":
-            self._set_siren(device, 30)
+    def _on_siren_confirmed(self, _dialog, response: str, device, client) -> None:
+        tile = self._cards.get(int(device.id))
+        if (
+            response == "activate"
+            and client is not None
+            and get_client() is client
+            and tile is not None
+            and tile.device is device
+        ):
+            self._set_siren(device, 30, client=client)
 
     def _set_siren(self, device, duration: int, *, client=None) -> None:
         if client is None:
@@ -2680,6 +2721,7 @@ class CamerasPage(Gtk.Box):
             self._event_client = None
         self._devices_request_generation += 1
         self._snapshot_generation += 1
+        self._cancel_snapshot_work()
         self._cancel_all_refresh_timers()
         self._snapshot_inflight_generations.clear()
         self._snapshot_pending_events.clear()
@@ -2691,6 +2733,7 @@ class CamerasPage(Gtk.Box):
 
     def _clear_grid(self) -> None:
         self._snapshot_generation += 1
+        self._cancel_snapshot_work()
         self._cancel_all_refresh_timers()
         self._snapshot_inflight_generations.clear()
         self._snapshot_pending_events.clear()
@@ -2704,6 +2747,12 @@ class CamerasPage(Gtk.Box):
         while (child := self._grid.get_first_child()) is not None:
             self._grid.remove(child)
         self._show_empty_monitoring_inspector()
+
+    def _cancel_snapshot_work(self) -> None:
+        previous = getattr(self, "_snapshot_cancel_event", None)
+        if previous is not None:
+            previous.set()
+        self._snapshot_cancel_event = threading.Event()
 
     def _rebuild_grid(self) -> None:
         while (child := self._grid.get_first_child()) is not None:

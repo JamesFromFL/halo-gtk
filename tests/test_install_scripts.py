@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -16,13 +20,19 @@ def _write_executable(path: Path, contents: str) -> None:
     path.chmod(0o755)
 
 
-def test_desktop_install_and_uninstall_in_isolated_home(tmp_path):
-    home = tmp_path / "home"
+@pytest.mark.parametrize("special_paths", [False, True])
+@pytest.mark.parametrize("relative_xdg", [False, True])
+def test_desktop_install_and_uninstall_in_isolated_home(tmp_path, special_paths, relative_xdg):
+    suffix = " $() &|%\"'`\\" if special_paths else ""
+    home = tmp_path / ("home" + suffix)
     fake_bin = tmp_path / "bin"
-    checkout = tmp_path / "checkout"
+    checkout = tmp_path / ("checkout" + suffix)
     fake_bin.mkdir()
     home.mkdir()
     shutil.copytree(REPO_ROOT / "scripts", checkout / "scripts")
+    helper = checkout / "src/halo_gtk/desktop_entry.py"
+    helper.parent.mkdir(parents=True)
+    shutil.copyfile(REPO_ROOT / "src/halo_gtk/desktop_entry.py", helper)
     shutil.copytree(
         REPO_ROOT / "data",
         checkout / "data",
@@ -62,6 +72,17 @@ if len(sys.argv) > 1 and sys.argv[1] == "venv":
             "XDG_STATE_HOME": str(home / ".local/state"),
         }
     )
+    if relative_xdg:
+        for name in ("XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"):
+            env[name] = "relative-xdg"
+
+    launcher = home / ".local/bin/halo-gtk"
+    desktop_file = home / ".local/share/applications/io.github.JamesFromFL.HaloGtk.desktop"
+    outside = tmp_path / "unrelated"
+    outside.write_text("preserve", encoding="utf-8")
+    for path in (launcher, desktop_file):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(outside)
 
     subprocess.run(
         [checkout / "scripts/install.sh"],
@@ -71,19 +92,36 @@ if len(sys.argv) > 1 and sys.argv[1] == "venv":
         timeout=30,
     )
 
-    launcher = home / ".local/bin/halo-gtk"
-    desktop_file = home / ".local/share/applications/io.github.JamesFromFL.HaloGtk.desktop"
     schema = home / ".local/share/glib-2.0/schemas/io.github.JamesFromFL.HaloGtk.gschema.xml"
     icon = home / ".local/share/icons/hicolor/256x256/apps/io.github.JamesFromFL.HaloGtk.png"
     assert launcher.is_file()
     assert stat.S_IMODE(launcher.stat().st_mode) == 0o755
-    assert f'exec "{checkout}/.venv/bin/halo-gtk" "$@"' in launcher.read_text(encoding="utf-8")
-    assert f'Exec="{home}/.local/bin/halo-gtk"' in desktop_file.read_text(encoding="utf-8")
+    assert f'exec {shlex.quote(str(checkout / ".venv/bin/halo-gtk"))} "$@"' in launcher.read_text(
+        encoding="utf-8"
+    )
+    from halo_gtk.desktop_entry import quote_exec_argument
+
+    assert f"Exec={quote_exec_argument(str(launcher))}" in desktop_file.read_text(encoding="utf-8")
+    assert outside.read_text(encoding="utf-8") == "preserve"
+    assert not launcher.is_symlink()
+    assert not desktop_file.is_symlink()
+
+    arguments_log = tmp_path / "arguments.json"
+    env["HALO_ARGUMENTS_LOG"] = str(arguments_log)
+    _write_executable(
+        checkout / ".venv/bin/halo-gtk",
+        "#!/usr/bin/env python3\nimport json, os, sys\n"
+        'with open(os.environ["HALO_ARGUMENTS_LOG"], "w") as out: json.dump(sys.argv[1:], out)\n',
+    )
+    arguments = ["--test", "literal $() &|%\"'`\\", "two words"]
+    subprocess.run([launcher, *arguments], env=env, check=True, timeout=10)
+    assert json.loads(arguments_log.read_text(encoding="utf-8")) == arguments
+    assert not (tmp_path / "relative-xdg").exists()
     assert schema.is_file()
     assert icon.is_file()
     assert uv_log.read_text(encoding="utf-8").splitlines() == [
-        f"venv --system-site-packages {checkout}/.venv",
         f"--project {checkout} lock --check",
+        f"venv --system-site-packages {checkout}/.venv",
         f"--project {checkout} sync --frozen --no-dev",
     ]
 
@@ -107,6 +145,7 @@ if len(sys.argv) > 1 and sys.argv[1] == "venv":
     assert not icon.exists()
     assert not autostart.exists()
     assert preserved.read_text(encoding="utf-8") == '{"preserved":true}\n'
+    assert outside.read_text(encoding="utf-8") == "preserve"
 
 
 def test_installer_validates_live_media_runtime_contract():

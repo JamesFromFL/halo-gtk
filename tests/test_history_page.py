@@ -174,3 +174,172 @@ def test_video_player_deactivate_stops_and_closes_fullscreen():
 
     assert calls == ["stop", "close", ("fullscreen", False)]
     assert player._fullscreen_window is None
+
+
+def test_selecting_an_event_stops_the_previous_recording_before_requesting_url(monkeypatch):
+    from halo_gtk import history_page
+
+    calls = []
+    event = {"id": 7, "device_id": 42}
+    page = SimpleNamespace(
+        _current_event=None,
+        _playback_request_generation=3,
+        _player=SimpleNamespace(stop=lambda: calls.append("stop")),
+        _update_favorite_button=lambda: None,
+        _update_event_details=lambda _event: calls.append("details"),
+        _nav_split=SimpleNamespace(set_show_content=lambda _value: None),
+        _on_title_change=None,
+        _load_and_play=lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        history_page.threading,
+        "Thread",
+        lambda **_kwargs: SimpleNamespace(start=lambda: calls.append("fetch")),
+    )
+
+    HistoryPage._on_event_selected(page, None, SimpleNamespace(_event_data=event))
+
+    assert calls == ["stop", "details", "fetch"]
+    assert page._current_event is event
+    assert page._playback_request_generation == 4
+
+
+def test_refresh_invalidates_pending_recording_requests(monkeypatch):
+    from halo_gtk import history_page
+
+    calls = []
+    page = SimpleNamespace(
+        _reset_current_event=lambda: calls.append("reset-playback"),
+        _nav_split=SimpleNamespace(set_show_content=lambda _value: None),
+        _list_placeholder=SimpleNamespace(
+            set_title=lambda _value: None, set_description=lambda _value: None
+        ),
+        _clear_event_list=lambda: None,
+        _reset_history_pagination=lambda: None,
+        _start_history_fetch=lambda **_kwargs: calls.append("fetch"),
+        _after_favorite_change=lambda: None,
+    )
+    monkeypatch.setattr(history_page, "get_client", lambda: SimpleNamespace(is_authenticated=True))
+    monkeypatch.setattr(history_page.favorites, "request_reconcile", lambda *_args, **_kwargs: None)
+
+    HistoryPage.refresh(page)
+
+    assert calls == ["reset-playback", "fetch"]
+
+
+def test_delayed_delete_preserves_other_cameras_and_newer_playback():
+    deleted = {"id": 7, "device_id": 42}
+    other_camera = {"id": 7, "device_id": 99}
+    newly_selected = {"id": 8, "device_id": 42}
+    calls = []
+    page = SimpleNamespace(
+        _events=[deleted, other_camera, newly_selected],
+        _current_event=newly_selected,
+        _reset_current_event=lambda: calls.append("reset"),
+        _fill_event_rows=lambda: calls.append("rows"),
+    )
+
+    HistoryPage._after_delete(page, deleted)
+
+    assert page._events == [other_camera, newly_selected]
+    assert page._current_event is newly_selected
+    assert calls == ["rows"]
+
+
+def test_delayed_delete_rebuild_keeps_navigation_without_restarting_current_clip(monkeypatch):
+    from halo_gtk import history_page
+
+    deleted = {"id": 7, "device_id": 42}
+    playing = {"id": 8, "device_id": 42}
+    following = {"id": 9, "device_id": 42}
+    activated = []
+
+    class EventList:
+        def __init__(self):
+            self.rows = []
+            self.selected = None
+
+        def append(self, row):
+            self.rows.append(row)
+
+        def clear(self):
+            self.rows.clear()
+            self.selected = None
+
+        def select_row(self, row):
+            self.selected = row
+
+        def get_selected_row(self):
+            return self.selected
+
+        def get_row_at_index(self, index):
+            return self.rows[index] if 0 <= index < len(self.rows) else None
+
+    event_list = EventList()
+
+    def make_row(event):
+        row = SimpleNamespace(_event_data=event)
+        row.get_index = lambda: event_list.rows.index(row)
+        return row
+
+    page = SimpleNamespace(
+        _events=[deleted, playing, following],
+        _current_event=dict(playing),  # Match identity even if the event dict was replaced.
+        _pending_event_id=None,
+        _history_exhausted=True,
+        _event_list=event_list,
+        _clear_event_list=event_list.clear,
+        _make_event_row=make_row,
+        _on_event_selected=lambda _list, row: activated.append(row._event_data),
+        _reset_current_event=lambda: activated.append("unexpected playback reset"),
+    )
+    page._visible_events = lambda: page._events
+    page._fill_event_rows = lambda: HistoryPage._fill_event_rows(page)
+    page._select_adjacent_event = lambda offset: HistoryPage._select_adjacent_event(page, offset)
+    monkeypatch.setattr(history_page._cfg, "load", lambda: {"event_history_next_auto_play": True})
+
+    HistoryPage._after_delete(page, deleted)
+
+    assert event_list.get_selected_row()._event_data is playing
+    assert activated == []
+    HistoryPage._on_playback_finished(page)
+    assert event_list.get_selected_row()._event_data is following
+    HistoryPage._select_adjacent_event(page, -1)
+    assert event_list.get_selected_row()._event_data is playing
+    assert activated == [following, playing]
+
+
+def test_delete_invalidates_pending_playback_for_a_matching_event():
+    deleted = {"id": 7, "device_id": 42}
+    calls = []
+    page = SimpleNamespace(
+        _events=[dict(deleted)],
+        _current_event=dict(deleted),
+        _reset_current_event=lambda: calls.append("reset"),
+        _fill_event_rows=lambda: calls.append("rows"),
+    )
+
+    HistoryPage._after_delete(page, deleted)
+
+    assert page._events == []
+    assert calls == ["reset", "rows"]
+
+
+def test_queued_end_of_stream_does_not_restart_autoplay_after_stop(monkeypatch):
+    from halo_gtk import history_page
+
+    queued = []
+    player = SimpleNamespace(
+        _playback_generation=3,
+        _handle_eos=lambda generation: _VideoPlayer._handle_eos(player, generation),
+    )
+    monkeypatch.setattr(
+        history_page.GLib, "idle_add", lambda callback, *args: queued.append((callback, args))
+    )
+
+    _VideoPlayer._on_eos(player)
+    player._playback_generation += 1  # stop() or loading another recording
+    callback, args = queued[0]
+
+    # No scrubber, polling or completion callback should be touched for the old clip.
+    assert callback(*args) is False

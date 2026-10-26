@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any
 
 
@@ -17,9 +18,16 @@ def camera_network_status(device: Any) -> NetworkStatus:
     """Return the network icon and tooltip for a Ring camera device."""
     connection_kind = _connection_kind(device)
     percent = _connection_percent(device)
+    if percent is None:
+        return NetworkStatus(
+            "network-wired-symbolic"
+            if connection_kind == "ethernet"
+            else "network-wireless-symbolic",
+            "Ethernet: signal unknown" if connection_kind == "ethernet" else "Connection: Unknown",
+        )
     label = _label_for_percent(percent)
 
-    if connection_kind == "ethernet":
+    if connection_kind == "ethernet" and percent > 0:
         return NetworkStatus(
             "network-wired-symbolic",
             _tooltip("Ethernet", percent),
@@ -44,15 +52,20 @@ def _connection_kind(device: Any) -> str:
         if value is None:
             continue
         text = str(value).lower()
-        if any(token in text for token in ("ethernet", "wired", "lan")):
-            return "ethernet"
         if any(token in text for token in ("wifi", "wi-fi", "wireless", "wlan")):
             return "wifi"
+        if any(token in text for token in ("ethernet", "wired", "lan")):
+            return "ethernet"
     return "wifi"
 
 
-def _connection_percent(device: Any) -> int:
+def _connection_percent(device: Any) -> int | None:
     attrs = _all_metadata(device)
+    # Cached signal values may survive disconnection. An explicit offline
+    # report must win over those historical readings.
+    status = _find_value(attrs, "connection_status")
+    if status is False or str(status).lower() in {"offline", "disconnected", "unreachable"}:
+        return 0
     for key in (
         "wifi_signal_percentage",
         "wifi_signal_percent",
@@ -80,11 +93,7 @@ def _connection_percent(device: Any) -> int:
     if category is not None:
         return _percent_for_category(category)
 
-    status = _find_value(attrs, "connection_status")
-    if status is not None and str(status).lower() in {"offline", "disconnected", "unreachable"}:
-        return 0
-
-    return 0
+    return None
 
 
 def _label_for_percent(percent: int) -> str:
@@ -119,7 +128,7 @@ def _tooltip(label: str, percent: int) -> str:
     return f"{label}: {percent}%"
 
 
-def _percent_for_category(value: str) -> int:
+def _percent_for_category(value: str) -> int | None:
     normalized = value.lower().replace("_", " ").replace("-", " ")
     if any(token in normalized for token in ("offline", "disconnected", "unreachable")):
         return 0
@@ -133,7 +142,7 @@ def _percent_for_category(value: str) -> int:
         return 77
     if "excellent" in normalized or "strong" in normalized:
         return 92
-    return 0
+    return None
 
 
 def _category_value(value: Any) -> str | None:
@@ -173,12 +182,15 @@ def _percent_from_rssi(value: float | None) -> int | None:
 def _number_from_value(value: Any) -> float | None:
     if isinstance(value, bool) or value is None:
         return None
-    if isinstance(value, int | float):
-        return float(value)
     try:
-        return float(str(value).strip().rstrip("%"))
-    except (TypeError, ValueError):
+        number = (
+            float(value)
+            if isinstance(value, int | float)
+            else float(str(value).strip().rstrip("%"))
+        )
+    except (TypeError, ValueError, OverflowError):
         return None
+    return number if isfinite(number) else None
 
 
 def _all_metadata(device: Any) -> dict[str, Any]:

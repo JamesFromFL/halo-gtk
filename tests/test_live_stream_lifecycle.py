@@ -463,6 +463,84 @@ async def test_stream_becomes_active_only_after_first_video_buffer(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_video_caps_follow_resolution_changes(monkeypatch):
+    import numpy as np
+    from aiortc.mediastreams import MediaStreamError
+
+    import halo_gtk.live_stream as live_stream
+
+    live_stream.Gst.init(None)
+    frames = iter((np.zeros((2, 4, 3), dtype=np.uint8), np.zeros((4, 8, 3), dtype=np.uint8)))
+    dimensions = []
+
+    class ChangingTrack:
+        async def recv(self):
+            array = next(frames, None)
+            if array is None:
+                raise MediaStreamError
+            return SimpleNamespace(to_ndarray=lambda **_kwargs: array)
+
+    class AppSrc:
+        def set_property(self, name, caps):
+            assert name == "caps"
+            structure = caps.get_structure(0)
+            dimensions.append((structure.get_value("width"), structure.get_value("height")))
+
+        def emit(self, *_args):
+            return live_stream.Gst.FlowReturn.OK
+
+    monkeypatch.setattr(live_stream.GLib, "idle_add", lambda *_args: None)
+    resources = _StreamResources(token=20, device=FakeDevice(), client=object(), session_id="test")
+    view = make_bare_view(resources)
+    view._video_appsrc = AppSrc()
+
+    await view._receive_frames(ChangingTrack(), resources)
+
+    assert dimensions == [(4, 2), (8, 4)]
+
+
+@pytest.mark.asyncio
+async def test_audio_caps_follow_channel_and_rate_changes():
+    import numpy as np
+    from aiortc.mediastreams import MediaStreamError
+    from av import AudioFrame
+
+    import halo_gtk.live_stream as live_stream
+
+    live_stream.Gst.init(None)
+    mono = AudioFrame.from_ndarray(np.zeros((1, 4), dtype=np.int16), "s16", "mono")
+    mono.sample_rate = 24000
+    stereo = AudioFrame.from_ndarray(np.zeros((2, 4), dtype=np.int16), "s16p", "stereo")
+    stereo.sample_rate = 48000
+    frames = iter((mono, stereo))
+    formats = []
+
+    class ChangingTrack:
+        async def recv(self):
+            frame = next(frames, None)
+            if frame is None:
+                raise MediaStreamError
+            return frame
+
+    class AppSrc:
+        def set_property(self, name, caps):
+            assert name == "caps"
+            structure = caps.get_structure(0)
+            formats.append((structure.get_value("channels"), structure.get_value("rate")))
+
+        def emit(self, *_args):
+            return live_stream.Gst.FlowReturn.OK
+
+    resources = _StreamResources(token=21, device=FakeDevice(), client=object(), session_id="test")
+    view = make_bare_view(resources)
+    view._audio_appsrc = AppSrc()
+
+    await view._receive_audio_frames(ChangingTrack(), resources)
+
+    assert formats == [(1, 24000), (2, 48000)]
+
+
+@pytest.mark.asyncio
 async def test_stop_during_offer_cleans_only_stopped_generation(monkeypatch):
     import aiortc
 

@@ -194,7 +194,7 @@ silently destroyed.
 - Python 3.11 through 3.14
 - `uv` 0.11.24
 - PyGObject, GdkPixbuf, GioUnix, Graphene, libnotify, and libsecret
-- GStreamer 1.0 with common codecs and `gtk4paintablesink`
+- GStreamer 1.20 or newer with common codecs and `gtk4paintablesink`
 - PulseAudio or PipeWire-compatible audio output
 - A PulseAudio-compatible microphone source for the current two-way-talk path
 - A desktop Secret Service provider for session storage
@@ -208,6 +208,20 @@ release.
 The wheel built in CI validates the Python package and bundled application icon.
 It does not install the desktop file, GSettings schema, or hicolor icons, so
 `scripts/install.sh` remains the supported desktop installation path.
+
+The media stack is validated against aiortc 1.15.0 and PyAV 17.1.0. Run
+`uv sync --frozen` after updating the checkout; an older environment does not
+support the explicit conversion-thread setting. Python 3.11 remains supported.
+
+Recording previews use verified HTTPS and a bounded child process for fetching,
+decoding, and image conversion. A slow, oversized, unsupported or canceled
+preview falls back to an available bounded snapshot. Previews accept at most
+8 MiB of recording body data and 4 MiB of image input, and return at most a
+1280×720 PNG. Full recording saves have a separate 512 MiB limit and a one-hour
+job budget; save jobs can continue across navigation and expose cancellation.
+Native codec process limits supplement these policies; they are not a complete
+security sandbox. Actual Ring/CDN compatibility and physical audio still need
+live regression testing.
 
 ## Privacy and local data
 
@@ -276,6 +290,7 @@ available for setup, account management, and critical security workflows.
 ### Planned work
 
 - Expand support for non-camera Ring devices.
+- Add Alarm and sensor event history; current Alarm support shows live status and mode controls.
 - Add broader Linux packaging, including AUR and Flatpak options.
 - Build a dedicated browser for locally saved Favorites and media.
 - Add more advanced per-device notification behavior.
@@ -296,6 +311,10 @@ uv build --out-dir dist
 
 `--system-site-packages` lets the virtual environment use `gi` and the GObject
 introspection libraries installed by the distribution.
+
+See [SECURITY.md](SECURITY.md) for dependency maintenance and the scoped upstream
+OAuthlib advisory exception. The [October 2026 audit](doc/audit-2026-10-25.md)
+records fixes, validation boundaries, unfinished features, and proposed larger changes.
 
 </details>
 

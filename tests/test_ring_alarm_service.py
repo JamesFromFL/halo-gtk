@@ -334,6 +334,51 @@ async def test_frames_for_assets_outside_current_ticket_are_ignored():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "connection", [AlarmConnectionStatus.OFFLINE, AlarmConnectionStatus.CELLULAR_BACKUP]
+)
+async def test_online_service_degrades_when_asset_disconnects_without_socket_closure(connection):
+    asset = AlarmTicketAsset("asset-1", "base_station_v1", "online")
+    transport = _StreamingTransport((asset,), (DeviceInfoDocList("asset-1", (_panel(),)),))
+    service = RingAlarmService(
+        _Gateway(),
+        (_owned_seed("location-1"),),
+        lambda _snapshot: None,
+        transport_factory=lambda _request, _seed: transport,
+        poll_interval=0.001,
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(service.run(stop))
+    try:
+        await _wait_until(lambda: service.snapshot.status is AlarmServiceStatus.ONLINE)
+        runtime = service._runtimes["location-1"]
+        await service._location_message(
+            runtime,
+            SessionInfo((AssetSessionInfo("asset-1", connection, "base_station_v1"),)),
+        )
+
+        location = service.snapshot.find_location("location-1")
+        assert transport.connected is True
+        assert service.snapshot.status is AlarmServiceStatus.DEGRADED
+        assert location.mode is AlarmMode.UNKNOWN
+        assert location.can_set_mode is False
+        assert location.inventory is AlarmInventoryStatus.STALE
+
+        await service._location_message(
+            runtime,
+            SessionInfo(
+                (AssetSessionInfo("asset-1", AlarmConnectionStatus.ONLINE, "base_station_v1"),)
+            ),
+        )
+        assert service.snapshot.status is AlarmServiceStatus.DEGRADED
+        await service._location_message(runtime, DeviceInfoDocList("asset-1", (_panel(),)))
+        assert service.snapshot.status is AlarmServiceStatus.ONLINE
+    finally:
+        stop.set()
+        await task
+
+
+@pytest.mark.asyncio
 async def test_reconcile_adds_and_removes_locations_without_restarting_healthy_socket():
     asset = AlarmTicketAsset("asset-1", "base_station_v1", "online")
     transports = {

@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import fcntl
 import json
 import re
+import tempfile
 import threading
+import time
+import weakref
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from halo_gtk import device_names, storage_paths
 from halo_gtk.atomic_io import atomic_write_json
-from halo_gtk.http_download import download_https
+from halo_gtk.http_download import async_download_https, download_https
 
 DATA_DIR = storage_paths.data_dir()
 FAVORITES_DIR = DATA_DIR / "favorites"
@@ -28,8 +33,126 @@ _ids_lock = threading.Lock()
 _cached_ids: set[str] | None = None
 _cached_ids_key: tuple[str, float | None] | None = None
 _index_lock = threading.RLock()
+_async_locks = weakref.WeakKeyDictionary()
+_async_locks_guard = threading.Lock()
 
 _VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm", ".mkv"}
+
+_snapshot_lock = threading.Lock()
+_snapshot_key: str | None = None
+_snapshot_events: tuple = ()
+_snapshot_ids: frozenset[str] = frozenset()
+_snapshot_updated = 0.0
+_snapshot_loading = False
+_snapshot_callbacks: list = []
+_snapshot_generation = 0
+_snapshot_retry_after = 0.0
+
+
+def cached_favorite_events() -> list[dict[str, Any]]:
+    """Return copied immutable-cache entries without filesystem work on GTK."""
+    request_reconcile()
+    with _snapshot_lock:
+        return [dict(event) for event in _snapshot_events]
+
+
+def cached_is_favorited(event: dict[str, Any]) -> bool:
+    request_reconcile()
+    with _snapshot_lock:
+        return favorite_id_for_event(event) in _snapshot_ids
+
+
+def request_reconcile(callback=None, *, force: bool = False) -> None:
+    """Coalesce background scans; a mutation during a scan forces a fresh pass."""
+    global _snapshot_key, _snapshot_loading, _snapshot_events, _snapshot_ids
+    global _snapshot_updated, _snapshot_generation, _snapshot_retry_after
+    key = str(FAVORITES_INDEX)
+    ready = []
+    start = False
+    with _snapshot_lock:
+        if _snapshot_key != key:
+            _snapshot_key, _snapshot_events, _snapshot_ids = key, (), frozenset()
+            _snapshot_updated = 0.0
+            _snapshot_retry_after = 0.0
+            _snapshot_generation += 1
+        if force:
+            _snapshot_generation += 1
+        if callback is not None:
+            reference = (
+                weakref.WeakMethod(callback) if getattr(callback, "__self__", None) else callback
+            )
+            if reference not in _snapshot_callbacks:
+                _snapshot_callbacks.append(reference)
+        if _snapshot_loading:
+            return
+        now = time.monotonic()
+        if not force and now - _snapshot_updated < 2:
+            ready = list(_snapshot_callbacks)
+            _snapshot_callbacks.clear()
+        elif now < _snapshot_retry_after:
+            return
+        else:
+            _snapshot_loading = True
+            start = True
+    if ready:
+        _dispatch_snapshot_callbacks(ready)
+        return
+    if not start:
+        return
+
+    def worker():
+        global _snapshot_events, _snapshot_ids, _snapshot_updated, _snapshot_loading
+        global _snapshot_retry_after
+        while True:
+            with _snapshot_lock:
+                generation = _snapshot_generation
+            try:
+                events = favorite_events()
+                snapshot = tuple(MappingProxyType(dict(event)) for event in events)
+                ids = frozenset(
+                    str(event["_favorite_id"]) for event in events if event.get("_favorite_id")
+                )
+            except Exception:
+                # Keep the last good snapshot on transient filesystem failures.
+                snapshot = ids = None
+            with _snapshot_lock:
+                if generation != _snapshot_generation:
+                    continue
+                now = time.monotonic()
+                if snapshot is not None:
+                    _snapshot_events, _snapshot_ids = snapshot, ids
+                    _snapshot_updated = now
+                    _snapshot_retry_after = 0.0
+                else:
+                    _snapshot_retry_after = now + 2
+                _snapshot_loading = False
+                callbacks = list(_snapshot_callbacks)
+                _snapshot_callbacks.clear()
+            _dispatch_snapshot_callbacks(callbacks)
+            return
+
+    try:
+        threading.Thread(target=worker, name="halo-favorites-cache", daemon=True).start()
+    except RuntimeError:
+        with _snapshot_lock:
+            _snapshot_loading = False
+            _snapshot_retry_after = time.monotonic() + 2
+
+
+def _dispatch_snapshot_callbacks(callbacks):
+    if not callbacks:
+        return
+    from gi.repository import GLib
+
+    for reference in callbacks:
+
+        def deliver(reference=reference):
+            callback = reference() if isinstance(reference, weakref.WeakMethod) else reference
+            if callback is not None:
+                callback()
+            return False
+
+        GLib.idle_add(deliver)
 
 
 def favorite_id_for_event(event: dict[str, Any]) -> str | None:
@@ -98,8 +221,12 @@ def _index_entries_locked() -> list[dict[str, Any]]:
         if not isinstance(entry, dict):
             changed = True
             continue
-        video_path = Path(str(entry.get("video_path", ""))).expanduser()
-        if video_path.is_file():
+        try:
+            video_path = Path(str(entry.get("video_path", ""))).expanduser()
+            present = video_path.is_file()
+        except (OSError, ValueError):
+            present = False
+        if present:
             valid_entries.append(entry)
         else:
             changed = True
@@ -138,70 +265,116 @@ def add_favorite(
     thumbnail_bytes: bytes | None = None,
 ) -> dict[str, Any]:
     """Download *recording_url* into the local archive and index it."""
-    favorite_id = favorite_id_for_event(event)
-    if favorite_id is None:
-        raise ValueError("Cannot favorite an event without device and event ids")
+    staging_path = _new_staging_path(event)
+    try:
+        download_https(recording_url, staging_path)
+        return _publish_favorite(event, staging_path, thumbnail_bytes)
+    finally:
+        staging_path.unlink(missing_ok=True)
 
+
+async def async_add_favorite(event, recording_url, *, thumbnail_bytes=None, control=None):
+    """App-owned archive save with cancellable transport and a final index fence."""
+    staging_path = _new_staging_path(event)
+    try:
+        await async_download_https(recording_url, staging_path, control=control, publish=False)
+        async with _async_index_transaction(control):
+            if control is not None:
+                control.begin_commit()
+            entry = _write_favorite_locked(event, staging_path, thumbnail_bytes)
+        request_reconcile(force=True)
+        return entry
+    finally:
+        staging_path.unlink(missing_ok=True)
+
+
+def _new_staging_path(event) -> Path:
+    if favorite_id_for_event(event) is None:
+        raise ValueError("Cannot favorite an event without device and event ids")
     FAVORITE_VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
     FAVORITE_THUMBNAILS_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=FAVORITE_VIDEOS_DIR, prefix=".download-", suffix=".part", delete=False
+    ) as temporary:
+        return Path(temporary.name)
 
+
+def _publish_favorite(event, staging_path, thumbnail_bytes):
     with _index_transaction():
-        video_path = FAVORITE_VIDEOS_DIR / _video_filename(event)
-        download_https(recording_url, video_path)
+        return _write_favorite_locked(event, staging_path, thumbnail_bytes)
 
-        thumbnail_path = ""
-        if thumbnail_bytes:
-            thumb = FAVORITE_THUMBNAILS_DIR / f"{video_path.stem}.png"
-            thumb.write_bytes(thumbnail_bytes)
-            thumbnail_path = str(thumb)
 
-        entry = {
-            "favorite_id": favorite_id,
-            "event_id": str(event.get("id")),
-            "device_id": str(_event_device_id(event)),
-            "camera_name": _event_camera_name(event),
-            "event_kind": str(event.get("kind") or "event"),
-            "created_at": _event_created_at(event).isoformat(),
-            "video_path": str(video_path),
-            "thumbnail_path": thumbnail_path,
-            "filename": video_path.name,
-        }
-
-        entries = [
-            item for item in _index_entries_locked() if item.get("favorite_id") != favorite_id
-        ]
-        entries.append(entry)
-        _write_index(entries)
+def _write_favorite_locked(event, staging_path, thumbnail_bytes):
+    favorite_id = favorite_id_for_event(event)
+    video_path = FAVORITE_VIDEOS_DIR / _video_filename(event)
+    staging_path.replace(video_path)
+    thumbnail_path = ""
+    if thumbnail_bytes:
+        thumb = FAVORITE_THUMBNAILS_DIR / f"{video_path.stem}.png"
+        thumb.write_bytes(thumbnail_bytes)
+        thumbnail_path = str(thumb)
+    entry = {
+        "favorite_id": favorite_id,
+        "event_id": str(event.get("id")),
+        "device_id": str(_event_device_id(event)),
+        "camera_name": _event_camera_name(event),
+        "event_kind": str(event.get("kind") or "event"),
+        "created_at": _event_created_at(event).isoformat(),
+        "video_path": str(video_path),
+        "thumbnail_path": thumbnail_path,
+        "filename": video_path.name,
+    }
+    entries = [item for item in _index_entries_locked() if item.get("favorite_id") != favorite_id]
+    entries.append(entry)
+    _write_index(entries)
     return entry
+
+
+def _removal_id(event_or_id):
+    return (event_or_id if isinstance(event_or_id, str) else event_or_id.get("_favorite_id")) or (
+        favorite_id_for_event(event_or_id) if isinstance(event_or_id, dict) else None
+    )
 
 
 def remove_favorite(event_or_id: dict[str, Any] | str) -> bool:
     """Remove a favorite from the index and delete its archived files."""
-    favorite_id = (
-        event_or_id if isinstance(event_or_id, str) else event_or_id.get("_favorite_id")
-    ) or (favorite_id_for_event(event_or_id) if isinstance(event_or_id, dict) else None)
+    favorite_id = _removal_id(event_or_id)
     if favorite_id is None:
         return False
-
     with _index_transaction():
-        removed = False
-        remaining = []
-        for entry in _index_entries_locked():
-            if entry.get("favorite_id") != favorite_id:
-                remaining.append(entry)
-                continue
-            removed = True
-            _delete_managed_file(entry.get("video_path"), FAVORITE_VIDEOS_DIR)
-            _delete_managed_file(entry.get("thumbnail_path"), FAVORITE_THUMBNAILS_DIR)
+        return _remove_favorite_locked(favorite_id)
 
-        if removed:
-            _write_index(remaining)
-        return removed
+
+async def async_remove_favorite(event_or_id, *, control=None):
+    favorite_id = _removal_id(event_or_id)
+    if favorite_id is None:
+        return False
+    async with _async_index_transaction(control):
+        if control is not None:
+            control.begin_commit()
+        removed = _remove_favorite_locked(favorite_id)
+    request_reconcile(force=True)
+    return removed
+
+
+def _remove_favorite_locked(favorite_id):
+    removed = False
+    remaining = []
+    for entry in _index_entries_locked():
+        if entry.get("favorite_id") != favorite_id:
+            remaining.append(entry)
+            continue
+        removed = True
+        _delete_managed_file(entry.get("video_path"), FAVORITE_VIDEOS_DIR)
+        _delete_managed_file(entry.get("thumbnail_path"), FAVORITE_THUMBNAILS_DIR)
+    if removed:
+        _write_index(remaining)
+    return removed
 
 
 @contextlib.contextmanager
 def _index_transaction():
-    """Serialize favorite file/index mutations across threads and processes."""
+    """Blocking API for background readers and legacy synchronous callers."""
     with _index_lock:
         FAVORITES_DIR.mkdir(parents=True, exist_ok=True)
         with (FAVORITES_DIR / ".index.lock").open("a+b") as lock_file:
@@ -212,14 +385,50 @@ def _index_transaction():
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+@contextlib.asynccontextmanager
+async def _async_index_transaction(control=None):
+    """Yield while waiting for thread/process locks; never stall other saves."""
+    loop = asyncio.get_running_loop()
+    with _async_locks_guard:
+        reference = _async_locks.get(loop)
+        lock = reference() if reference is not None else None
+        if lock is None:
+            lock = asyncio.Lock()
+            _async_locks[loop] = weakref.ref(lock)
+    async with lock:
+        while not _index_lock.acquire(blocking=False):
+            if control is not None:
+                control.checkpoint()
+            await asyncio.sleep(0.01)
+        try:
+            FAVORITES_DIR.mkdir(parents=True, exist_ok=True)
+            with (FAVORITES_DIR / ".index.lock").open("a+b") as lock_file:
+                while True:
+                    if control is not None:
+                        control.checkpoint()
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        await asyncio.sleep(0.01)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            _index_lock.release()
+
+
 def _read_index() -> dict[str, Any]:
     if not FAVORITES_INDEX.is_file():
         return {"version": 1, "favorites": []}
     try:
         data = json.loads(FAVORITES_INDEX.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError, RecursionError):
         return {"version": 1, "favorites": []}
-    return data if isinstance(data, dict) else {"version": 1, "favorites": []}
+    if not isinstance(data, dict) or not isinstance(data.get("favorites"), list):
+        return {"version": 1, "favorites": []}
+    return data
 
 
 def _write_index(entries: list[dict[str, Any]]) -> None:
@@ -305,7 +514,8 @@ def _video_filename(event: dict[str, Any]) -> str:
     camera = _safe_filename(_event_camera_name(event))
     kind = _safe_filename(str(event.get("kind") or "event"))
     event_id = _safe_filename(str(event.get("id") or "unknown"))
-    return f"{created}_{camera}_{kind}_{event_id}.mp4"
+    device_id = _safe_filename(str(_event_device_id(event)))
+    return f"{created}_{device_id}_{camera}_{kind}_{event_id}.mp4"
 
 
 def _safe_filename(value: str) -> str:

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from contextlib import contextmanager
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
@@ -10,7 +11,11 @@ import pytest
 
 from halo_gtk.alarm.models import AlarmMode
 from halo_gtk.alarm.protocol import DeviceInfoDocList
-from halo_gtk.alarm.provider import AlarmLocationSeed, AlarmRequestError
+from halo_gtk.alarm.provider import (
+    AlarmCommandSupersededError,
+    AlarmLocationSeed,
+    AlarmRequestError,
+)
 from halo_gtk.alarm.transport import AlarmTransportError, RingAlarmTransport
 
 
@@ -127,6 +132,81 @@ class _Session:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("shutdown", ["close", "stop"])
+async def test_handshake_finishing_after_shutdown_closes_socket_without_publishing(shutdown):
+    websocket = _WebSocket()
+    handshake_started = asyncio.Event()
+    handshake_finished = asyncio.Event()
+
+    class DelayedSession(_Session):
+        async def ws_connect(self, url, **kwargs):
+            handshake_started.set()
+            await handshake_finished.wait()
+            return await super().ws_connect(url, **kwargs)
+
+    session = DelayedSession(websocket)
+    transport = RingAlarmTransport(
+        _Gateway(_ticket()),
+        AlarmLocationSeed("location-1"),
+        session_factory=lambda: session,
+    )
+    opened = []
+    stop = asyncio.Event()
+    connection = asyncio.create_task(
+        transport.connect_once(
+            epoch=1,
+            stop_event=stop,
+            on_open=opened.append,
+            on_message=lambda _message: None,
+        )
+    )
+    await handshake_started.wait()
+    if shutdown == "close":
+        await transport.close()
+    else:
+        stop.set()
+    handshake_finished.set()
+    await connection
+
+    assert opened == []
+    assert websocket.sent == []
+    assert websocket.closed is True
+    assert transport.connected_epoch is None
+    assert transport.assets == ()
+    await transport.close()
+    assert session.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [[], {}, None, 1])
+async def test_unrecognized_ticket_status_does_not_abort_valid_inventory(status):
+    ticket = _ticket()
+    ticket["assets"][0]["status"] = status
+    websocket = _WebSocket()
+    session = _Session(websocket)
+    transport = RingAlarmTransport(
+        _Gateway(ticket),
+        AlarmLocationSeed("location-1"),
+        session_factory=lambda: session,
+    )
+    stop = asyncio.Event()
+    opened = []
+
+    def on_open(assets):
+        opened.extend(assets)
+        stop.set()
+
+    await transport.connect_once(
+        epoch=1,
+        stop_event=stop,
+        on_open=on_open,
+        on_message=lambda _message: None,
+    )
+    assert opened[0].status == "unknown"
+    await transport.close()
+
+
+@pytest.mark.asyncio
 async def test_transport_uses_authenticated_ticket_and_owned_wss_session():
     gateway = _Gateway(_ticket())
     websocket = _WebSocket(
@@ -217,6 +297,44 @@ async def test_transport_gets_fresh_ticket_and_keeps_sequence_monotonic():
     assert await connect(2, second) == [3, 4]
     assert "ticket-one" in session.urls[0][0]
     assert "ticket-two" in session.urls[1][0]
+    await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_mode_admission_runs_after_send_lock_and_rejection_preserves_socket():
+    websocket = _WebSocket()
+    transport = RingAlarmTransport(_Gateway(), AlarmLocationSeed("location-1"))
+    transport._websocket = websocket
+    transport._connection_epoch = 1
+    entered = []
+
+    @contextmanager
+    def reject_replaced_client():
+        entered.append(True)
+        raise AlarmCommandSupersededError
+        yield
+
+    await transport._send_lock.acquire()
+    command = asyncio.create_task(
+        transport.send_mode(
+            "asset-1",
+            "panel-1",
+            AlarmMode.AWAY,
+            epoch=1,
+            admission=reject_replaced_client,
+        )
+    )
+    await asyncio.sleep(0)
+    assert entered == []
+    transport._send_lock.release()
+    with pytest.raises(AlarmCommandSupersededError):
+        await command
+
+    assert entered == [True]
+    assert websocket.sent == []
+    assert websocket.closed is False
+    assert transport.connected is True
+    assert transport._send_lock.locked() is False
     await transport.close()
 
 

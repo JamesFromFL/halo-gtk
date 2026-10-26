@@ -368,6 +368,22 @@ def test_normalise_tolerates_malformed_json_values():
     assert data["video_dir"].endswith("/Videos/halo-gtk")
 
 
+def test_load_tolerates_overflowing_ids_and_null_paths(tmp_path, monkeypatch):
+    from halo_gtk import config
+
+    monkeypatch.setattr(config, "_GSETTINGS_ENABLED", False)
+    _redirect_config_store(config, monkeypatch, tmp_path)
+    config.CONFIG_FILE.write_text(
+        '{"camera_order": [1e999, "3"], "snapshot_dir": null, "video_dir": "bad\\u0000path"}'
+    )
+
+    loaded = config.load()
+
+    assert loaded["camera_order"] == [3]
+    assert loaded["snapshot_dir"] == config.defaults()["snapshot_dir"]
+    assert loaded["video_dir"] == config.defaults()["video_dir"]
+
+
 def test_reset_json_config_removes_file_and_returns_defaults(tmp_path, monkeypatch):
     from halo_gtk import config
 

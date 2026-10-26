@@ -129,7 +129,7 @@ def _coerce_int_list(value: Any) -> list[int]:
     for item in value:
         try:
             result.append(int(item))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
     return result
 
@@ -145,8 +145,10 @@ def _coerce_density_preset(value: Any, default: str) -> str:
 
 
 def _coerce_path(value: Any, default: str) -> str:
+    if not isinstance(value, str | Path):
+        return default
     result = str(value).strip()
-    return result or default
+    return result if result and "\0" not in result else default
 
 
 def _settings():

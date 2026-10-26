@@ -201,3 +201,57 @@ def test_stale_view_callback_does_not_mutate_replacement_session():
 
     assert replacement is not first
     assert replacement.state is StreamState.CONNECTING
+
+
+def test_stop_all_continues_after_one_view_fails_to_stop():
+    from halo_gtk.live_sessions import LiveSessionManager
+
+    class FailingView(FakeView):
+        def stop(self):
+            super().stop()
+            raise RuntimeError("pipeline failed")
+
+    views = iter((FailingView(), FakeView()))
+    manager = LiveSessionManager(view_factory=lambda: next(views))
+    first = manager.acquire(SimpleNamespace(id=1), owner="live-monitoring")
+    second = manager.acquire(SimpleNamespace(id=2), owner="live-monitoring")
+
+    manager.stop_all()
+
+    assert first.view.stops == second.view.stops == 1
+    assert manager.session_for(1) is None
+    assert manager.session_for(2) is None
+
+
+def test_failed_release_does_not_leave_a_registered_session():
+    from halo_gtk.live_sessions import LiveSessionManager
+
+    class FailingView(FakeView):
+        def stop(self):
+            raise RuntimeError("pipeline failed")
+
+    manager = LiveSessionManager(view_factory=FailingView)
+    manager.acquire(SimpleNamespace(id=1), owner="live-monitoring")
+
+    with pytest.raises(RuntimeError, match="pipeline failed"):
+        manager.release(1, owner="live-monitoring")
+
+    assert manager.session_for(1) is None
+
+
+def test_startup_error_is_preserved_when_partial_cleanup_also_fails():
+    from halo_gtk.live_sessions import LiveSessionManager
+
+    class FailingView(FakeView):
+        def start_for_device(self, _device):
+            raise ValueError("stream could not start")
+
+        def stop(self):
+            raise RuntimeError("pipeline could not stop")
+
+    manager = LiveSessionManager(view_factory=FailingView)
+
+    with pytest.raises(ValueError, match="stream could not start"):
+        manager.acquire(SimpleNamespace(id=1), owner="live-monitoring")
+
+    assert manager.session_for(1) is None

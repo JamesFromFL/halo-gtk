@@ -43,6 +43,7 @@ class FocusedLivePage(Gtk.Box):
         self._on_history = on_history
         self._on_nickname_changed = on_nickname_changed
         self._device = None
+        self._view_generation = 0
         self._max_streams = 4
         self._session = None
         self._intercom_supported = False
@@ -269,6 +270,10 @@ class FocusedLivePage(Gtk.Box):
         max_streams: int = 4,
         initial_snapshot: bytes | None = None,
     ) -> None:
+        previous = getattr(self, "_still_cancel_event", None)
+        if previous is not None:
+            previous.set()
+        self._view_generation += 1
         self._device = device
         self._max_streams = max_streams
         self._title_label.set_label(device_names.display_name(device))
@@ -295,6 +300,10 @@ class FocusedLivePage(Gtk.Box):
         self._start_session()
 
     def leave(self) -> None:
+        cancel_event = getattr(self, "_still_cancel_event", None)
+        if cancel_event is not None:
+            cancel_event.set()
+        self._view_generation += 1
         if self._device is not None:
             self._stop_talking()
             get_live_session_manager().release(self._device.id, owner=FOCUSED_OWNER)
@@ -369,6 +378,11 @@ class FocusedLivePage(Gtk.Box):
 
     def _load_snapshot_still(self, device) -> None:
         device_id = getattr(device, "id", None)
+        generation = self._view_generation
+        previous = getattr(self, "_still_cancel_event", None)
+        if previous is not None:
+            previous.set()
+        cancel_event = self._still_cancel_event = threading.Event()
 
         def worker() -> None:
             png_bytes = None
@@ -377,18 +391,24 @@ class FocusedLivePage(Gtk.Box):
 
                 client = get_client()
                 if client is not None and client.is_authenticated:
-                    png_bytes = client.snapshot_for_device(device)
-                    if not png_bytes:
-                        png_bytes = client.last_event_frame_for_device(device)
+                    png_bytes = client.snapshot_for_device(device, cancel_event=cancel_event)
+                    if not png_bytes and not cancel_event.is_set():
+                        png_bytes = client.last_event_frame_for_device(
+                            device, cancel_event=cancel_event
+                        )
             except Exception as exc:
                 _log.debug("Focused still snapshot failed for %s: %s", device.name, exc)
-            if png_bytes:
-                GLib.idle_add(self._set_loaded_still, device_id, bytes(png_bytes))
+            if png_bytes and not cancel_event.is_set():
+                GLib.idle_add(self._set_loaded_still, device_id, bytes(png_bytes), generation)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _set_loaded_still(self, device_id: int | None, png_bytes: bytes) -> bool:
-        if self._device is None or getattr(self._device, "id", None) != device_id:
+    def _set_loaded_still(self, device_id: int | None, png_bytes: bytes, generation: int) -> bool:
+        if (
+            generation != self._view_generation
+            or self._device is None
+            or getattr(self._device, "id", None) != device_id
+        ):
             return GLib.SOURCE_REMOVE
         # Do not overwrite a live stream that already has its first frame.
         if self._session is not None and self._session.get_current_frame_png() is not None:
@@ -490,18 +510,32 @@ class FocusedLivePage(Gtk.Box):
         self._set_volume_state(scale.get_value())
 
     def _on_mic_toggled(self, btn: Gtk.ToggleButton) -> None:
+        import weakref
+
+        from halo_gtk.ui_feedback import microphone_state, show_toast
+
         if self._session is None:
             return
         if btn.get_active():
-            btn.set_icon_name("audio-input-microphone-symbolic")
-            btn.set_tooltip_text("Microphone on")
-            self._session.start_talking()
+            session = self._session
+            page_ref = weakref.ref(self)
+
+            def on_state(state):
+                page = page_ref()
+                if page is not None and page._session is session:
+                    microphone_state(page._mic_btn, page._on_mic_toggled, state)
+                    if state == "failed":
+                        show_toast(page, "Microphone unavailable. Check your input device.")
+
+            session.start_talking(on_state_changed=on_state)
         else:
             btn.set_icon_name("microphone-disabled-symbolic")
             btn.set_tooltip_text("Microphone off")
             self._session.stop_talking()
 
     def _on_screenshot(self, *_args) -> None:
+        from halo_gtk.ui_feedback import show_toast
+
         if self._session is None:
             return
         png = self._session.get_current_frame_png()
@@ -511,15 +545,23 @@ class FocusedLivePage(Gtk.Box):
         if zoomed_png is not None:
             png = zoomed_png
         camera_name = device_names.display_name(self._device) if self._device is not None else None
-        dest = media_paths.snapshot_dir(camera_name)
-        media_paths.write_unique_bytes(
-            dest,
-            datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
-            ".png",
-            png,
-        )
+        try:
+            dest = media_paths.snapshot_dir(camera_name)
+            media_paths.write_unique_bytes(
+                dest,
+                datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
+                ".png",
+                png,
+            )
+        except OSError:
+            show_toast(self, "Could not save screenshot. Check free space and folder permissions.")
+            return
+        show_toast(self, "Screenshot saved")
         if media_paths.should_open_after_save():
-            media_paths.open_folder(dest)
+            try:
+                media_paths.open_folder(dest)
+            except Exception:
+                show_toast(self, "Screenshot saved, but the folder could not be opened.")
 
     def _on_play(self, *_args) -> None:
         self._start_session()
@@ -601,13 +643,21 @@ class FocusedLivePage(Gtk.Box):
         dialog.set_default_response("cancel")
         dialog.set_close_response("cancel")
         dialog.set_response_appearance("activate", Adw.ResponseAppearance.DESTRUCTIVE)
-        dialog.connect("response", self._on_siren_confirmed)
+        dialog.connect(
+            "response", self._on_siren_confirmed, self._device, client, self._view_generation
+        )
         root = self.get_root()
         dialog.present(root if isinstance(root, Gtk.Window) else self)
 
-    def _on_siren_confirmed(self, _dialog, response: str) -> None:
-        if response == "activate":
-            self._set_siren(30)
+    def _on_siren_confirmed(self, _dialog, response: str, device, client, generation: int) -> None:
+        if (
+            response == "activate"
+            and generation == self._view_generation
+            and self._device is device
+            and client is not None
+            and _ring_client() is client
+        ):
+            self._set_siren(30, client=client)
 
     def _set_siren(self, duration: int, *, client=None) -> None:
         if self._device is None:

@@ -21,11 +21,11 @@ from halo_gtk.alarm.models import (
     AlarmMode,
     AlarmPhase,
     AlarmServiceStatus,
-    AlarmSignal,
     AlarmWriteAuthorization,
     TriState,
     empty_alarm_snapshot,
 )
+from halo_gtk.alarm.policy import asset_reason, authorization_reason, panel_reason
 from halo_gtk.alarm.protocol import (
     AssetSessionInfo,
     ClapMessage,
@@ -74,6 +74,10 @@ class _PendingCommand:
 
 
 class _CommandConnectionLost(RuntimeError):
+    pass
+
+
+class _CommandRevisionChanged(AlarmCommandSupersededError):
     pass
 
 
@@ -468,6 +472,10 @@ class RingAlarmService:
             if runtime.sync_task is not None:
                 runtime.sync_task.cancel()
                 runtime.sync_task = None
+        elif runtime.phase in {"online", "degraded"}:
+            # An established socket can remain open while the hub reports an
+            # offline/stale asset. Reflect that loss of inventory immediately.
+            runtime.phase = "degraded"
         if (
             location is not None
             and self._has_fresh_panel_asset(location)
@@ -645,19 +653,45 @@ class RingAlarmService:
             epoch=runtime.epoch,
             baseline_revision=location.revision,
             future=loop.create_future(),
-            armed=True,
         )
         self._pending[location_id] = pending
+
+        @contextlib.contextmanager
+        def admit_send():
+            with self._command_admission():
+                # A session update can be awaiting an inventory request before
+                # its UI snapshot is published. Admission uses the live store.
+                current = self._store.snapshot.find_location(location_id)
+                if (
+                    self._closed
+                    or self._runtimes.get(location_id) is not runtime
+                    or current is None
+                    or current.revision != expected_revision
+                    or not self._decorate_location(current).can_set_mode
+                ):
+                    raise _CommandRevisionChanged
+                pending.armed = True
+                yield
+
         try:
             try:
-                with self._command_admission():
-                    await runtime.transport.send_mode(
-                        panel.asset_id,
-                        panel.zid,
-                        target,
-                        epoch=runtime.epoch,
-                        bypass_ids=requested_bypass,
-                    )
+                await runtime.transport.send_mode(
+                    panel.asset_id,
+                    panel.zid,
+                    target,
+                    epoch=runtime.epoch,
+                    bypass_ids=requested_bypass,
+                    admission=admit_send,
+                )
+            except _CommandRevisionChanged:
+                current = self.snapshot.find_location(location_id)
+                return self._command_result(
+                    AlarmCommandStatus.STALE_REVISION,
+                    location_id,
+                    target,
+                    confirmed_mode=current.mode if current is not None else AlarmMode.UNKNOWN,
+                    code="revision-mismatch",
+                )
             except AlarmCommandSupersededError:
                 return self._command_result(
                     AlarmCommandStatus.SUPERSEDED,
@@ -708,6 +742,8 @@ class RingAlarmService:
                 self._pending.pop(location_id, None)
             if not pending.future.done():
                 pending.future.cancel()
+            elif not pending.future.cancelled():
+                pending.future.exception()
 
     async def _reconcile_ambiguous_command(
         self,
@@ -897,40 +933,26 @@ class RingAlarmService:
             reason = "multiple-panels"
         elif panel is None:
             reason = "security-panel-unavailable"
-        elif location.write_authorization is AlarmWriteAuthorization.DENIED:
-            reason = "authorization-denied"
-        elif location.write_authorization is not AlarmWriteAuthorization.ALLOWED:
-            reason = "authorization-unknown"
+        elif authorization_reason(location.write_authorization) is not None:
+            reason = authorization_reason(location.write_authorization)
         elif panel.stale:
             reason = "state-stale"
         else:
             panel_asset = location.find_asset(panel.asset_id)
             if panel_asset is None:
                 reason = "panel-unavailable"
-            elif panel_asset.connection is AlarmConnectionStatus.CELLULAR_BACKUP:
-                reason = "cellular-backup"
-            elif panel_asset.connection is not AlarmConnectionStatus.ONLINE:
-                reason = "panel-not-online"
-            elif panel_asset.inventory is not AlarmInventoryStatus.COMPLETE:
-                reason = "panel-inventory-incomplete"
-            elif any(
-                not device.stale
-                and (device.smoke is TriState.ACTIVE or device.carbon_monoxide is TriState.ACTIVE)
-                for device in panel_asset.devices
-            ):
-                reason = "life-safety-active"
-            elif location.phase is AlarmPhase.ALARMING:
-                reason = "active-alarm"
-            elif location.mode is AlarmMode.UNKNOWN:
-                reason = "mode-unknown"
-            elif location.phase is AlarmPhase.UNKNOWN or location.signal is AlarmSignal.UNKNOWN:
-                reason = "panel-state-unknown"
-            elif location.signal is not AlarmSignal.NONE:
-                reason = "active-alarm"
-            elif not panel.faulted_devices_valid:
-                reason = "faulted-device-list-invalid"
-            elif self._faulted_bypass_ids(location) is None:
-                reason = "faulted-device-unresolved"
+            else:
+                reason = asset_reason(panel_asset, check_stale=False) or panel_reason(
+                    location.mode,
+                    location.phase,
+                    location.signal,
+                    faults_valid=panel.faulted_devices_valid,
+                    alarming_first=True,
+                )
+                if reason == "panel-offline":
+                    reason = "panel-not-online"
+                if reason is None and self._faulted_bypass_ids(location) is None:
+                    reason = "faulted-device-unresolved"
         return replace(
             location,
             can_set_mode=reason is None,

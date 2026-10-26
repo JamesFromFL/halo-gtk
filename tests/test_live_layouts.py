@@ -88,3 +88,20 @@ def test_clean_name_caps_length_and_falls_back():
     assert live_layouts.clean_name("   ", "Custom 1") == "Custom 1"
     assert live_layouts.clean_name("  Front    Yard  ", "Custom 1") == "Front Yard"
     assert len(live_layouts.clean_name("x" * 60, "Custom 1")) == 50
+
+
+def test_loading_layout_skips_unrepresentable_numeric_device_ids(tmp_path, monkeypatch):
+    from halo_gtk import live_layouts
+
+    path = tmp_path / "live-monitoring-layouts.json"
+    path.write_text(
+        '{"layouts":[{"id":"one","name":"Patio","size":"medium",'
+        '"order":[1,1e999,"2"],"visible":[1e999,2]}]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(live_layouts, "LAYOUTS_FILE", path)
+
+    loaded = live_layouts.load_layouts()
+
+    assert loaded[0]["order"] == [1, 2]
+    assert loaded[0]["visible"] == [2]

@@ -40,6 +40,7 @@ class SettingsPage(Gtk.Box):
         self._refreshing = False
         self._account_email_cache: str | None = None
         self._account_email_loading = False
+        self._account_email_client = None
         self._build_ui()
         self.refresh()
 
@@ -53,7 +54,8 @@ class SettingsPage(Gtk.Box):
             show_content=False,
         )
         self._split_view.connect("notify::collapsed", self._on_split_collapsed_changed)
-        self.append(self._split_view)
+        self._toast_overlay = Adw.ToastOverlay(child=self._split_view)
+        self.append(self._toast_overlay)
 
         sidebar_toolbar = Adw.ToolbarView()
         self._sidebar_header = Adw.HeaderBar(
@@ -660,6 +662,10 @@ class SettingsPage(Gtk.Box):
 
     def _refresh_account(self) -> None:
         client = get_client()
+        if client is not self._account_email_client:
+            self._account_email_client = client
+            self._account_email_cache = None
+            self._account_email_loading = False
         logged_in = client is not None and client.is_authenticated
         self._login_status_row.set_subtitle("Logged in" if logged_in else "Not logged in")
         self._refresh_session_button.set_sensitive(logged_in)
@@ -672,23 +678,25 @@ class SettingsPage(Gtk.Box):
             return
 
         if self._account_email_cache is not None:
-            self._account_email_row.set_subtitle(self._account_email_cache)
+            self._account_email_row.set_subtitle(GLib.markup_escape_text(self._account_email_cache))
             return
 
         self._account_email_row.set_subtitle("Loading...")
         if not self._account_email_loading:
             self._account_email_loading = True
-            threading.Thread(target=self._load_account_email, daemon=True).start()
+            threading.Thread(target=self._load_account_email, args=(client,), daemon=True).start()
 
-    def _load_account_email(self) -> None:
+    def _load_account_email(self, client) -> None:
         try:
             account_email = get_account_email()
         except Exception as exc:
             _log.warning("Failed to load Ring account email: %s", exc)
             account_email = None
-        GLib.idle_add(self._finish_load_account_email, account_email)
+        GLib.idle_add(self._finish_load_account_email, account_email, client)
 
-    def _finish_load_account_email(self, account_email: str | None) -> bool:
+    def _finish_load_account_email(self, account_email: str | None, expected_client) -> bool:
+        if expected_client is not self._account_email_client or get_client() is not expected_client:
+            return GLib.SOURCE_REMOVE
         self._account_email_loading = False
         client = get_client()
         if client is None or not client.is_authenticated:
@@ -697,12 +705,18 @@ class SettingsPage(Gtk.Box):
             return GLib.SOURCE_REMOVE
 
         self._account_email_cache = account_email
-        self._account_email_row.set_subtitle(account_email or "Not available")
+        self._account_email_row.set_subtitle(
+            GLib.markup_escape_text(account_email or "Not available")
+        )
         return GLib.SOURCE_REMOVE
 
     def _refresh_directories(self, cfg: dict) -> None:
-        self._snapshot_dir_row.set_subtitle(self._display_path(cfg["snapshot_dir"]))
-        self._video_dir_row.set_subtitle(self._display_path(cfg["video_dir"]))
+        self._snapshot_dir_row.set_subtitle(
+            GLib.markup_escape_text(self._display_path(cfg["snapshot_dir"]))
+        )
+        self._video_dir_row.set_subtitle(
+            GLib.markup_escape_text(self._display_path(cfg["video_dir"]))
+        )
         self._set_switch_active(
             self._camera_subfolders_switch,
             cfg.get("create_camera_subfolders", False),
@@ -821,7 +835,8 @@ class SettingsPage(Gtk.Box):
         cfg["background_service"] = enabled
         if not enabled:
             cfg["autostart_background"] = False
-        _config.save(cfg)
+        if not self._save_config(cfg):
+            return
         self.refresh()
         self._apply_app_settings()
 
@@ -830,15 +845,12 @@ class SettingsPage(Gtk.Box):
             return
         enabled = switch.get_active()
         cfg = _config.load()
+        previous = dict(cfg)
         cfg["autostart_login"] = enabled
         if not enabled:
             cfg["autostart_background"] = False
-        _config.save(cfg)
-        try:
-            autostart.set_enabled(enabled, background=cfg["autostart_background"])
-        except Exception as exc:
-            _log.warning("Failed to update autostart setting: %s", exc)
-            self._set_switch_active(switch, autostart.is_enabled())
+        if not self._save_autostart_config(cfg, previous):
+            return
         self.refresh()
         self._apply_app_settings()
 
@@ -847,15 +859,13 @@ class SettingsPage(Gtk.Box):
             return
         enabled = switch.get_active()
         cfg = _config.load()
+        previous = dict(cfg)
         cfg["autostart_background"] = enabled
         if enabled:
             cfg["autostart_login"] = True
             cfg["background_service"] = True
-        _config.save(cfg)
-        try:
-            autostart.set_enabled(cfg["autostart_login"], background=enabled)
-        except Exception as exc:
-            _log.warning("Failed to update autostart background setting: %s", exc)
+        if not self._save_autostart_config(cfg, previous):
+            return
         self.refresh()
         self._apply_app_settings()
 
@@ -864,7 +874,8 @@ class SettingsPage(Gtk.Box):
             return
         cfg = _config.load()
         cfg["show_tray_icon"] = switch.get_active()
-        _config.save(cfg)
+        if not self._save_config(cfg):
+            return
         self._apply_app_settings()
 
     def _on_grid_density_selected(self, combo: Adw.ComboRow, _pspec) -> None:
@@ -872,21 +883,23 @@ class SettingsPage(Gtk.Box):
             return
         cfg = _config.load()
         cfg["camera_grid_density_preset"] = "dense" if combo.get_selected() == 1 else "balanced"
-        _config.save(cfg)
+        if not self._save_config(cfg):
+            return
         self._refresh_main_window()
 
     def _on_live_monitoring_allow_six_toggled(self, switch: Gtk.Switch, _pspec) -> None:
         if self._refreshing:
             return
-        self._save_bool_setting("live_monitoring_allow_six_streams", switch)
-        self._refresh_main_window()
+        if self._save_bool_setting("live_monitoring_allow_six_streams", switch):
+            self._refresh_main_window()
 
     def _on_notifications_toggled(self, switch: Gtk.Switch, _pspec) -> None:
         if self._refreshing:
             return
         cfg = _config.load()
         cfg["show_notifications"] = switch.get_active()
-        _config.save(cfg)
+        if not self._save_config(cfg):
+            return
         self.refresh()
 
     def _on_custom_notification_messages_toggled(self, switch: Gtk.Switch, _pspec) -> None:
@@ -894,7 +907,8 @@ class SettingsPage(Gtk.Box):
             return
         cfg = _config.load()
         cfg["custom_notification_messages"] = switch.get_active()
-        _config.save(cfg)
+        if not self._save_config(cfg):
+            return
         self.refresh()
 
     def _on_custom_message_changed(self, row: Adw.EntryRow, _pspec, config_key: str) -> None:
@@ -902,17 +916,57 @@ class SettingsPage(Gtk.Box):
             return
         cfg = _config.load()
         cfg[config_key] = row.get_text()
-        _config.save(cfg)
+        self._save_config(cfg)
 
     def _save_switch_setting(self, switch: Gtk.Switch, _pspec, *, config_key: str) -> None:
         self._save_bool_setting(config_key, switch)
 
-    def _save_bool_setting(self, config_key: str, switch: Gtk.Switch) -> None:
+    def _save_bool_setting(self, config_key: str, switch: Gtk.Switch) -> bool:
         if self._refreshing:
-            return
+            return False
         cfg = _config.load()
         cfg[config_key] = switch.get_active()
-        _config.save(cfg)
+        return self._save_config(cfg)
+
+    def _save_config(self, cfg: dict) -> bool:
+        """Persist before applying side effects; restore controls on failure."""
+        try:
+            _config.save(cfg)
+        except Exception as exc:
+            _log.warning("Failed to save application settings: %s", exc)
+            self.refresh()
+            self._show_save_error(
+                "Could not save settings. Check free space and folder permissions, then try again."
+            )
+            return False
+        return True
+
+    def _show_save_error(self, message: str) -> None:
+        self._toast_overlay.add_toast(Adw.Toast.new(message))
+
+    def _save_autostart_config(self, cfg: dict, previous: dict) -> bool:
+        enabled_before = autostart.is_enabled()
+        try:
+            autostart.set_enabled(cfg["autostart_login"], background=cfg["autostart_background"])
+        except Exception as exc:
+            _log.warning("Failed to update login startup: %s", exc)
+            self.refresh()
+            self._show_save_error(
+                "Could not update login startup. Check folder permissions and try again."
+            )
+            return False
+        if self._save_config(cfg):
+            return True
+        try:
+            autostart.set_enabled(enabled_before, background=previous["autostart_background"])
+        except Exception as exc:
+            _log.warning("Failed to restore login startup: %s", exc)
+            self._show_save_error(
+                "Settings were not saved and login startup could not be restored. "
+                "Check its setting before signing out."
+            )
+        self.refresh()
+        return False
 
     def _on_choose_folder_clicked(self, _button: Gtk.Button, config_key: str) -> None:
         cfg = _config.load()
@@ -940,8 +994,8 @@ class SettingsPage(Gtk.Box):
             if path:
                 cfg = _config.load()
                 cfg[config_key] = path
-                _config.save(cfg)
-                self.refresh()
+                if self._save_config(cfg):
+                    self.refresh()
         dialog.destroy()
 
     def _on_camera_subfolders_toggled(self, switch: Gtk.Switch, _pspec) -> None:
@@ -949,14 +1003,14 @@ class SettingsPage(Gtk.Box):
             return
         cfg = _config.load()
         cfg["create_camera_subfolders"] = switch.get_active()
-        _config.save(cfg)
+        self._save_config(cfg)
 
     def _on_open_folder_after_save_toggled(self, switch: Gtk.Switch, _pspec) -> None:
         if self._refreshing:
             return
         cfg = _config.load()
         cfg["open_folder_after_save"] = switch.get_active()
-        _config.save(cfg)
+        self._save_config(cfg)
 
     def _on_open_favorites_folder_clicked(self, *_args) -> None:
         favorites.FAVORITES_DIR.mkdir(parents=True, exist_ok=True)
@@ -968,8 +1022,8 @@ class SettingsPage(Gtk.Box):
         cfg["video_dir"] = str(media_paths.DEFAULT_VIDEO_DIR)
         cfg["create_camera_subfolders"] = False
         cfg["open_folder_after_save"] = False
-        _config.save(cfg)
-        self.refresh()
+        if self._save_config(cfg):
+            self.refresh()
 
     def _on_delete_live_monitoring_layouts_clicked(self, *_args) -> None:
         dialog = Adw.AlertDialog(
@@ -992,7 +1046,7 @@ class SettingsPage(Gtk.Box):
         self._refresh_main_window()
 
     def _set_live_monitoring_message(self, message: str) -> None:
-        self._live_monitoring_message_row.set_subtitle(message)
+        self._live_monitoring_message_row.set_subtitle(GLib.markup_escape_text(message))
         self._live_monitoring_message_row.set_visible(True)
 
     def _on_clear_preview_cache_clicked(self, *_args) -> None:
@@ -1050,7 +1104,7 @@ class SettingsPage(Gtk.Box):
             self._set_advanced_message("No debug logs found.")
 
     def _set_storage_message(self, message: str) -> None:
-        self._storage_message_row.set_subtitle(message)
+        self._storage_message_row.set_subtitle(GLib.markup_escape_text(message))
         self._storage_message_row.set_visible(True)
 
     def _on_export_logs_clicked(self, *_args) -> None:
@@ -1108,18 +1162,24 @@ class SettingsPage(Gtk.Box):
             self._set_advanced_message(f"Could not reset settings: {exc}")
             return
 
+        startup_error = False
         try:
             autostart.set_enabled(False)
         except Exception as exc:
             _log.warning("Failed to disable autostart after settings reset: %s", exc)
+            startup_error = True
 
         self.refresh()
         self._apply_app_settings()
         self._refresh_main_window()
-        self._set_advanced_message("Settings reset to defaults.")
+        self._set_advanced_message(
+            "Settings reset, but login startup could not be disabled. Check its permissions."
+            if startup_error
+            else "Settings reset to defaults."
+        )
 
     def _set_advanced_message(self, message: str) -> None:
-        self._advanced_message_row.set_subtitle(message)
+        self._advanced_message_row.set_subtitle(GLib.markup_escape_text(message))
         self._advanced_message_row.set_visible(True)
 
     def _on_refresh_session_clicked(self, *_args) -> None:
@@ -1146,7 +1206,12 @@ class SettingsPage(Gtk.Box):
                 )
             else:
                 _log.warning("Failed to refresh Ring session: %s", exc)
-                GLib.idle_add(self._finish_refresh_session, False, str(exc), False)
+                GLib.idle_add(
+                    self._finish_refresh_session,
+                    False,
+                    "Could not refresh the Ring session. Check your connection and try again.",
+                    False,
+                )
         else:
             GLib.idle_add(self._finish_refresh_session, True, "Ring session refreshed.", False)
 
@@ -1173,7 +1238,7 @@ class SettingsPage(Gtk.Box):
             logged_out = logout_client(expected_client=client)
         except Exception as exc:
             _log.warning("Failed to clear rejected Ring session: %s", exc)
-            error = str(exc)
+            error = "Local credentials could not be cleared. Check your secret service."
         GLib.idle_add(self._finish_rejected_session_logout, logged_out, error)
 
     def _finish_rejected_session_logout(
@@ -1228,7 +1293,7 @@ class SettingsPage(Gtk.Box):
             logout_client()
         except Exception as exc:
             _log.warning("Failed to log out of Ring: %s", exc)
-            error = str(exc)
+            error = "Check that your secret service is available, then try again."
         GLib.idle_add(self._finish_logout, error)
 
     def _finish_logout(self, error: str | None) -> bool:
@@ -1250,7 +1315,7 @@ class SettingsPage(Gtk.Box):
         self._logout_button.set_sensitive(sensitive)
 
     def _set_account_message(self, message: str) -> None:
-        self._account_message_row.set_subtitle(message)
+        self._account_message_row.set_subtitle(GLib.markup_escape_text(message))
         self._account_message_row.set_visible(True)
 
     def _refresh_main_window(self) -> None:

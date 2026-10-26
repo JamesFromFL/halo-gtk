@@ -1,7 +1,7 @@
 """Safety and confirmation tests for Ring Alarm mode commands."""
 
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from itertools import count
 
 import pytest
@@ -133,7 +133,12 @@ class _CommandTransport:
         *,
         epoch,
         bypass_ids=(),
+        admission=None,
     ):
+        with admission() if admission is not None else nullcontext():
+            await self._send_mode(asset_id, panel_zid, mode, epoch=epoch, bypass_ids=bypass_ids)
+
+    async def _send_mode(self, asset_id, panel_zid, mode, *, epoch, bypass_ids=()):
         self.send_started.set()
         self.send_calls.append((asset_id, panel_zid, mode, epoch, bypass_ids))
         if self.send_behavior == "block":
@@ -840,6 +845,54 @@ async def test_send_boundary_rejection_is_superseded_without_sending():
     assert transport.send_calls == []
     assert service._pending == {}
     await _stop(stop, task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("published", [True, False])
+async def test_queued_send_rechecks_revision_and_cannot_confirm_before_admission(
+    monkeypatch, published
+):
+    service, transport, stop, task = await _start_service((_panel(), _contact(faulted=False)))
+    queued = asyncio.Event()
+    release = asyncio.Event()
+    real_send = transport.send_mode
+
+    async def delayed_send(*args, **kwargs):
+        queued.set()
+        await release.wait()
+        await real_send(*args, **kwargs)
+
+    monkeypatch.setattr(transport, "send_mode", delayed_send)
+    location = service.snapshot.find_location("location-1")
+    command = asyncio.create_task(
+        service.request_mode(
+            "location-1",
+            AlarmMode.AWAY,
+            expected_revision=location.revision,
+        )
+    )
+    try:
+        await queued.wait()
+        update = DeviceInfoDocUpdate("asset-1", (_panel("all"),))
+        if published:
+            await transport.on_message(update)
+        else:
+            # State can change before the receive callback publishes its UI
+            # snapshot, e.g. while it awaits another asset's inventory request.
+            service._store.apply_message("location-1", update, transport.epoch)
+        pending = service._pending["location-1"]
+        assert not pending.armed
+        assert not pending.future.done()
+        release.set()
+        result = await command
+
+        assert result.status is AlarmCommandStatus.STALE_REVISION
+        assert result.code == "revision-mismatch"
+        assert transport.send_calls == []
+        assert service._pending == {}
+    finally:
+        command.cancel()
+        await _stop(stop, task)
 
 
 @pytest.mark.asyncio

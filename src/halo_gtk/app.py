@@ -170,8 +170,11 @@ class RingApplication(Adw.Application):
 
     def do_shutdown(self) -> None:
         from halo_gtk.ring_client import shutdown_client  # avoid circular at top
+        from halo_gtk.save_jobs import shutdown as shutdown_saves
 
         self._quitting = True
+        if not shutdown_saves():
+            _log.warning("Save worker exceeded the shutdown cleanup allowance")
         win = self.get_main_window()
         if win is not None:
             win.stop_runtime_streams()

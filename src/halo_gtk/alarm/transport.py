@@ -7,6 +7,7 @@ import contextlib
 import inspect
 import re
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 from urllib.parse import urlencode, urlsplit, urlunsplit
@@ -24,7 +25,12 @@ from halo_gtk.alarm.protocol import (
     encode_mode_command,
     parse_clap_frame,
 )
-from halo_gtk.alarm.provider import AlarmLocationSeed, AlarmRequestError, AlarmRestGateway
+from halo_gtk.alarm.provider import (
+    AlarmCommandSupersededError,
+    AlarmLocationSeed,
+    AlarmRequestError,
+    AlarmRestGateway,
+)
 
 _TICKET_ENDPOINT = "https://app.ring.com/api/v1/clap/tickets"
 _MAX_TICKET_LENGTH = 16_384
@@ -169,6 +175,12 @@ class RingAlarmTransport:
         except Exception:
             raise AlarmTransportError("websocket-connect-failed") from None
 
+        # Shutdown may finish while ws_connect() is awaiting the handshake.
+        # Never publish or retain a socket that arrived after its owner stopped.
+        if self._closed or _event_is_set(stop_event):
+            await _close_websocket(websocket, timeout=self._close_timeout)
+            return
+
         self._websocket = websocket
         self._connection_epoch = epoch
         self._assets = ticket.assets
@@ -231,6 +243,7 @@ class RingAlarmTransport:
         *,
         epoch: int,
         bypass_ids: tuple[str, ...] = (),
+        admission: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> None:
         """Send one mode command once; callers own confirmation and retry policy."""
 
@@ -243,6 +256,7 @@ class RingAlarmTransport:
                 bypass_ids,
             ),
             epoch=epoch,
+            admission=admission,
         )
 
     async def close(self) -> None:
@@ -309,6 +323,7 @@ class RingAlarmTransport:
         encode: Callable[[int], Mapping[str, Any]],
         *,
         epoch: int,
+        admission: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> None:
         async with self._send_lock:
             websocket = self._websocket
@@ -322,9 +337,16 @@ class RingAlarmTransport:
             sequence = self._sequence
             self._sequence += 1
             frame = encode_clap_frame(encode(sequence))
+
+            async def send_frame() -> None:
+                # Recheck permission/revision after queueing behind earlier
+                # writes and immediately before starting this socket write.
+                with admission() if admission is not None else contextlib.nullcontext():
+                    await websocket.send_str(frame)
+
             try:
                 await asyncio.wait_for(
-                    websocket.send_str(frame),
+                    send_frame(),
                     timeout=self._send_timeout,
                 )
             except TimeoutError:
@@ -332,6 +354,10 @@ class RingAlarmTransport:
                 raise AlarmTransportError("websocket-send-timeout") from None
             except asyncio.CancelledError:
                 await asyncio.shield(self._retire_websocket(websocket))
+                raise
+            except AlarmCommandSupersededError:
+                # Admission rejected before any bytes were handed to the
+                # socket; the connection remains valid for other requests.
                 raise
             except Exception:
                 await asyncio.shield(self._retire_websocket(websocket))
@@ -366,7 +392,11 @@ def _parse_ticket(payload: object) -> _Ticket:
             raise AlarmTransportError("invalid-ticket-assets")
         seen.add(asset_id)
         raw_status = value.get("status")
-        status = raw_status if raw_status in {"online", "offline"} else "unknown"
+        status = (
+            raw_status
+            if isinstance(raw_status, str) and raw_status in {"online", "offline"}
+            else "unknown"
+        )
         on_battery = value.get("onBattery")
         assets.append(
             AlarmTicketAsset(

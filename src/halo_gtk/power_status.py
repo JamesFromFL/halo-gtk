@@ -47,8 +47,8 @@ def camera_power_status(device: Any) -> PowerStatus:
             f"Battery: {battery}%",
         )
 
-    if _has_accessible_metadata(device):
-        return PowerStatus("ac-adapter-symbolic", "Plugged-In / Hardwired")
+    if _battery_capability(device) is True:
+        return PowerStatus("battery-missing-symbolic", "Battery: Unknown")
 
     return PowerStatus("dialog-question-symbolic", "Unknown / Error")
 
@@ -60,13 +60,7 @@ def _is_hardwired(device: Any) -> bool:
     if str(settings.get("power_mode") or "").lower() in {"wired", "hardwired", "plugged_in"}:
         return True
 
-    capability_checker = getattr(device, "has_capability", None)
-    if callable(capability_checker):
-        try:
-            return capability_checker("battery") is False
-        except Exception:
-            return False
-    return False
+    return _battery_capability(device) is False
 
 
 def _has_external_power(device: Any) -> bool:
@@ -88,7 +82,7 @@ def _battery_percent(device: Any) -> int | None:
         return None
     try:
         return max(0, min(100, int(value)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -113,11 +107,13 @@ def _battery_present(device: Any) -> bool | None:
     return None
 
 
-def _has_accessible_metadata(device: Any) -> bool:
-    attrs = _device_attrs(device)
-    if isinstance(attrs, dict):
-        return True
-    return any(hasattr(device, attr) for attr in ("family", "name", "id", "device_api_id"))
+def _battery_capability(device: Any) -> bool | None:
+    try:
+        checker = getattr(device, "has_capability", None)
+        value = checker("battery") if callable(checker) else None
+    except Exception:
+        return None
+    return value if isinstance(value, bool) else None
 
 
 def _device_attrs(device: Any) -> dict[str, Any] | None:

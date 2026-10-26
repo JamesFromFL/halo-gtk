@@ -30,7 +30,7 @@ def _normalise_ids(value: Any) -> list[int]:
     for item in value:
         try:
             device_id = int(item)
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             continue
         if device_id in seen:
             continue

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from halo_gtk import power_status
 
 
@@ -28,11 +30,11 @@ class _BrokenDevice:
         raise RuntimeError("unavailable")
 
 
-def test_camera_power_status_uses_plugged_icon_when_no_battery_metadata():
+def test_camera_power_status_preserves_uncertainty_when_battery_health_is_missing():
     status = power_status.camera_power_status(_Device())
 
-    assert status.icon_name == "ac-adapter-symbolic"
-    assert status.tooltip == "Plugged-In / Hardwired"
+    assert status.icon_name == "battery-missing-symbolic"
+    assert status.tooltip == "Battery: Unknown"
 
 
 def test_camera_power_status_uses_unknown_icon_when_metadata_is_unavailable():
@@ -133,3 +135,10 @@ def test_camera_power_status_uses_capability_to_classify_wired_devices():
 
     assert status.icon_name == "ac-adapter-symbolic"
     assert status.tooltip == "Plugged-In / Hardwired"
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+def test_nonfinite_battery_values_do_not_break_camera_cards(value):
+    status = power_status.camera_power_status(_Device(value, attrs={"battery_present": True}))
+
+    assert status.tooltip == "Battery: Unknown"

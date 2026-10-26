@@ -18,6 +18,7 @@ _log = logging.getLogger(__name__)
 class AuthDialog(Adw.Dialog):
     def __init__(self) -> None:
         super().__init__(title="Sign in to Ring", content_width=360)
+        self._loading = False
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -91,6 +92,8 @@ class AuthDialog(Adw.Dialog):
     # ------------------------------------------------------------------
 
     def _on_sign_in_clicked(self, *_) -> None:
+        if self._loading:
+            return
         email = self._email_row.get_text().strip()
         password = self._password_row.get_text()
 
@@ -181,9 +184,11 @@ class AuthDialog(Adw.Dialog):
         return GLib.SOURCE_REMOVE
 
     def _set_loading(self, loading: bool) -> None:
+        self._loading = loading
         self._sign_in_btn.set_sensitive(not loading)
         self._sign_in_btn.set_label(
             "Signing in…" if loading else ("Verify" if self._otp_group.get_visible() else "Sign In")
         )
         self._email_row.set_sensitive(not loading)
         self._password_row.set_sensitive(not loading)
+        self._otp_row.set_sensitive(not loading)

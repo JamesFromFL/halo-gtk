@@ -152,6 +152,13 @@ def test_parser_rejects_oversize_deep_duplicate_and_nonstandard_json():
         parse_clap_frame('{"channel":"x","msg":{"msg":"x","seq":NaN}}')
 
 
+@pytest.mark.parametrize("number", ["1e9999", "-1e9999", "9" * 5000])
+def test_parser_normalizes_overflowing_numbers_to_schema_errors(number):
+    frame = '{"channel":"message","msg":{"msg":"Future","body":[' + number + "]}}"
+    with pytest.raises(AlarmSchemaError):
+        parse_clap_frame(frame)
+
+
 def test_parser_rejects_malformed_known_messages_and_duplicate_devices():
     with pytest.raises(AlarmSchemaError, match="body"):
         parse_clap_frame(_frame({"msg": "DeviceInfoDocGetList", "src": "asset-1"}))

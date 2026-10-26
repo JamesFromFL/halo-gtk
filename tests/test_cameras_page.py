@@ -1,6 +1,7 @@
 """Tests for camera page ordering helpers."""
 
 import io
+import threading
 from types import SimpleNamespace
 
 from PIL import Image
@@ -182,6 +183,55 @@ def test_opening_focused_view_stops_grid_talkback(monkeypatch):
 
     assert calls[0] == "stop-talking"
     assert calls[1][0] == "focus"
+
+
+def test_siren_confirmation_rejects_a_replaced_camera_or_client(monkeypatch):
+    from halo_gtk import cameras_page
+
+    client = object()
+    device = SimpleNamespace(id=7)
+    sent = []
+    page = SimpleNamespace(
+        _cards={7: SimpleNamespace(device=device)},
+        _set_siren=lambda *args, **kwargs: sent.append((args, kwargs)),
+    )
+    monkeypatch.setattr(cameras_page, "get_client", lambda: client)
+
+    CamerasPage._on_siren_confirmed(page, None, "activate", device, client)
+    page._cards[7] = SimpleNamespace(device=SimpleNamespace(id=7))
+    CamerasPage._on_siren_confirmed(page, None, "activate", device, client)
+    page._cards[7] = SimpleNamespace(device=device)
+    monkeypatch.setattr(cameras_page, "get_client", object)
+    CamerasPage._on_siren_confirmed(page, None, "activate", device, client)
+
+    assert sent == [((device, 30), {"client": client})]
+
+
+def test_refresh_keeps_saved_layouts_that_match_a_partial_inventory(tmp_path, monkeypatch):
+    from halo_gtk import live_layouts
+
+    path = tmp_path / "live-monitoring-layouts.json"
+    monkeypatch.setattr(live_layouts, "LAYOUTS_FILE", path)
+    live_layouts.save_layouts(
+        [{"id": "patio", "name": "Patio", "order": [1, 2], "visible": [1, 2]}]
+    )
+    saved_text = path.read_text(encoding="utf-8")
+    page = SimpleNamespace(
+        _show_monitoring_controls=True,
+        _devices=[SimpleNamespace(id=1)],
+        _layout_is_default_equivalent=lambda _layout: True,
+        _is_default_live_layout=lambda: True,
+        _layout_select_btn=SimpleNamespace(set_label=lambda _label: None),
+        _save_layout_btn=SimpleNamespace(set_sensitive=lambda _value: None),
+        _rename_layout_btn=SimpleNamespace(set_visible=lambda _value: None),
+        _delete_layout_btn=SimpleNamespace(set_visible=lambda _value: None),
+        _rebuild_live_layout_menu=lambda: None,
+    )
+
+    CamerasPage._refresh_live_layout_state(page)
+
+    assert page._layout_records == []
+    assert path.read_text(encoding="utf-8") == saved_text
 
 
 def test_hiding_inspector_stops_selected_camera_talkback():
@@ -423,6 +473,7 @@ def test_deactivate_snapshot_updates_cancels_hidden_page_work(monkeypatch):
     page._event_client = client
     page._devices_request_generation = 3
     page._snapshot_generation = 7
+    cancelled = page._snapshot_cancel_event = threading.Event()
     page._refresh_timers = {1: 41, 2: 42}
     page._snapshot_inflight_generations = {1: 7}
     page._snapshot_pending_events = {1: object()}
@@ -438,10 +489,35 @@ def test_deactivate_snapshot_updates_cancels_hidden_page_work(monkeypatch):
     assert page._snapshot_updates_active is False
     assert page._devices_request_generation == 4
     assert page._snapshot_generation == 8
+    assert cancelled.is_set() and not page._snapshot_cancel_event.is_set()
     assert page._refresh_timers == {}
     assert page._snapshot_inflight_generations == {}
     assert page._snapshot_pending_events == {}
     assert page._snapshot_restart_timer_ids == set()
+
+
+def test_cancelled_preview_does_not_start_fallback_or_update_a_card(monkeypatch):
+    from halo_gtk import cameras_page
+
+    cancelled = threading.Event()
+    calls = []
+
+    def snapshot(_device, *, cancel_event):
+        assert cancel_event is cancelled
+        calls.append("snapshot")
+        cancel_event.set()
+        return None
+
+    client = SimpleNamespace(
+        snapshot_for_device=snapshot,
+        last_event_frame_for_device=lambda *_args, **_kwargs: calls.append("fallback"),
+    )
+    monkeypatch.setattr(cameras_page, "get_client", lambda: client)
+    page = CamerasPage.__new__(CamerasPage)
+    page._show_monitoring_controls = True
+    page._queue_card_snapshot_update = lambda *_args: calls.append("update")
+    page._load_snapshot(SimpleNamespace(id=1, name="fixture"), cancel_event=cancelled)
+    assert calls == ["snapshot"]
 
 
 def test_legacy_doorbell_push_refreshes_matching_camera_snapshot():

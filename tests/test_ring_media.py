@@ -181,6 +181,89 @@ async def test_microphone_frame_pacing_uses_monotonic_clock(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_microphone_failed_start_releases_pipeline_and_keeps_silence(monkeypatch):
+    states = []
+
+    class FailedPipeline:
+        def get_by_name(self, _name):
+            return object()
+
+        def set_state(self, state):
+            states.append(state)
+            return ring_media.Gst.StateChangeReturn.FAILURE
+
+    monkeypatch.setattr(ring_media.Gst, "parse_launch", lambda _description: FailedPipeline())
+    track = ring_media.MicrophoneTrack()
+
+    with pytest.raises(RuntimeError, match="could not start"):
+        await track.start_capture()
+
+    assert states == [ring_media.Gst.State.PLAYING, ring_media.Gst.State.NULL]
+    assert track._active is False
+    assert track._mic_pipeline is None
+    assert track._mic_appsink is None
+
+
+@pytest.mark.asyncio
+async def test_microphone_discards_sample_captured_before_talkback_release(monkeypatch):
+    track = ring_media.MicrophoneTrack()
+    sink = object()
+    track._active = True
+    track._mic_appsink = sink
+
+    class FakeLoop:
+        async def run_in_executor(self, _executor, _function, _sink):
+            await track.stop_capture()
+            return b"\x10\x10" * ring_media.MIC_SAMPLES
+
+    monkeypatch.setattr(ring_media.asyncio, "get_running_loop", FakeLoop)
+
+    frame = await track.recv()
+
+    assert bytes(frame.planes[0]) == b"\0" * (ring_media.MIC_SAMPLES * 2)
+
+
+@pytest.mark.parametrize(
+    ("format_name", "values", "expected"),
+    [
+        ("u8", [0, 128, 255], [-32768, 0, 32512]),
+        ("s16", [-32768, 0, 32767], [-32768, 0, 32767]),
+        ("s32", [-2147483648, 0, 2147483647], [-32768, 0, 32767]),
+        ("flt", [-1.0, 0.0, 1.0], [-32767, 0, 32767]),
+    ],
+)
+def test_audio_conversion_preserves_pcm_amplitude(format_name, values, expected):
+    import numpy as np
+    from av import AudioFrame
+
+    frame = AudioFrame(format=format_name, layout="mono", samples=len(values))
+    frame.sample_rate = 48000
+    frame.planes[0].update(np.asarray(values, dtype=frame.to_ndarray().dtype).tobytes())
+
+    raw, channels, rate, samples = ring_media.audio_frame_to_s16le_interleaved(frame)
+
+    assert np.frombuffer(raw, dtype="<i2").tolist() == expected
+    assert (channels, rate, samples) == (1, 48000, len(values))
+
+
+def test_audio_conversion_interleaves_planar_channels():
+    import numpy as np
+    from av import AudioFrame
+
+    frame = AudioFrame.from_ndarray(
+        np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int16),
+        format="s16p",
+        layout="stereo",
+    )
+    frame.sample_rate = 48000
+
+    raw, channels, rate, samples = ring_media.audio_frame_to_s16le_interleaved(frame)
+
+    assert np.frombuffer(raw, dtype="<i2").tolist() == [1, 4, 2, 5, 3, 6]
+    assert (channels, rate, samples) == (2, 48000, 3)
+
+
+@pytest.mark.asyncio
 async def test_aiortc_connect_task_is_retained_for_matching_peer_only():
     class Peer:
         def __init__(self):

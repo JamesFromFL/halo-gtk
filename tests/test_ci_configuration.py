@@ -38,7 +38,12 @@ def test_release_toolchain_and_private_patch_dependencies_are_pinned():
         dependency
         for dependency in config["project"]["dependencies"]
         if dependency.startswith("aiortc")
-    ] == ["aiortc==1.14.0"]
+    ] == ["aiortc==1.15.0"]
+    assert [
+        dependency
+        for dependency in config["project"]["dependencies"]
+        if dependency.startswith("av")
+    ] == ["av==17.1.0"]
 
 
 def test_ci_checks_lock_freshness_and_the_installed_wheel():

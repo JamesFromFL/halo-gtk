@@ -8,6 +8,7 @@ import threading
 import time
 from contextlib import suppress
 from dataclasses import dataclass
+from math import isfinite
 
 from halo_gtk import config as _config
 from halo_gtk import device_names
@@ -369,10 +370,13 @@ def _notification_target(event) -> _NotificationTarget | None:
         event_id_int = int(event_id) if event_id is not None else None
         started_at = float(getattr(event, "now", 0) or 0)
         expires_in = float(getattr(event, "expires_in", 0) or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return None
+    expires_at = started_at + expires_in
+    if not isfinite(expires_at):
         return None
     return _NotificationTarget(
         device_id=device_id_int,
         event_id=event_id_int,
-        expires_at=started_at + expires_in,
+        expires_at=expires_at,
     )

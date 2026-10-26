@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from unittest.mock import AsyncMock
 
 import pytest
 import ring_doorbell
@@ -872,12 +873,13 @@ async def test_async_event_history_passes_backend_history_parameters():
 
 
 @pytest.mark.asyncio
-async def test_last_event_frame_prefers_history_snapshot_url():
+async def test_last_event_frame_prefers_history_snapshot_url(monkeypatch):
     client = RingClient()
     device = _FakeDevice(history=[{"id": 1, "snapshot_url": "https://ring/snapshot.jpg"}])
     fake_ring = _FakeRing([device])
     fake_ring.auth = _FakeAuth()
     client._ring = fake_ring
+    monkeypatch.setattr(client._preview, "image_url", AsyncMock(return_value=b"history-snapshot"))
 
     preview = await client._async_last_event_frame_for_device(device)
 
@@ -886,7 +888,7 @@ async def test_last_event_frame_prefers_history_snapshot_url():
 
 
 @pytest.mark.asyncio
-async def test_event_preview_for_device_uses_matching_history_event_snapshot():
+async def test_event_preview_for_device_uses_matching_history_event_snapshot(monkeypatch):
     client = RingClient()
     device = _FakeDevice(
         history=[
@@ -897,6 +899,7 @@ async def test_event_preview_for_device_uses_matching_history_event_snapshot():
     fake_ring = _FakeRing([device])
     fake_ring.auth = _FakeAuth()
     client._ring = fake_ring
+    monkeypatch.setattr(client._preview, "image_url", AsyncMock(return_value=b"history-snapshot"))
     event = type("FakeEvent", (), {"id": 2})()
 
     preview = await client._async_event_preview_for_device(device, 2, event)
@@ -917,7 +920,64 @@ def test_stopped_client_rejects_submissions_without_restarting_loop():
         client.submit(coroutine)
 
     assert coroutine.cr_frame is None
+
+
+def test_submission_closes_coroutine_if_loop_stops_after_readiness(monkeypatch):
+    client = RingClient()
+    monkeypatch.setattr(client, "_ensure_loop", lambda: object())
+
+    def rejected_submission(_coroutine, _loop):
+        raise RuntimeError("Event loop is closed")
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", rejected_submission)
+
+    async def command():
+        pass
+
+    coroutine = command()
+    with pytest.raises(RuntimeError, match="loop is closed"):
+        client.submit(coroutine)
+    assert coroutine.cr_frame is None
     assert client._loop_thread is None
+
+
+@pytest.mark.asyncio
+async def test_installed_sdk_inventory_refresh_preserves_identity_until_membership_changes():
+    from ring_doorbell import Ring
+
+    ring = Ring(object())
+    ring.session = {}
+    inventory = {"doorbots": [{"id": 1, "description": "Door", "kind": "doorbell"}]}
+    ring.devices_data = {"doorbots": {1: dict(inventory["doorbots"][0])}}
+    original_device = ring.devices().all_devices[0]
+    active_stream = object()
+    original_device._webrtc_streams["active"] = active_stream
+
+    async def query(_url):
+        return type("Response", (), {"json": lambda _self: inventory})()
+
+    ring._async_query = query
+    ring_client._install_device_inventory_refresh(ring)
+    installed_update = ring.async_update_devices
+    ring_client._install_device_inventory_refresh(ring)
+    assert ring.async_update_devices is installed_update
+
+    inventory["doorbots"][0]["description"] = "Renamed Door"
+    await ring.async_update_devices()
+    assert ring.devices().all_devices[0] is original_device
+    assert original_device.name == "Renamed Door"
+
+    inventory["doorbots"].append({"id": 2, "description": "New Door", "kind": "doorbell"})
+    await ring.async_update_devices()
+    assert [device.id for device in ring.devices().all_devices] == [1, 2]
+    assert original_device._webrtc_streams["active"] is active_stream
+
+    inventory["doorbots"] = [inventory["doorbots"][1]]
+    await ring.async_update_devices()
+    assert [device.id for device in ring.devices().all_devices] == [2]
+    # SDK group refresh previously looked up removed device 1 and raised KeyError.
+    await ring.async_update_groups()
+    assert original_device._webrtc_streams["active"] is active_stream
 
 
 def test_stale_client_cannot_publish_listener_state(monkeypatch):
@@ -1072,6 +1132,49 @@ async def test_listener_reuses_persisted_and_updated_credentials_on_reconnect(
     assert saved == [updated]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("startup_result", [False, RuntimeError("startup failed"), "cancel"])
+async def test_listener_closes_partially_started_receiver(monkeypatch, startup_result):
+    client = RingClient()
+    client._ring = object()
+    calls = []
+    monkeypatch.setattr(client, "_load_owned_event_credentials", lambda: None)
+    monkeypatch.setattr(client, "_set_owned_listener_state", lambda _state: None)
+
+    class PartialListener:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def add_notification_callback(self, _callback):
+            pass
+
+        async def start(self):
+            calls.append("start")
+            if startup_result == "cancel":
+                raise asyncio.CancelledError
+            if isinstance(startup_result, Exception):
+                raise startup_result
+            return startup_result
+
+        async def stop(self):
+            calls.append("stop")
+
+    async def backoff(_seconds):
+        calls.append("backoff")
+        client._stop_event.set()
+
+    monkeypatch.setattr(ring_doorbell, "RingEventListener", PartialListener)
+    monkeypatch.setattr(client, "_sleep_or_stop", backoff)
+
+    if startup_result == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await client._async_listen()
+        assert calls == ["start", "stop"]
+    else:
+        await client._async_listen()
+        assert calls == ["start", "stop", "backoff"]
+
+
 def test_event_credential_save_failure_is_contained_and_reused(
     monkeypatch,
     caplog,
@@ -1145,13 +1248,10 @@ def test_invalid_and_stale_event_credential_callbacks_are_ignored(
 
 
 @pytest.mark.asyncio
-async def test_recording_frame_decode_runs_off_the_ring_event_loop(monkeypatch):
-    decode_threads = []
+async def test_recording_frame_decode_uses_preview_process_manager(monkeypatch):
     decoded_urls = []
-    event_loop_thread = threading.get_ident()
 
-    def decode(url):
-        decode_threads.append(threading.get_ident())
+    async def decode(url):
         decoded_urls.append(url)
         return b"decoded-frame"
 
@@ -1160,10 +1260,9 @@ async def test_recording_frame_decode_runs_off_the_ring_event_loop(monkeypatch):
             self.recording_url_calls += 1
             return "https://example.test/recording.mp4"
 
-    monkeypatch.setattr(ring_client, "_decode_first_recording_frame_png", decode)
-    monkeypatch.setattr(ring_client.asyncio, "to_thread", _polling_to_thread)
     device = RecordingDevice(history=[{"id": 22}])
     client = RingClient()
+    monkeypatch.setattr(client._preview, "recording", decode)
     client._ring = _FakeRing([device])
 
     first_task = asyncio.create_task(client._async_first_recording_frame(device, 22))
@@ -1182,26 +1281,24 @@ async def test_recording_frame_decode_runs_off_the_ring_event_loop(monkeypatch):
         "https://example.test/recording.mp4",
         "https://example.test/recording.mp4",
     ]
-    assert decode_threads and all(thread_id != event_loop_thread for thread_id in decode_threads)
 
 
 @pytest.mark.asyncio
 async def test_recording_decode_does_not_block_asyncio_progress(monkeypatch):
-    decode_started = threading.Event()
-    release_decode = threading.Event()
+    decode_started = asyncio.Event()
+    release_decode = asyncio.Event()
 
-    def decode(_url):
+    async def decode(_url):
         decode_started.set()
-        assert release_decode.wait(timeout=2)
+        await release_decode.wait()
         return b"decoded-frame"
 
     class RecordingDevice(_FakeDevice):
         async def async_recording_url(self, _event_id):
             return "https://example.test/recording.mp4"
 
-    monkeypatch.setattr(ring_client, "_decode_first_recording_frame_png", decode)
-    monkeypatch.setattr(ring_client.asyncio, "to_thread", _polling_to_thread)
     client = RingClient()
+    monkeypatch.setattr(client._preview, "recording", decode)
     device = RecordingDevice()
 
     decode_task = asyncio.create_task(client._async_first_recording_frame(device, 1))

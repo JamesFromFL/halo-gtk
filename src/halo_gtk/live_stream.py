@@ -26,6 +26,8 @@ gi.require_version("Gtk", "4.0")
 from aiortc.mediastreams import MediaStreamError  # noqa: E402
 from gi.repository import GLib, Gst, Gtk  # noqa: E402
 
+from halo_gtk.frame_timing import FrameClock  # noqa: E402
+
 # Importing the media module applies the validated aiortc compatibility patches.
 from halo_gtk.ring_media import (  # noqa: E402
     MicrophoneTrack,
@@ -36,6 +38,17 @@ from halo_gtk.ring_media import (  # noqa: E402
 )
 
 _log = logging.getLogger(__name__)
+
+# A nonblocking producer must bound/drop backlog explicitly. The byte threshold
+# alone only emits enough-data; it does not stop this asyncio producer.
+VIDEO_SOURCE = (
+    "appsrc name=vsrc format=time is-live=true do-timestamp=false block=false "
+    "max-buffers=2 max-bytes=0 max-time=0 leaky-type=downstream "
+)
+AUDIO_SOURCE = (
+    "appsrc name=asrc format=time is-live=true do-timestamp=false block=false "
+    "max-buffers=0 max-bytes=0 max-time=500000000 leaky-type=downstream "
+)
 
 
 @dataclass(eq=False)
@@ -56,6 +69,7 @@ class _StreamResources:
     connected: bool = False
     talkback_generation: int = 0
     talkback_requested: bool = False
+    talkback_callback: Any = None
 
     async def cleanup(self) -> None:
         if self.cleanup_started:
@@ -76,6 +90,10 @@ class _StreamResources:
             self.talkback_generation += 1
             self.talkback_requested = False
             await run_step(self.mic_track.stop_capture(), "Microphone")
+            set_error = getattr(self.mic_track, "set_on_capture_error", None)
+            if set_error is not None:
+                set_error(None)
+        self.talkback_callback = None
 
         current = asyncio.current_task()
         pending = [task for task in self.tasks if task is not current and not task.done()]
@@ -154,10 +172,10 @@ class LiveStreamView(Gtk.Box):
     def _build_pipeline(self) -> None:
         audio_sink = _audio_sink_description()
         self._pipeline = Gst.parse_launch(
-            "appsrc name=vsrc format=time is-live=true do-timestamp=false block=false "
+            f"{VIDEO_SOURCE}"
             "! videoconvert "
             "! gtk4paintablesink name=vsink sync=false  "
-            "appsrc name=asrc format=time is-live=true do-timestamp=false block=false "
+            f"{AUDIO_SOURCE}"
             "! queue max-size-time=500000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream "
             "! audioconvert "
             "! audioresample "
@@ -303,19 +321,25 @@ class LiveStreamView(Gtk.Box):
         """Return the GTK paintable backing the live video sink."""
         return self._paintable
 
-    def start_talking(self) -> None:
+    def start_talking(self, *, on_state_changed=None) -> None:
         """Begin sending microphone audio to Ring.  Safe to call from GTK thread."""
         resources = self._resources
         if resources is None:
+            if on_state_changed is not None:
+                on_state_changed("failed")
             return
         resources.talkback_generation += 1
         resources.talkback_requested = True
+        resources.talkback_callback = on_state_changed
         generation = resources.talkback_generation
-        self._submit(
+        self._talkback_outcome(resources, generation, "starting")
+        future = self._submit(
             resources.client,
             self._async_start_talking(resources, generation),
             "Microphone start",
         )
+        if future is None:
+            self._talkback_failed(resources, generation)
 
     async def _async_start_talking(
         self,
@@ -323,18 +347,49 @@ class LiveStreamView(Gtk.Box):
         generation: int,
     ) -> None:
         """Activate the camera speaker before sending microphone samples."""
-        while self._talkback_request_is_current(resources, generation):
-            if resources.connected and resources.mic_track is not None:
-                break
-            await asyncio.sleep(0.01)
-        if not self._talkback_request_is_current(resources, generation):
-            return
-        await activate_ring_camera_speaker(resources.device, resources.session_id)
-        if (
-            self._talkback_request_is_current(resources, generation)
-            and resources.mic_track is not None
-        ):
-            await resources.mic_track.start_capture()
+        try:
+            async with asyncio.timeout(12):
+                while self._talkback_request_is_current(resources, generation):
+                    if resources.connected and resources.mic_track is not None:
+                        break
+                    await asyncio.sleep(0.01)
+                if not self._talkback_request_is_current(resources, generation):
+                    return
+                await activate_ring_camera_speaker(resources.device, resources.session_id)
+                if self._talkback_request_is_current(resources, generation):
+                    set_error = getattr(resources.mic_track, "set_on_capture_error", None)
+                    if set_error is not None:
+                        set_error(lambda: self._talkback_failed(resources, generation))
+                    await resources.mic_track.start_capture()
+                    self._talkback_outcome(resources, generation, "active")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log.debug("Microphone activation failed: %s", exc)
+            if self._talkback_request_is_current(resources, generation):
+                with contextlib.suppress(Exception):
+                    await resources.mic_track.stop_capture()
+            self._talkback_failed(resources, generation)
+
+    def _talkback_failed(self, resources: _StreamResources, generation: int) -> None:
+        if self._talkback_request_is_current(resources, generation):
+            resources.talkback_requested = False
+            self._talkback_outcome(resources, generation, "failed")
+
+    def _talkback_outcome(self, resources, generation: int, state: str) -> None:
+        def deliver():
+            if (
+                self._is_current_resources(resources)
+                and resources.talkback_generation == generation
+            ):
+                if state in {"starting", "active"} and not resources.talkback_requested:
+                    return GLib.SOURCE_REMOVE
+                callback = resources.talkback_callback
+                if callback is not None:
+                    callback(state)
+            return GLib.SOURCE_REMOVE
+
+        GLib.idle_add(deliver)
 
     def stop_talking(self) -> None:
         """Stop sending microphone audio.  Safe to call from GTK thread."""
@@ -343,6 +398,7 @@ class LiveStreamView(Gtk.Box):
             return
         resources.talkback_generation += 1
         resources.talkback_requested = False
+        self._talkback_outcome(resources, resources.talkback_generation, "stopped")
         if resources.mic_track is None:
             return
         self._submit(
@@ -605,8 +661,8 @@ class LiveStreamView(Gtk.Box):
         _log.debug("Video frame receiver started")
         # Per-stream state lives in locals (not on self) so a freshly-started
         # receiver can't race a still-running old one over caps/PTS.
-        video_caps_set = False
-        video_pts = 0
+        video_dimensions = None
+        clock = FrameClock()
         terminal_state = "stopped"
         terminal_message = "Stream ended"
         try:
@@ -614,7 +670,7 @@ class LiveStreamView(Gtk.Box):
                 frame = await track.recv()
                 if not self._is_current_resources(resources):
                     break
-                rgb = frame.to_ndarray(format="rgb24")
+                rgb = frame.to_ndarray(format="rgb24", threads=1)
                 h, w = rgb.shape[:2]
 
                 # Store the un-padded frame for screenshots.
@@ -629,23 +685,24 @@ class LiveStreamView(Gtk.Box):
                 else:
                     raw = rgb.tobytes()
 
-                if not video_caps_set:
+                if video_dimensions != (w_caps, h):
                     caps = Gst.Caps.from_string(
-                        f"video/x-raw,format=RGB,width={w_caps},height={h},framerate=30/1"
+                        f"video/x-raw,format=RGB,width={w_caps},height={h},framerate=0/1"
                     )
                     self._video_appsrc.set_property("caps", caps)
-                    video_caps_set = True
+                    video_dimensions = (w_caps, h)
                     if w_caps != w:
                         _log.debug("Video stream: %dx%d (padded to %dx%d)", w, h, w_caps, h)
                     else:
                         _log.debug("Video stream: %dx%d", w, h)
 
-                duration = Gst.SECOND // 30
+                timestamp, discontinuity = clock.stamp(frame, Gst.SECOND // 30)
                 buffer = Gst.Buffer.new_wrapped(raw)
-                buffer.pts = video_pts
-                buffer.dts = video_pts
-                buffer.duration = duration
-                video_pts += duration
+                buffer.pts = timestamp
+                buffer.dts = timestamp
+                buffer.duration = Gst.CLOCK_TIME_NONE
+                if discontinuity:
+                    buffer.set_flags(Gst.BufferFlags.DISCONT)
                 result = self._video_appsrc.emit("push-buffer", buffer)
                 if not gst_push_succeeded(result):
                     _log.debug("Stopping video receiver after appsrc push result: %s", result)
@@ -678,8 +735,8 @@ class LiveStreamView(Gtk.Box):
 
     async def _receive_audio_frames(self, track, resources: _StreamResources) -> None:
         _log.debug("Audio frame receiver started")
-        audio_caps_set = False
-        audio_pts = 0
+        audio_format = None
+        clock = FrameClock()
         audio_push_logged = False
         try:
             while self._is_current_resources(resources):
@@ -688,21 +745,23 @@ class LiveStreamView(Gtk.Box):
                     break
                 raw, channels, rate, samples = audio_frame_to_s16le_interleaved(frame)
 
-                if not audio_caps_set:
+                if audio_format != (channels, rate):
                     caps_str = (
                         "audio/x-raw,format=S16LE,layout=interleaved,"
                         f"channels={channels},rate={rate}"
                     )
                     self._audio_appsrc.set_property("caps", Gst.Caps.from_string(caps_str))
-                    audio_caps_set = True
+                    audio_format = (channels, rate)
                     _log.debug("Ring audio stream: S16LE interleaved %dch %dHz", channels, rate)
 
                 duration = samples * Gst.SECOND // rate if rate > 0 else Gst.SECOND // 50
+                timestamp, discontinuity = clock.stamp(frame, duration)
                 buffer = Gst.Buffer.new_wrapped(raw)
-                buffer.pts = audio_pts
-                buffer.dts = audio_pts
+                buffer.pts = timestamp
+                buffer.dts = timestamp
                 buffer.duration = duration
-                audio_pts += duration
+                if discontinuity:
+                    buffer.set_flags(Gst.BufferFlags.DISCONT)
                 result = self._audio_appsrc.emit("push-buffer", buffer)
                 if not audio_push_logged:
                     _log.debug("Ring audio push result: %s", result.value_nick)
@@ -739,7 +798,7 @@ class LiveStreamView(Gtk.Box):
         def observe(done: concurrent.futures.Future) -> None:
             try:
                 error = done.exception()
-            except concurrent.futures.CancelledError:
+            except (concurrent.futures.CancelledError, asyncio.CancelledError):
                 return
             except Exception as exc:
                 _log.debug("%s result could not be read: %s", label, exc)

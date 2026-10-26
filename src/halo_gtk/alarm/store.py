@@ -27,6 +27,7 @@ from halo_gtk.alarm.models import (
     TriState,
     empty_alarm_snapshot,
 )
+from halo_gtk.alarm.policy import asset_reason, authorization_reason, panel_reason
 from halo_gtk.alarm.protocol import (
     MAX_DEVICE_DOCUMENTS,
     MAX_FRAME_BYTES,
@@ -1310,33 +1311,17 @@ def _command_availability(
         return False, "multiple-panels"
     if panel is None:
         return False, "panel-unavailable"
-    if write_authorization is AlarmWriteAuthorization.DENIED:
-        return False, "authorization-denied"
-    if write_authorization is not AlarmWriteAuthorization.ALLOWED:
-        return False, "authorization-unknown"
+    reason = authorization_reason(write_authorization)
+    if reason is not None:
+        return False, reason
     panel_asset = next(asset for asset in assets if asset.asset_id == panel.asset_id)
-    if panel_asset.connection is AlarmConnectionStatus.CELLULAR_BACKUP:
-        return False, "cellular-backup"
-    if panel_asset.connection is not AlarmConnectionStatus.ONLINE:
-        return False, "panel-offline"
-    if panel_asset.stale:
-        return False, "panel-stale"
-    if panel_asset.inventory is not AlarmInventoryStatus.COMPLETE:
-        return False, "panel-inventory-incomplete"
-    if any(
-        not device.stale
-        and (device.smoke is TriState.ACTIVE or device.carbon_monoxide is TriState.ACTIVE)
-        for device in panel_asset.devices
-    ):
-        return False, "life-safety-active"
-    if panel.mode is AlarmMode.UNKNOWN:
-        return False, "mode-unknown"
-    if panel.phase is AlarmPhase.ALARMING:
-        return False, "alarm-active"
-    if panel.phase is AlarmPhase.UNKNOWN or panel.signal is AlarmSignal.UNKNOWN:
-        return False, "panel-state-unknown"
-    if panel.signal is not AlarmSignal.NONE:
-        return False, "alarm-active"
-    if not panel.faulted_devices_valid:
-        return False, "faulted-device-list-invalid"
-    return True, None
+    reason = asset_reason(panel_asset, check_stale=True) or panel_reason(
+        panel.mode,
+        panel.phase,
+        panel.signal,
+        faults_valid=panel.faulted_devices_valid,
+        alarming_first=False,
+    )
+    if reason == "active-alarm":
+        reason = "alarm-active"
+    return reason is None, reason

@@ -33,7 +33,7 @@ def clear_debug_logs() -> int:
             continue
 
         path = Path(base_filename)
-        if not _is_halo_log(path):
+        if path.is_symlink() or not _is_halo_log(path):
             continue
 
         handler.acquire()
@@ -51,7 +51,7 @@ def clear_debug_logs() -> int:
             handler.release()
 
     for path in STATE_DIR.glob(LOG_GLOB):
-        if not path.is_file() or path.resolve() in active_paths:
+        if path.is_symlink() or not path.is_file() or path.resolve() in active_paths:
             continue
         path.write_text("")
         touched += 1
@@ -60,7 +60,7 @@ def clear_debug_logs() -> int:
 
 
 def _remove_path(path: Path) -> int:
-    if not path.exists():
+    if not path.exists() and not path.is_symlink():
         return 0
 
     if path.is_file() or path.is_symlink():

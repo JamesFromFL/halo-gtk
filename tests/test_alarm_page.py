@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 from halo_gtk import alarm_page as alarm_page_module
@@ -158,6 +159,19 @@ def test_location_title_treats_known_emergency_signal_as_active_evidence():
     )
 
     assert _location_state_title(location) == "Fire alarm active"
+
+
+def test_security_panel_row_prioritizes_active_alarm_over_disarmed_mode():
+    panel = _location(mode=AlarmMode.DISARMED).security_panel
+    fire = replace(panel, signal=AlarmSignal.FIRE)
+    alarming = replace(panel, phase=AlarmPhase.ALARMING)
+
+    assert _device_state(fire) == ("Fire alarm active", "error")
+    assert _device_state(alarming) == ("Alarm active", "error")
+    assert _device_state(replace(fire, stale=True)) == (
+        "Last reported: Fire alarm active",
+        "warning",
+    )
 
 
 def test_ac_power_loss_overrides_online_system_device_state():

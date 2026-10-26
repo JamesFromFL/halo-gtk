@@ -28,6 +28,15 @@ This section tracks the work toward Halo GTK's first tagged release.
 - Automated lint, test, dependency-audit, schema, desktop-file, and installed-wheel checks.
 
 ### Changed
+- Updated the validated media stack to aiortc 1.15.0 / PyAV 17.1.0 with explicit
+  single-thread RGB conversion and permanent real-media compatibility contracts.
+- Recording previews now use verified, bounded HTTPS and a stoppable decode
+  process; authenticated snapshot bodies are streamed under a separate cap.
+- Device setting writes are ordered per camera and session; pending values,
+  uncertain results and failed local saves have visible outcomes.
+- Tray registration is asynchronous and Favorites reconciliation runs outside
+  GTK callbacks with cached results. Deliberate media saves have tracked,
+  bounded jobs with progress, cancellation and atomic publication.
 - Rebuilt the application interface around an adaptive libadwaita navigation ribbon, image-first
   camera surfaces, a selected-camera monitoring inspector, and compact list/detail history.
 - Reorganized settings into General, Live View, Events, Storage, Account, and Advanced areas.
@@ -41,6 +50,29 @@ This section tracks the work toward Halo GTK's first tagged release.
   compatibility contracts.
 
 ### Fixed
+- Live video backlog is bounded, source frame intervals and audio gaps are
+  retained, and stale microphone results cannot change a newer talkback request.
+- Microphone startup and late capture failures reset the control and show a
+  failure outcome instead of leaving “Microphone on” while sending silence.
+- Shared Alarm policy helpers preserve existing admission decisions and reason
+  precedence, including service-only transport and bypass guards.
+- Alarm mode requests revalidate the confirmed revision at the socket-write boundary;
+  late connections and malformed protocol values cannot revive stopped state.
+- Event selection, deletion, autoplay, account details, and siren confirmations retain
+  the correct camera, request, and authenticated-session identity.
+- Temporary device disappearance no longer deletes saved monitoring layouts, and
+  Ring inventory refresh now discovers added/removed devices without restarting login.
+- Failed listener, session, and microphone startup/teardown clean up their resources;
+  push-to-talk discards captured samples that complete after release.
+- Live playback renegotiates changed media formats and correctly converts unsigned PCM.
+- Favorite downloads no longer hold the history index lock, and identically named
+  cameras cannot overwrite each other's archived clips.
+- Malformed settings/health data remain recoverable, unknown health stays unknown,
+  and log cleanup preserves symlink targets.
+- Installer and autostart paths use literal command escaping; launcher/desktop
+  publication is atomic, process matching is exact, and XDG paths stay consistent.
+- Refreshed HTTP, certificate, image, and related locked dependencies following
+  the October 2026 advisory audit; documented the server-only OAuthlib exception.
 - Stale authentication, event-listener, snapshot, and live-stream callbacks can no longer
   overwrite a newer session.
 - Blocking recording-frame decoding no longer stalls Ring's asynchronous event loop.

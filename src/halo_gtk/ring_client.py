@@ -39,14 +39,13 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
-import io
 import logging
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from contextvars import ContextVar
 from dataclasses import replace
-from functools import partial
+from functools import partial, wraps
 from typing import Any
 
 from halo_gtk.alarm.models import (
@@ -62,6 +61,7 @@ from halo_gtk.alarm.provider import (
     AlarmRequestError,
     location_seeds_from_base_stations,
 )
+from halo_gtk.preview import PreviewManager
 from halo_gtk.secret_store import (
     clear_ring_account_email,
     clear_ring_event_credentials,
@@ -74,6 +74,8 @@ from halo_gtk.secret_store import (
     save_ring_token,
     validate_ring_event_credentials,
 )
+from halo_gtk.snapshot_http import authenticated_snapshot_url
+from halo_gtk.snapshot_http import snapshot_bytes as _bounded_snapshot_bytes
 
 _log = logging.getLogger(__name__)
 
@@ -88,6 +90,7 @@ _account_email_lock = threading.Lock()
 
 _APP_USER_AGENT = "android:com.ringapp"
 _DEFAULT_CALL_TIMEOUT = 90
+_PREVIEW_CALL_TIMEOUT = 15
 _LISTENER_STOP_TIMEOUT = 4
 _ALARM_STOP_TIMEOUT = 4
 _ASYNC_CLOSE_TIMEOUT = 5
@@ -99,6 +102,47 @@ _LISTENER_RECONNECT_MIN = 5
 _LISTENER_RECONNECT_MAX = 120
 _RING_LOCATIONS_ENDPOINT = "https://api.ring.com/devices/v1/locations"
 _ALARM_LOCATION_DISCOVERY_TIMEOUT = 10
+_PREVIEW_CALL_SLOTS = threading.BoundedSemaphore(2)
+
+
+def _bounded_preview(method):
+    """Bound a whole preview (including SDK waits) and track stop cancellation."""
+
+    @wraps(method)
+    async def call(self, *args, **kwargs):
+        task = asyncio.current_task()
+        entered = False
+        try:
+            async with asyncio.timeout(_PREVIEW_CALL_TIMEOUT):
+                with self._preview_tasks_lock:
+                    nested = task in self._preview_tasks
+                    if nested:
+                        self._preview_tasks[task] += 1
+                        entered = True
+                if not nested:
+                    while not _PREVIEW_CALL_SLOTS.acquire(blocking=False):
+                        if not self._preview_is_current():
+                            return None
+                        await asyncio.sleep(0.025)
+                    with self._preview_tasks_lock:
+                        self._preview_tasks[task] = 1
+                    entered = True
+                if not self._preview_is_current():
+                    return None
+                result = await method(self, *args, **kwargs)
+                return result if self._preview_is_current() else None
+        except TimeoutError:
+            return None
+        finally:
+            if entered:
+                with self._preview_tasks_lock:
+                    self._preview_tasks[task] -= 1
+                    if self._preview_tasks[task] == 0:
+                        del self._preview_tasks[task]
+                        _PREVIEW_CALL_SLOTS.release()
+
+    return call
+
 
 # Real-time event-listener connection state, surfaced to the UI for an
 # "events offline / reconnecting" indicator. Module-level so subscribers survive
@@ -180,6 +224,15 @@ def _install_serialized_auth_refresh(auth) -> None:
         default=None,
     )
 
+    @contextlib.contextmanager
+    def request_scope():
+        """Capture the token generation before either SDK or bounded image I/O."""
+        token = request_refresh_generation.set(completed_refreshes)
+        try:
+            yield
+        finally:
+            request_refresh_generation.reset(token)
+
     async def serialized_refresh():
         nonlocal completed_refreshes, last_result
         observed_refreshes = completed_refreshes
@@ -194,18 +247,49 @@ def _install_serialized_auth_refresh(auth) -> None:
             return last_result
 
     auth.async_refresh_tokens = serialized_refresh
+    auth._halo_auth_request_scope = request_scope
     original_query = getattr(auth, "async_query", None)
     if callable(original_query):
 
         async def generation_tracked_query(*args, **kwargs):
-            token = request_refresh_generation.set(completed_refreshes)
-            try:
+            with request_scope():
                 return await original_query(*args, **kwargs)
-            finally:
-                request_refresh_generation.reset(token)
 
         auth.async_query = generation_tracked_query
     auth._halo_refresh_serialized = True
+
+
+def _install_device_inventory_refresh(ring) -> None:
+    """Invalidate the pinned SDK's collection when devices are added or removed.
+
+    ring-doorbell refreshes devices_data but retains its old RingDevices cache.
+    Invalidate immediately after inventory refresh so its subsequent group
+    discovery also sees the current devices. Normal state refreshes preserve
+    identity, and active streams retain their own original device references.
+    """
+    if getattr(ring, "_halo_inventory_refresh_installed", False):
+        return
+    update_devices = getattr(ring, "async_update_devices", None)
+    if not callable(update_devices) or not hasattr(ring, "_devices"):
+        return
+    families = {"doorbots", "authorized_doorbots", "stickup_cams", "chimes", "other"}
+
+    def inventory_signature():
+        return frozenset(
+            (family, device_id, attrs.get("kind"))
+            for family, devices in ring.devices_data.items()
+            if family in families
+            for device_id, attrs in devices.items()
+        )
+
+    async def refresh_devices():
+        previous = inventory_signature()
+        await update_devices()
+        if inventory_signature() != previous:
+            ring._devices = None
+
+    ring.async_update_devices = refresh_devices
+    ring._halo_inventory_refresh_installed = True
 
 
 # ---------------------------------------------------------------------------
@@ -512,23 +596,6 @@ def start_client(client: RingClient) -> bool:
         return True
 
 
-def _decode_first_recording_frame_png(url: str) -> bytes:
-    """Decode one recording frame synchronously for use from a worker thread."""
-    import av
-    from PIL import Image
-
-    container = av.open(url, options={"timeout": "5000000"})
-    try:
-        frame = next(container.decode(video=0))
-        array = frame.to_ndarray(format="rgb24")
-    finally:
-        container.close()
-
-    output = io.BytesIO()
-    Image.fromarray(array).save(output, format="PNG")
-    return output.getvalue()
-
-
 # ---------------------------------------------------------------------------
 # Client
 # ---------------------------------------------------------------------------
@@ -556,6 +623,9 @@ class RingClient:
         self._alarm_closing_service = None
         self._alarm_close_task: asyncio.Task | None = None
         self._stop_event = threading.Event()
+        self._preview = PreviewManager(self._stop_event)
+        self._preview_tasks_lock = threading.Lock()
+        self._preview_tasks = {}
         self._event_callbacks: list = []
         self._alarm_callbacks: list = []
         self._alarm_snapshot_lock = threading.Lock()
@@ -639,16 +709,42 @@ class RingClient:
             future.cancel()
             raise TimeoutError("Ring API request timed out") from None
 
+    def _run_preview(self, coro, cancel_event: threading.Event | None = None) -> bytes | None:
+        """Cancel the actual async preview when its requesting view is retired."""
+        if cancel_event is None:
+            # Preserve the ordinary submission path for existing callers and
+            # injected clients. The async preview scope still has its deadline.
+            return self._run(coro)
+        if cancel_event.is_set():
+            coro.close()
+            return None
+        future = self.submit(coro)
+        deadline = time.monotonic() + _PREVIEW_CALL_TIMEOUT
+        while True:
+            if cancel_event.is_set() or time.monotonic() >= deadline:
+                future.cancel()
+                return None
+            try:
+                result = future.result(timeout=min(0.05, max(0.001, deadline - time.monotonic())))
+            except concurrent.futures.TimeoutError:
+                if future.done():
+                    return None
+                continue
+            except concurrent.futures.CancelledError:
+                return None
+            # Completion and view retirement can arrive in the same interval.
+            return None if cancel_event.is_set() else result
+
     def submit(self, coro) -> concurrent.futures.Future:
         """Submit *coro* to the Ring asyncio loop and return its Future."""
         try:
             loop = self._ensure_loop()
+            return asyncio.run_coroutine_threadsafe(coro, loop)
         except BaseException:
             close = getattr(coro, "close", None)
             if callable(close):
                 close()
             raise
-        return asyncio.run_coroutine_threadsafe(coro, loop)
 
     # ------------------------------------------------------------------
     # Authentication
@@ -692,6 +788,7 @@ class RingClient:
                 self._capture_auth_token(token)
 
             ring = Ring(auth)
+            _install_device_inventory_refresh(ring)
             _log.debug(
                 "OAuth token obtained — hardware_id=%s user_agent=%s",
                 auth.get_hardware_id(),
@@ -720,6 +817,7 @@ class RingClient:
 
         try:
             ring = Ring(auth)
+            _install_device_inventory_refresh(ring)
 
             # A cached token that expired (and whose refresh failed) raises
             # AuthenticationError here — let it propagate so init_client_from_cache()
@@ -1032,25 +1130,34 @@ class RingClient:
                 return device
         return None
 
-    def snapshot_for_device(self, device) -> bytes | None:
+    def snapshot_for_device(
+        self, device, *, cancel_event: threading.Event | None = None
+    ) -> bytes | None:
         """Return snapshot bytes for a device, including cached snapshot fallback."""
         if self._ring is None:
             return None
-        return self._run(self._async_snapshot_bytes(device))
+        return self._run_preview(self._async_snapshot_bytes(device), cancel_event)
 
-    def last_event_frame_for_device(self, device) -> bytes | None:
+    def last_event_frame_for_device(
+        self, device, *, cancel_event: threading.Event | None = None
+    ) -> bytes | None:
         """Return a first-frame preview from the latest event, with snapshot fallback."""
         if self._ring is None:
             return None
-        return self._run(self._async_last_event_frame_for_device(device))
+        return self._run_preview(self._async_last_event_frame_for_device(device), cancel_event)
 
-    def event_preview_for_device(self, device, event) -> bytes | None:
+    def event_preview_for_device(
+        self, device, event, *, cancel_event: threading.Event | None = None
+    ) -> bytes | None:
         """Return the best preview image for a Ring push event."""
         if self._ring is None:
             return None
         event_id = getattr(event, "id", None)
-        return self._run(self._async_event_preview_for_device(device, event_id, event))
+        return self._run_preview(
+            self._async_event_preview_for_device(device, event_id, event), cancel_event
+        )
 
+    @_bounded_preview
     async def _async_event_preview_for_device(
         self,
         device,
@@ -1062,6 +1169,7 @@ class RingClient:
             history_event = await self._async_find_history_event(device, event_id)
         return await self._async_event_preview_bytes(device, event_id, event, history_event)
 
+    @_bounded_preview
     async def _async_last_event_frame_for_device(self, device) -> bytes | None:
         try:
             history = await device.async_history(limit=1)
@@ -1083,9 +1191,9 @@ class RingClient:
                 _log.debug("No recording URL for event %s; using cached snapshot", event_id)
                 return await self._async_cached_snapshot_bytes(device.id)
 
-            png_bytes = await asyncio.to_thread(_decode_first_recording_frame_png, url)
+            png_bytes = await self._preview.recording(url)
             _log.debug("Decoded first frame from recording for %s", device.name)
-            return png_bytes
+            return png_bytes if self._preview_is_current() else None
         except Exception as exc:
             _log.debug("Latest event preview failed for %s: %s", device.name, exc)
             return await self._async_cached_snapshot_bytes(device.id)
@@ -1213,6 +1321,7 @@ class RingClient:
                 return item
         return None
 
+    @_bounded_preview
     async def _async_event_preview_bytes(
         self,
         device,
@@ -1238,6 +1347,7 @@ class RingClient:
 
         return None
 
+    @_bounded_preview
     async def _async_history_snapshot_bytes(
         self,
         history_event: dict[str, Any] | None,
@@ -1247,23 +1357,49 @@ class RingClient:
             return None
 
         try:
-            resp = await self._ring.auth.async_query(snapshot_url)
-            if resp.status_code == 200 and resp.content:
-                return bytes(resp.content)
+            try:
+                endpoint = authenticated_snapshot_url(snapshot_url)
+            except Exception:
+                # Signed CDN URLs receive no Ring bearer token or SDK cookies.
+                image = await self._preview.image_url(snapshot_url)
+            else:
+                data = await _bounded_snapshot_bytes(self._ring.auth, endpoint)
+                image = await self._preview.normalize_image(data)
+            return image if self._preview_is_current() else None
         except Exception as exc:
             _log.debug("Notification history snapshot fetch failed: %s", exc)
         return None
 
+    @_bounded_preview
     async def _async_snapshot_bytes(self, device) -> bytes | None:
         try:
-            snapshot = await device.async_get_snapshot(retries=2, delay=1)
-            if snapshot:
-                return bytes(snapshot)
+            from ring_doorbell.const import SNAPSHOT_ENDPOINT, SNAPSHOT_TIMESTAMP_ENDPOINT
+
+            # Follow the pinned SDK's timestamp/retry sequence, but fetch the
+            # image through our streaming cap instead of SDK resp.read().
+            async with asyncio.timeout(8):
+                payload = {"doorbot_ids": [device.id]}
+                await self._ring.async_query(
+                    SNAPSHOT_TIMESTAMP_ENDPOINT, method="POST", json=payload
+                )
+                requested = time.time()
+                for _attempt in range(2):
+                    await asyncio.sleep(1)
+                    response = await self._ring.async_query(
+                        SNAPSHOT_TIMESTAMP_ENDPOINT, method="POST", json=payload
+                    )
+                    if response.json()["timestamps"][0]["timestamp"] / 1000 > requested:
+                        data = await _bounded_snapshot_bytes(
+                            self._ring.auth, SNAPSHOT_ENDPOINT.format(device.id)
+                        )
+                        image = await self._preview.normalize_image(data)
+                        return image if self._preview_is_current() else None
         except Exception as exc:
             _log.debug("Notification snapshot fetch failed for %s: %s", device.name, exc)
 
         return await self._async_cached_snapshot_bytes(device.id, device_name=device.name)
 
+    @_bounded_preview
     async def _async_cached_snapshot_bytes(
         self,
         device_id: int,
@@ -1273,24 +1409,38 @@ class RingClient:
         try:
             from ring_doorbell.const import SNAPSHOT_ENDPOINT
 
-            resp = await self._ring.async_query(SNAPSHOT_ENDPOINT.format(device_id))
-            if resp.status_code == 200 and resp.content:
-                return bytes(resp.content)
+            data = await _bounded_snapshot_bytes(
+                self._ring.auth, SNAPSHOT_ENDPOINT.format(device_id)
+            )
+            image = await self._preview.normalize_image(data)
+            return image if self._preview_is_current() else None
         except Exception as exc:
             label = device_name or str(device_id)
             _log.debug("Cached snapshot fetch failed for %s: %s", label, exc)
 
         return None
 
+    @_bounded_preview
     async def _async_first_recording_frame(self, device, event_id: int) -> bytes | None:
         try:
+            if not self._preview_is_current():
+                return None
             url = await device.async_recording_url(event_id)
             if not url:
                 return None
-            return await asyncio.to_thread(_decode_first_recording_frame_png, url)
+            image = await self._preview.recording(url)
+            return image if self._preview_is_current() else None
         except Exception as exc:
             _log.debug("Notification recording preview failed for event %s: %s", event_id, exc)
             return None
+
+    def _preview_is_current(self) -> bool:
+        generation = self._published_generation
+        return (
+            not self._stopped
+            and not self._stop_event.is_set()
+            and (generation is None or _is_active_client_generation(self, generation))
+        )
 
     # ------------------------------------------------------------------
     # Background FCM listener
@@ -1316,6 +1466,16 @@ class RingClient:
         with self._loop_lock:
             self._stopped = True
         self._stop_event.set()
+        self._preview.close()
+        from halo_gtk.save_jobs import cancel_for_client
+
+        cancel_for_client(self)
+        with self._preview_tasks_lock:
+            preview_tasks = tuple(self._preview_tasks)
+        for task in preview_tasks:
+            loop = task.get_loop()
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(task.cancel)
         self._retire_event_listener_revision()
         self._signal_alarm_stop()
         alarm_future = self._alarm_future
@@ -1427,23 +1587,16 @@ class RingClient:
             )
             listener.add_notification_callback(self._on_ring_event)
             self._set_owned_listener_state(LISTENER_CONNECTING)
+            started = False
             try:
-                started = await listener.start()
-            except Exception as exc:
-                _log.warning("FCM listener failed to start: %s", exc)
-                started = False
-
-            if not started:
-                self._retire_event_listener_revision(listener_revision)
-                self._set_owned_listener_state(LISTENER_OFFLINE)
-                await self._sleep_or_stop(backoff)
-                backoff = min(backoff * 2, _LISTENER_RECONNECT_MAX)
-                continue
-
-            backoff = _LISTENER_RECONNECT_MIN
-            _log.info("FCM event listener started")
-            try:
-                while not self._stop_event.is_set():
+                try:
+                    started = await listener.start()
+                except Exception as exc:
+                    _log.warning("FCM listener failed to start: %s", exc)
+                if started:
+                    backoff = _LISTENER_RECONNECT_MIN
+                    _log.info("FCM event listener started")
+                while started and not self._stop_event.is_set():
                     await self._sleep_or_stop(_LISTENER_MONITOR_INTERVAL)
                     if self._stop_event.is_set():
                         break
@@ -1457,6 +1610,12 @@ class RingClient:
                 with contextlib.suppress(Exception):
                     await listener.stop()
                 _log.info("FCM event listener stopped")
+            if not started:
+                self._set_owned_listener_state(LISTENER_OFFLINE)
+                # The listener can allocate a receiver before start() fails.
+                # Close it before waiting or creating its replacement.
+                await self._sleep_or_stop(backoff)
+                backoff = min(backoff * 2, _LISTENER_RECONNECT_MAX)
 
         self._set_owned_listener_state(LISTENER_OFFLINE)
 

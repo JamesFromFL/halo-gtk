@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections import deque
 from collections.abc import Callable
+from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +16,7 @@ gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
+from ring_doorbell.exceptions import RingTimeout  # noqa: E402
 
 from halo_gtk import device_names  # noqa: E402
 from halo_gtk.camera_info import CameraInfoContent  # noqa: E402
@@ -22,6 +25,135 @@ from halo_gtk.ring_client import get_client  # noqa: E402
 _log = logging.getLogger(__name__)
 
 _CHIME_TYPES = ("Mechanical", "Digital", "Not Present")
+_SETTING_TIMEOUT = 20.0
+_setting_queues_lock = threading.Lock()
+_setting_queues: dict[tuple, _SettingQueue] = {}
+
+
+@dataclass
+class _SettingRequest:
+    key: str | None
+    invoke: Callable[[], Any]
+    current: Callable[[], bool]
+    wanted: Callable[[], bool]
+    finished: Callable[[str | None, bool], None]
+
+
+class _SettingQueue:
+    """One in-flight write per device/session, including after a wait timeout.
+
+    Only callers explicitly providing an idempotent setting key may replace an
+    unsent value. Never cancel/retry a submitted remote write on a UI timeout.
+    """
+
+    def __init__(self, key: tuple, client) -> None:
+        self.key = key
+        self.client = client
+        self.pending: deque[_SettingRequest] = deque()
+
+    @classmethod
+    def enqueue(cls, key: tuple, client, request: _SettingRequest) -> None:
+        replaced = []
+        with _setting_queues_lock:
+            queue = _setting_queues.get(key)
+            start = queue is None
+            if queue is None:
+                queue = cls(key, client)
+                _setting_queues[key] = queue
+            if request.key is not None:
+                replaced = [waiting for waiting in queue.pending if waiting.key == request.key]
+                queue.pending = deque(
+                    waiting for waiting in queue.pending if waiting.key != request.key
+                )
+                queue.pending.append(request)
+            else:
+                queue.pending.append(request)
+        for waiting in replaced:
+            if waiting.current() and waiting.wanted():
+                waiting.finished("Not sent; a newer pending value replaced this change.", False)
+        if start:
+            try:
+                threading.Thread(target=queue._run, daemon=True).start()
+            except Exception as exc:
+                _log.debug("Could not start camera setting worker: %s", exc)
+                with _setting_queues_lock:
+                    _setting_queues.pop(key, None)
+                    waiting = list(queue.pending)
+                    queue.pending.clear()
+                for queued in waiting:
+                    if queued.current() and queued.wanted():
+                        queued.finished(
+                            "Not sent; the save worker could not start. Try again.", False
+                        )
+
+    async def _invoke(self, request: _SettingRequest):
+        if not request.current() or not request.wanted():
+            raise RuntimeError("The Ring session or settings window changed")
+        return await request.invoke()
+
+    def _run(self) -> None:
+        while True:
+            with _setting_queues_lock:
+                if not self.pending:
+                    _setting_queues.pop(self.key, None)
+                    return
+                request = self.pending.popleft()
+            if not request.current() or not request.wanted():
+                continue
+            try:
+                command = self._invoke(request)
+                try:
+                    future = self.client.submit(command)
+                except BaseException:
+                    command.close()
+                    raise
+                try:
+                    future.result(timeout=_SETTING_TIMEOUT)
+                except FutureTimeout:
+                    if future.done():
+                        # Completion can race the local wait deadline.
+                        future.result()
+                    else:
+                        request.finished(
+                            "Ring has not confirmed this change. Waiting for its outcome.", True
+                        )
+                        # Hold subsequent writes until the actual request resolves.
+                        # Closing a window must not admit overlapping writes.
+                        while request.current():
+                            try:
+                                future.result(timeout=0.25)
+                                break
+                            except FutureTimeout:
+                                if future.done():
+                                    future.result()
+                                    break
+                        else:
+                            continue
+                if request.current():
+                    request.finished(None, False)
+            except Exception as exc:
+                _log.debug("Camera setting write failed: %s", exc)
+                if request.current():
+                    uncertain = isinstance(exc, TimeoutError | RingTimeout)
+                    request.finished(
+                        "Ring timed out; the change may have been applied. "
+                        "Check the camera before trying again."
+                        if uncertain
+                        else "Ring could not confirm this change. "
+                        "Check the connection and camera, then try again.",
+                        uncertain,
+                    )
+                    if uncertain:
+                        with _setting_queues_lock:
+                            waiting = list(self.pending)
+                            self.pending.clear()
+                        for queued in waiting:
+                            if queued.current() and queued.wanted():
+                                queued.finished(
+                                    "Not sent because an earlier change has an uncertain outcome. "
+                                    "Check the camera before trying again.",
+                                    False,
+                                )
 
 
 @dataclass(frozen=True)
@@ -118,6 +250,7 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
         self._on_nickname_changed = on_nickname_changed
         self._loading = False
         self._closed = False
+        self._setting_serial = 0
         self._status_row: Adw.ActionRow | None = None
         self.connect("close-request", self._on_close_request)
         self._build_ui()
@@ -320,6 +453,7 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
                     ("settings", "motion_detection_enabled"),
                     value,
                 ),
+                setting_key="motion_detection",
             )
 
     def _on_nickname_activate(self, entry: Gtk.Entry) -> None:
@@ -350,6 +484,7 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
                 "Doorbell Volume",
                 lambda: self.device.async_set_volume(value),
                 lambda: _set_nested_attr(self.device, ("settings", "doorbell_volume"), value),
+                setting_key="doorbell_volume",
             )
 
     def _on_chime_type_changed(self, dropdown: Gtk.DropDown, _param) -> None:
@@ -365,6 +500,7 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
                 ),
                 refresh_settings=True,
                 success_detail=f"Saved: {label}",
+                setting_key="chime_type",
             )
 
     def _on_chime_enabled_changed(self, row: Adw.SwitchRow, _param) -> None:
@@ -378,6 +514,7 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
                     ("settings", "chime_settings", "enable"),
                     value,
                 ),
+                setting_key="chime_enabled",
             )
 
     def _on_chime_duration_changed(self, spin: Gtk.SpinButton) -> None:
@@ -389,6 +526,7 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
                 lambda: _set_nested_attr(
                     self.device, ("settings", "chime_settings", "duration"), value
                 ),
+                setting_key="chime_duration",
             )
 
     def _apply_setting(
@@ -399,29 +537,80 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
         *,
         refresh_settings: bool = False,
         success_detail: str | None = None,
+        setting_key: str | None = None,
     ) -> None:
-        self._set_status(f"Saving {title}...")
+        client = get_client()
+        if client is None:
+            self._set_status(f"{title} was not saved: not signed in to Ring")
+            return
+        generation = getattr(client, "_published_generation", None)
+        self._setting_serial += 1
+        serial = self._setting_serial
+        self._set_status(f"Waiting to save {title}...")
 
-        def worker() -> None:
-            error: str | None = None
-            try:
-                client = get_client()
-                if client is None:
-                    raise RuntimeError("Not signed in to Ring")
-                client.submit(coroutine_factory()).result(timeout=20)
-                local_update()
-            except Exception as exc:
-                _log.debug("Failed to save %s for %s: %s", title, self.device.name, exc)
-                error = str(exc)
+        def current() -> bool:
+            return (
+                get_client() is client
+                and getattr(client, "_published_generation", None) == generation
+                and not getattr(client, "_stopped", False)
+            )
+
+        def finished(error: str | None, uncertain: bool) -> None:
             GLib.idle_add(
-                self._finish_apply,
+                self._finish_queued_setting,
+                serial,
+                current,
                 title,
                 error,
+                uncertain,
+                local_update,
                 refresh_settings,
                 success_detail,
             )
 
-        threading.Thread(target=worker, daemon=True).start()
+        key = (id(client), generation, device_names.device_key(self.device) or id(self.device))
+        _SettingQueue.enqueue(
+            key,
+            client,
+            _SettingRequest(
+                setting_key,
+                coroutine_factory,
+                current,
+                lambda: not self._closed,
+                finished,
+            ),
+        )
+
+    def _finish_queued_setting(
+        self,
+        serial,
+        current,
+        title,
+        error,
+        uncertain,
+        local_update,
+        refresh_settings,
+        success_detail,
+    ) -> bool:
+        if self._closed or not current():
+            return GLib.SOURCE_REMOVE
+        if error is None:
+            try:
+                local_update()
+            except Exception as exc:
+                _log.debug("Ring saved a setting but the local display could not refresh: %s", exc)
+                error = (
+                    "Ring saved the change, but the local display could not refresh. "
+                    "Reopen settings."
+                )
+        # An old request must not replace a newer pending/error status or
+        # rebuild controls while a later edit is still queued.
+        if uncertain:
+            self._set_status(f"{title}: {error} No automatic retry.")
+            return GLib.SOURCE_REMOVE
+        if serial != self._setting_serial:
+            return GLib.SOURCE_REMOVE
+        return self._finish_apply(title, error, refresh_settings, success_detail)
 
     def _on_close_request(self, *_args) -> bool:
         self._closed = True
@@ -437,7 +626,10 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
         if self._closed:
             return GLib.SOURCE_REMOVE
         if error:
-            self._set_status(f"{title} failed: {error}")
+            if error.startswith("Not sent"):
+                self._set_status(f"{title}: {error}")
+            else:
+                self._set_status(f"{title} could not be confirmed: {error}")
         else:
             if refresh_settings:
                 self._show_settings()

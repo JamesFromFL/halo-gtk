@@ -42,3 +42,24 @@ def test_set_enabled_false_removes_user_autostart_file(tmp_path, monkeypatch):
     autostart.set_enabled(False)
 
     assert autostart.is_enabled() is False
+
+
+def test_autostart_preserves_special_characters_in_executable(tmp_path, monkeypatch):
+    from gi.repository import GLib
+
+    from halo_gtk import autostart
+
+    executable = '/home/a $() `x` &|%"\\/halo-gtk'
+    autostart_file = tmp_path / "halo.desktop"
+    monkeypatch.setattr(autostart, "AUTOSTART_DIR", tmp_path)
+    monkeypatch.setattr(autostart, "AUTOSTART_FILE", autostart_file)
+    monkeypatch.setattr(autostart.shutil, "which", lambda _name: executable)
+
+    autostart.set_enabled(True, background=True)
+
+    desktop = GLib.KeyFile()
+    desktop.load_from_file(str(autostart_file), GLib.KeyFileFlags.NONE)
+    command = desktop.get_string("Desktop Entry", "Exec").replace("%%", "%")
+    valid, arguments = GLib.shell_parse_argv(command)
+    assert valid
+    assert arguments == [executable, "--background"]

@@ -10,7 +10,10 @@ APP_DIR_NAME = "halo-gtk"
 
 def _xdg_path(env_name: str, fallback: Path) -> Path:
     value = os.environ.get(env_name)
-    return Path(value).expanduser() if value else fallback
+    # The XDG specification requires absolute paths; relative values must not
+    # redirect settings or private media into the current working directory.
+    path = Path(value) if value else fallback
+    return path if path.is_absolute() else fallback
 
 
 def config_home() -> Path:

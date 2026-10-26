@@ -11,6 +11,7 @@ them wrong makes some camera streams decode as garbage.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import fractions
 import functools
 import json
@@ -373,13 +374,18 @@ def audio_frame_to_s16le_interleaved(frame) -> tuple[bytes, int, int, int]:
     if interleaved.dtype.kind == "f":
         interleaved = np.clip(interleaved, -1.0, 1.0)
         interleaved = (interleaved * 32767).astype(np.int16)
-    elif interleaved.dtype != np.int16:
-        info = np.iinfo(interleaved.dtype) if interleaved.dtype.kind in {"i", "u"} else None
-        if info is not None and interleaved.dtype.itemsize > 2:
-            shift = (interleaved.dtype.itemsize - 2) * 8
-            interleaved = (interleaved >> shift).astype(np.int16)
-        else:
-            interleaved = interleaved.astype(np.int16)
+    elif interleaved.dtype.kind in {"i", "u"}:
+        bits = interleaved.dtype.itemsize * 8
+        if interleaved.dtype.kind == "u":
+            # PyAV's unsigned PCM format is u8: silence is 128, not zero.
+            interleaved = interleaved.astype(np.int64) - (1 << (bits - 1))
+        if bits > 16:
+            interleaved = interleaved >> (bits - 16)
+        elif bits < 16:
+            interleaved = interleaved.astype(np.int16) << (16 - bits)
+
+    # The GStreamer caps specify S16LE regardless of the host's byte order.
+    interleaved = interleaved.astype("<i2", copy=False)
 
     if samples <= 0 and channels > 0:
         samples = max(1, interleaved.size // channels)
@@ -418,6 +424,12 @@ class MicrophoneTrack(AudioStreamTrack):
         self._mic_appsink: Gst.Element | None = None
         self._start: float | None = None
         self._timestamp: int = 0
+        self._capture_monitor: asyncio.Task | None = None
+        self._on_capture_error = None
+
+    def set_on_capture_error(self, callback) -> None:
+        """Observe lost local capture on the track's owning asyncio loop."""
+        self._on_capture_error = callback
 
     async def start_capture(self) -> None:
         """Start the GStreamer pulsesrc pipeline and begin sending mic audio."""
@@ -430,21 +442,58 @@ class MicrophoneTrack(AudioStreamTrack):
             "! capsfilter caps=audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved "
             "! appsink name=sink emit-signals=false max-buffers=1 drop=true"
         )
+        try:
+            appsink = pipeline.get_by_name("sink")
+            if appsink is None:
+                raise RuntimeError("Microphone pipeline did not provide an audio sink")
+            if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+                raise RuntimeError("Microphone pipeline could not start")
+        except BaseException:
+            pipeline.set_state(Gst.State.NULL)
+            raise
         self._mic_pipeline = pipeline
-        self._mic_appsink = pipeline.get_by_name("sink")
-        pipeline.set_state(Gst.State.PLAYING)
+        self._mic_appsink = appsink
         self._active = True
+        self._capture_monitor = asyncio.create_task(self._watch_capture(pipeline))
         _log.debug("Microphone capture started")
+
+    async def _watch_capture(self, pipeline) -> None:
+        """Poll without blocking or attaching a watch to GTK's other thread."""
+        try:
+            bus = pipeline.get_bus()
+            while self._mic_pipeline is pipeline and self._active:
+                message = bus.timed_pop_filtered(0, Gst.MessageType.ERROR | Gst.MessageType.EOS)
+                if message is not None:
+                    callback = self._on_capture_error
+                    await self.stop_capture()
+                    if callback is not None:
+                        callback()
+                    return
+                await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Failure to observe capture is itself a failure, not an on state.
+            if self._mic_pipeline is pipeline:
+                callback = self._on_capture_error
+                await self.stop_capture()
+                if callback is not None:
+                    callback()
 
     async def stop_capture(self) -> None:
         """Stop mic capture and revert to silence."""
-        if not self._active:
-            return
         self._active = False
-        if self._mic_pipeline is not None:
-            self._mic_pipeline.set_state(Gst.State.NULL)
-            self._mic_pipeline = None
-            self._mic_appsink = None
+        pipeline = self._mic_pipeline
+        self._mic_pipeline = None
+        self._mic_appsink = None
+        monitor = self._capture_monitor
+        self._capture_monitor = None
+        if monitor is not None and monitor is not asyncio.current_task():
+            monitor.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await monitor
+        if pipeline is not None:
+            pipeline.set_state(Gst.State.NULL)
         _log.debug("Microphone capture stopped")
 
     def _pull_sample_blocking(self, appsink: Gst.Element) -> bytes | None:
@@ -484,7 +533,12 @@ class MicrophoneTrack(AudioStreamTrack):
             loop = asyncio.get_running_loop()
             try:
                 raw = await loop.run_in_executor(None, self._pull_sample_blocking, appsink)
-                if raw:
+                if (
+                    raw
+                    and self._active
+                    and self._mic_appsink is appsink
+                    and self.readyState == "live"
+                ):
                     # Pad or trim to exactly the expected frame size.
                     needed = MIC_SAMPLES * 2  # S16LE = 2 bytes per sample
                     raw = raw[:needed].ljust(needed, b"\x00")
@@ -492,6 +546,11 @@ class MicrophoneTrack(AudioStreamTrack):
                     return frame
             except Exception as exc:  # noqa: BLE001
                 _log.debug("Mic pull error: %s", exc)
+                if self._mic_appsink is appsink and self._active:
+                    callback = self._on_capture_error
+                    await self.stop_capture()
+                    if callback is not None:
+                        callback()
 
         # Silence fallback — zeroed plane.
         for p in frame.planes:

@@ -247,6 +247,11 @@ def _device_state(device: AlarmDeviceSnapshot) -> tuple[str, str]:
         label, severity = "Water detected", "error"
     elif _active(device.freeze):
         label, severity = "Freeze detected", "error"
+    elif device.phase is AlarmPhase.ALARMING or device.signal not in {
+        AlarmSignal.NONE,
+        AlarmSignal.UNKNOWN,
+    }:
+        label, severity = f"{_signal_label(device.signal)} active", "error"
     elif _active(device.contact):
         label, severity = "Open", "warning"
     elif _active(device.tilt):
@@ -880,7 +885,7 @@ class AlarmPage(Gtk.Box):
 
     def _build_device_row(self, device: AlarmDeviceSnapshot) -> Adw.ActionRow:
         title = device.name.strip() or _device_kind_label(device)
-        row = Adw.ActionRow(title=title, subtitle=_device_subtitle(device))
+        row = Adw.ActionRow(title=title, subtitle=_device_subtitle(device), use_markup=False)
         icon = Gtk.Image.new_from_icon_name(
             _KIND_ICONS.get(device.kind, "dialog-question-symbolic")
         )
@@ -1138,7 +1143,11 @@ class AlarmPage(Gtk.Box):
         device_list.add_css_class("boxed-list")
         for device in devices:
             name = device.name.strip() or _device_kind_label(device)
-            row = Adw.ActionRow(title=name, subtitle=device.room or _device_kind_label(device))
+            row = Adw.ActionRow(
+                title=name,
+                subtitle=device.room or _device_kind_label(device),
+                use_markup=False,
+            )
             device_list.append(row)
         scroller = Gtk.ScrolledWindow(
             hscrollbar_policy=Gtk.PolicyType.NEVER,

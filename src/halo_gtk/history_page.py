@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import threading
+import weakref
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,9 +19,9 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Adw, Gdk, GLib, Gst, Gtk, Pango  # noqa: E402
 
-from halo_gtk import activity_icons, device_names, favorites, media_paths  # noqa: E402
+from halo_gtk import activity_icons, device_names, favorites, media_paths, save_jobs  # noqa: E402
 from halo_gtk import config as _cfg  # noqa: E402
-from halo_gtk.http_download import download_https  # noqa: E402
+from halo_gtk.http_download import DownloadError, async_download_https  # noqa: E402
 from halo_gtk.ring_client import get_client  # noqa: E402
 from halo_gtk.ring_events import normalized_event_kind  # noqa: E402
 from halo_gtk.zoom_view import (  # noqa: E402
@@ -224,6 +226,7 @@ class _VideoPlayer(Gtk.Box):
         self._on_next = on_next
         self._on_finished = on_finished
         self._duration_ns: int = -1
+        self._playback_generation = 0
         self._poll_id: int | None = None
         self._seeking = False
         self._muted = False
@@ -439,6 +442,7 @@ class _VideoPlayer(Gtk.Box):
 
     def load_uri(self, uri: str) -> None:
         """Load and begin playing *uri*."""
+        self._playback_generation += 1
         self._stop_poll()
         self._duration_ns = -1
         self._scrubber.set_value(0)
@@ -456,6 +460,7 @@ class _VideoPlayer(Gtk.Box):
         self._start_poll()
 
     def stop(self) -> None:
+        self._playback_generation += 1
         self._stop_poll()
         if self._player is not None:
             self._player.set_state(Gst.State.NULL)
@@ -670,9 +675,11 @@ class _VideoPlayer(Gtk.Box):
     # ------------------------------------------------------------------
 
     def _on_eos(self, *_) -> None:
-        GLib.idle_add(self._handle_eos)
+        GLib.idle_add(self._handle_eos, self._playback_generation)
 
-    def _handle_eos(self) -> bool:
+    def _handle_eos(self, generation: int) -> bool:
+        if generation != self._playback_generation:
+            return GLib.SOURCE_REMOVE
         self._stop_poll()
         self._scrubber.set_value(1.0)
         self._update_time_label(self._duration_ns if self._duration_ns > 0 else 0)
@@ -1067,6 +1074,7 @@ class HistoryPage(Gtk.Box):
 
     def on_page_hidden(self) -> None:
         """Stop playback and reject delayed history work after page exit."""
+        self._save_ui_generation = getattr(self, "_save_ui_generation", 0) + 1
         self._history_request_generation += 1
         self._playback_request_generation += 1
         self._history_loading = False
@@ -1080,11 +1088,14 @@ class HistoryPage(Gtk.Box):
         select_event_id: int | None = None,
     ) -> None:
         """Load event history.  Optionally pre-select *filter_device_id*."""
+        self._save_ui_generation = getattr(self, "_save_ui_generation", 0) + 1
         client = get_client()
         if client is None or not client.is_authenticated:
             self._show_signed_out_state()
             return
 
+        self._reset_current_event()
+        favorites.request_reconcile(self._after_favorite_change, force=True)
         if filter_device_id is not None:
             self._selected_device_id = filter_device_id
         if select_event_id is not None:
@@ -1286,7 +1297,9 @@ class HistoryPage(Gtk.Box):
         if not visible_events:
             if self._selected_device_index == len(self._device_options) + 1:
                 self._list_placeholder.set_title("Alarm and Sensors")
-                self._list_placeholder.set_description("Ring Alarm support is not wired yet.")
+                self._list_placeholder.set_description(
+                    "Alarm and sensor event history is not available in Halo yet."
+                )
             elif self._active_filter_keys:
                 self._list_placeholder.set_title("No matching events")
                 self._list_placeholder.set_description("No events match the current filters.")
@@ -1305,9 +1318,19 @@ class HistoryPage(Gtk.Box):
             return
 
         pending_row = None
+        current_row = None
+        current_id = (
+            favorites.favorite_id_for_event(self._current_event)
+            if self._current_event is not None
+            else None
+        )
         for ev in visible_events:
             row = self._make_event_row(ev)
             self._event_list.append(row)
+            if ev is self._current_event or (
+                current_id is not None and favorites.favorite_id_for_event(ev) == current_id
+            ):
+                current_row = row
             if self._pending_event_id is not None and int(ev.get("id", -1)) == int(
                 self._pending_event_id
             ):
@@ -1320,6 +1343,10 @@ class HistoryPage(Gtk.Box):
             self._pending_event_id = None
             self._event_list.select_row(pending_row)
             self._on_event_selected(self._event_list, pending_row)
+        elif current_row is not None:
+            # Rebuilding rows must retain navigation for the clip already playing.
+            # Selecting the replacement row does not reactivate or reload it.
+            self._event_list.select_row(current_row)
 
     def _make_event_row(self, event: dict) -> Adw.ActionRow:
         device = event.get("_device")
@@ -1340,7 +1367,7 @@ class HistoryPage(Gtk.Box):
             )
             subtitle = activity_icons.activity_label(event)
 
-        row = Adw.ActionRow(title=title, subtitle=subtitle, activatable=True)
+        row = Adw.ActionRow(title=title, subtitle=subtitle, activatable=True, use_markup=False)
         row._event_data = event  # type: ignore[attr-defined]
 
         icon = Gtk.Image()
@@ -1406,6 +1433,7 @@ class HistoryPage(Gtk.Box):
         event = getattr(row, "_event_data", None)
         if event is None:
             return
+        self._player.stop()
         self._current_event = event
         self._update_favorite_button()
         self._update_event_details(event)
@@ -1433,6 +1461,7 @@ class HistoryPage(Gtk.Box):
 
     def _load_and_play(self, event: dict, generation: int) -> None:
         client = get_client()
+        ui_generation = getattr(self, "_save_ui_generation", 0)
         local_path = event.get("_local_video_path")
         if local_path:
             GLib.idle_add(self._load_file_if_current, Path(local_path), generation)
@@ -1441,13 +1470,69 @@ class HistoryPage(Gtk.Box):
         device = event.get("_device")
         event_id = event.get("id")
         if client is None or device is None or event_id is None:
+            self._queue_history_result(
+                client,
+                ui_generation,
+                "_show_save_toast",
+                "No recording is available",
+                playback_generation=generation,
+            )
             return
         try:
             url = client.recording_url(device, event_id)
             if url:
-                GLib.idle_add(self._load_url_if_current, url, generation)
+                self._queue_history_result(
+                    client,
+                    ui_generation,
+                    "_load_url_if_current",
+                    url,
+                    generation,
+                    playback_generation=generation,
+                )
+            else:
+                self._queue_history_result(
+                    client,
+                    ui_generation,
+                    "_show_save_toast",
+                    "No recording is available",
+                    playback_generation=generation,
+                )
         except Exception as exc:
             _log.debug("Failed to get recording URL for event %s: %s", event_id, exc)
+            self._queue_history_result(
+                client,
+                ui_generation,
+                "_show_save_toast",
+                "Could not load the recording. Try again.",
+                playback_generation=generation,
+            )
+
+    def _queue_history_result(
+        self, client, generation, method, *args, playback_generation=None
+    ) -> None:
+        """Deliver an operation result only to its still-visible page and session."""
+        reference = weakref.ref(self)
+
+        def deliver():
+            page = reference()
+            if (
+                page is None
+                or get_client() is not client
+                or page.get_root() is None
+                or getattr(page, "_save_ui_generation", 0) != generation
+                or (
+                    playback_generation is not None
+                    and page._playback_request_generation != playback_generation
+                )
+            ):
+                return GLib.SOURCE_REMOVE
+            root = page.get_root()
+            app = root.get_application() if hasattr(root, "get_application") else None
+            if app is None or not hasattr(app, "is_quitting") or not app.is_quitting():
+                getattr(page, method)(*args)
+            return GLib.SOURCE_REMOVE
+
+        GLib.idle_add(deliver)
 
     def _load_file_if_current(self, path: Path, generation: int) -> bool:
         if generation == self._playback_request_generation:
@@ -1470,50 +1555,170 @@ class HistoryPage(Gtk.Box):
         if ev.get("_metadata_missing"):
             _log.debug("Cannot remove local favorite with missing metadata from Favorite button")
             return
-        if ev.get("_is_local_favorite") or favorites.is_favorited(ev):
+        if ev.get("_is_local_favorite") or favorites.cached_is_favorited(ev):
             self._remove_local_favorite(ev)
             return
 
         thumbnail = self._player.get_current_frame_png()
-        threading.Thread(target=self._archive_favorite, args=(ev, thumbnail), daemon=True).start()
+        self._start_media_save(ev, "favorite", thumbnail=thumbnail)
 
-    def _archive_favorite(self, event: dict, thumbnail: bytes | None) -> None:
+    def _start_media_save(self, event: dict, kind: str, *, thumbnail=None) -> None:
         client = get_client()
         device = event.get("_device")
         event_id = event.get("id")
         if client is None or device is None or event_id is None:
+            self._show_save_toast("No recording is available to save")
             return
-        try:
-            url = client.recording_url(device, event_id)
+
+        async def operation(job):
+            job.checkpoint()
+            url = await asyncio.wrap_future(client.submit(device.async_recording_url(event_id)))
+            job.checkpoint()
             if not url:
+                raise DownloadError("No recording is available")
+            if kind == "favorite":
+                return await favorites.async_add_favorite(
+                    event, url, thumbnail_bytes=thumbnail, control=job
+                )
+            dest = media_paths.video_dir(device_names.display_name(device))
+            event_kind = re.sub(r"[^A-Za-z0-9._-]+", "-", str(event.get("kind") or "event"))
+            stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            name = f"{stamp}_{event_kind.strip('-.') or 'event'}.mp4"
+            path = await async_download_https(url, dest / name, replace_existing=False, control=job)
+            return {"path": path, "open_after": media_paths.should_open_after_save()}
+
+        def finished(page, result):
+            if kind == "favorite":
+                favorites.request_reconcile(page._after_favorite_change, force=True)
+            elif result["open_after"]:
+                page._open_folder(result["path"].parent)
+
+        self._submit_save_job(
+            client,
+            (kind, favorites.favorite_id_for_event(event)),
+            "Saving favorite" if kind == "favorite" else "Saving recording",
+            operation,
+            on_success=finished,
+            is_current=lambda: get_client() is client,
+        )
+
+    def _show_save_toast(self, message: str, **kwargs):
+        root = self.get_root()
+        if root is not None and hasattr(root, "show_toast"):
+            return root.show_toast(message, **kwargs)
+        return None
+
+    def _submit_save_job(self, owner, key, label, operation, *, on_success=None, is_current=None):
+        page_ref = weakref.ref(self)
+        root = self.get_root()
+        root_ref = weakref.ref(root) if root is not None else lambda: None
+        generation = getattr(self, "_save_ui_generation", 0)
+        toasts = getattr(self, "_save_job_toasts", None)
+        if toasts is None:
+            toasts = self._save_job_toasts = {}
+
+        def update(job):
+            window = root_ref()
+            if window is None or not hasattr(window, "show_toast"):
                 return
-            favorites.add_favorite(event, url, thumbnail_bytes=thumbnail)
-            GLib.idle_add(self._after_favorite_change)
-        except Exception as exc:
-            _log.debug("Favorite archive failed: %s", exc)
+            app = window.get_application() if hasattr(window, "get_application") else None
+            if app is not None and hasattr(app, "is_quitting") and app.is_quitting():
+                return
+            toast = toasts.get(id(job))
+            if job.state in {"queued", "running", "committing"}:
+                title = job.label
+                if job.state == "queued":
+                    title += " — queued"
+                elif job.state == "committing":
+                    title = "Finishing save…"
+                elif job.total:
+                    title += f" — {min(100, job.downloaded * 100 // job.total)}%"
+                elif job.downloaded:
+                    title += f" — {job.downloaded / (1024 * 1024):.1f} MB"
+                if toast is None:
+
+                    def cancel():
+                        cancelled = job.cancel()
+                        if active := toasts.get(id(job)):
+                            active.set_title("Cancelling save…" if cancelled else "Finishing save…")
+                            active.set_button_label(None)
+
+                    toast = window.show_toast(title, button_label="Cancel", callback=cancel)
+                    if toast is not None:
+                        toast.set_timeout(0)
+                        toasts[id(job)] = toast
+                elif toast is not None:
+                    toast.set_title(title)
+                if toast is not None and job.state == "committing":
+                    toast.set_button_label(None)
+                return
+            if toast is not None:
+                toast.dismiss()
+                toasts.pop(id(job), None)
+            if job.state == "succeeded":
+                page = page_ref()
+                if (
+                    on_success is not None
+                    and page is not None
+                    and page.get_root() is window
+                    and getattr(page, "_save_ui_generation", 0) == generation
+                ):
+                    on_success(page, job.result)
+                window.show_toast(
+                    "Saved" if job.key[0] != "remove-favorite" else "Favorite removed"
+                )
+            elif job.state == "cancelled":
+                window.show_toast("Save cancelled")
+            else:
+                message = (
+                    "Saving timed out. Try again."
+                    if isinstance(job.error, TimeoutError)
+                    else "Could not save. Try again."
+                )
+                window.show_toast(message)
+                _log.debug("Save failed (%s)", type(job.error).__name__)
+
+        try:
+            return save_jobs.get_manager().submit(
+                owner, key, label, operation, on_update=update, is_current=is_current
+            )
+        except save_jobs.SaveQueueFull:
+            self._show_save_toast("The save queue is full. Try again when another save finishes.")
+            return None
 
     def _remove_local_favorite(self, event: dict) -> None:
         was_local = bool(event.get("_is_local_favorite"))
-        if event.get("_metadata_missing"):
-            local_path = event.get("_local_video_path")
-            try:
+
+        async def operation(job):
+            if event.get("_metadata_missing"):
+                local_path = event.get("_local_video_path")
+                job.begin_commit()
                 if local_path:
                     Path(local_path).unlink(missing_ok=True)
-            except OSError as exc:
-                _log.debug("Failed to remove local favorite file: %s", exc)
-                return
-            self._current_event = None
-            self._player.stop()
-            self._clear_event_details()
-            self._after_favorite_change()
-            return
+            else:
+                await favorites.async_remove_favorite(event, control=job)
 
-        if favorites.remove_favorite(event):
-            if was_local:
-                self._current_event = None
-                self._player.stop()
-                self._clear_event_details()
-            self._after_favorite_change()
+        def finished(page, _result):
+            favorite_id = favorites.favorite_id_for_event(event)
+            if was_local and (
+                page._current_event is event
+                or (
+                    favorite_id is not None
+                    and page._current_event is not None
+                    and favorite_id == favorites.favorite_id_for_event(page._current_event)
+                )
+            ):
+                page._reset_current_event()
+            favorites.request_reconcile(page._after_favorite_change, force=True)
+
+        key = favorites.favorite_id_for_event(event) or event.get("_local_video_path")
+        self._submit_save_job(
+            get_client(),
+            ("remove-favorite", key),
+            "Removing favorite",
+            operation,
+            on_success=finished,
+        )
 
     def _after_favorite_change(self) -> bool:
         self._update_favorite_button()
@@ -1528,26 +1733,68 @@ class HistoryPage(Gtk.Box):
         if local_path := ev.get("_local_video_path"):
             self._do_copy_clipboard(Path(local_path).resolve().as_uri())
             return
-        threading.Thread(target=self._copy_url_to_clipboard, args=(ev,), daemon=True).start()
+        threading.Thread(
+            target=self._copy_url_to_clipboard,
+            args=(
+                ev,
+                getattr(self, "_save_ui_generation", 0),
+                self._playback_request_generation,
+                get_client(),
+            ),
+            daemon=True,
+        ).start()
 
-    def _copy_url_to_clipboard(self, event: dict) -> None:
-        client = get_client()
+    def _copy_url_to_clipboard(
+        self, event: dict, generation=None, playback=None, client=None
+    ) -> None:
+        client = get_client() if generation is None else client
+        generation = getattr(self, "_save_ui_generation", 0) if generation is None else generation
+        playback = self._playback_request_generation if playback is None else playback
         device = event.get("_device")
         event_id = event.get("id")
         if client is None or device is None or event_id is None:
+            self._queue_history_result(
+                client,
+                generation,
+                "_show_save_toast",
+                "No recording URL is available",
+                playback_generation=playback,
+            )
             return
         try:
             url = client.recording_url(device, event_id)
             if url:
-                GLib.idle_add(self._do_copy_clipboard, url)
+                self._queue_history_result(
+                    client,
+                    generation,
+                    "_do_copy_clipboard",
+                    url,
+                    playback_generation=playback,
+                )
+            else:
+                self._queue_history_result(
+                    client,
+                    generation,
+                    "_show_save_toast",
+                    "No recording URL is available",
+                    playback_generation=playback,
+                )
         except Exception as exc:
             _log.debug("Failed to fetch URL for share: %s", exc)
+            self._queue_history_result(
+                client,
+                generation,
+                "_show_save_toast",
+                "Could not get the recording URL. Try again.",
+                playback_generation=playback,
+            )
 
     def _do_copy_clipboard(self, text: str) -> bool:
         display = self.get_display()
         if display is not None:
             clipboard = display.get_clipboard()
             clipboard.set(text)
+            self._show_save_toast("Recording URL copied")
         return GLib.SOURCE_REMOVE
 
     def _on_download(self, *_) -> None:
@@ -1557,47 +1804,35 @@ class HistoryPage(Gtk.Box):
         if local_path := ev.get("_local_video_path"):
             self._open_folder(Path(local_path).parent)
             return
-        threading.Thread(target=self._download_recording, args=(ev,), daemon=True).start()
-
-    def _download_recording(self, event: dict) -> None:
-        client = get_client()
-        device = event.get("_device")
-        event_id = event.get("id")
-        if client is None or device is None or event_id is None:
-            return
-        try:
-            url = client.recording_url(device, event_id)
-            if not url:
-                return
-            dest = media_paths.video_dir(device_names.display_name(device))
-            dest.mkdir(parents=True, exist_ok=True)
-            kind = re.sub(r"[^A-Za-z0-9._-]+", "-", str(event.get("kind") or "event")).strip("-.")
-            fname = dest / (f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{kind or 'event'}.mp4")
-            _log.debug("Downloading recording to %s", fname)
-            fname = download_https(url, fname, replace_existing=False)
-            _log.debug("Download complete: %s", fname)
-            if media_paths.should_open_after_save():
-                GLib.idle_add(self._open_folder, dest)
-        except Exception as exc:
-            _log.debug("Download failed: %s", exc)
+        self._start_media_save(ev, "download")
 
     def _on_screenshot(self, *_) -> None:
         png = self._player.get_current_frame_png()
         if png is None:
-            _log.debug("No frame available for screenshot")
+            self._show_save_toast("No video frame is available to save")
             return
         device = self._current_event.get("_device") if self._current_event is not None else None
         camera_name = device_names.display_name(device) if device is not None else None
-        dest = media_paths.snapshot_dir(camera_name)
-        fname = media_paths.write_unique_bytes(
-            dest,
-            datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
-            ".png",
-            png,
+
+        async def operation(job):
+            dest = media_paths.snapshot_dir(camera_name)
+            job.begin_commit()
+            path = media_paths.write_unique_bytes(
+                dest, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"), ".png", png
+            )
+            return {"path": path, "open_after": media_paths.should_open_after_save()}
+
+        def finished(page, result):
+            if result["open_after"]:
+                page._open_folder(result["path"].parent)
+
+        self._submit_save_job(
+            get_client(),
+            ("screenshot", id(self._current_event)),
+            "Saving screenshot",
+            operation,
+            on_success=finished,
         )
-        _log.debug("Screenshot saved to %s", fname)
-        if media_paths.should_open_after_save():
-            self._open_folder(dest)
 
     def _open_folder(self, path: Path) -> bool:
         try:
@@ -1646,27 +1881,49 @@ class HistoryPage(Gtk.Box):
     def _on_delete_confirmed(self, dialog, response: str, event: dict) -> None:
         if response != "delete":
             return
-        threading.Thread(target=self._do_delete, args=(event,), daemon=True).start()
+        threading.Thread(
+            target=self._do_delete,
+            args=(event, getattr(self, "_save_ui_generation", 0), get_client()),
+            daemon=True,
+        ).start()
 
-    def _do_delete(self, event: dict) -> None:
-        client = get_client()
+    def _do_delete(self, event: dict, generation=None, client=None) -> None:
+        client = get_client() if generation is None else client
+        generation = getattr(self, "_save_ui_generation", 0) if generation is None else generation
         device = event.get("_device")
         event_id = event.get("id")
-        if client is None or device is None or event_id is None:
+        if client is None or get_client() is not client or device is None or event_id is None:
+            self._queue_history_result(
+                client, generation, "_show_save_toast", "No recording is available to delete"
+            )
             return
         try:
             client.delete_recording(device, event_id)
             _log.debug("Deleted event %s", event_id)
-            GLib.idle_add(self._after_delete, event)
+            self._queue_history_result(client, generation, "_after_delete", event)
+            self._queue_history_result(client, generation, "_show_save_toast", "Recording deleted")
         except Exception as exc:
             _log.debug("Delete failed: %s", exc)
+            message = (
+                "Deletion timed out. It may have completed; refresh before trying again."
+                if isinstance(exc, TimeoutError)
+                else "Could not delete the recording. Refresh before trying again."
+            )
+            self._queue_history_result(client, generation, "_show_save_toast", message)
 
     def _after_delete(self, event: dict) -> bool:
-        self._events = [e for e in self._events if e.get("id") != event.get("id")]
-        self._current_event = None
-        self._player.stop()
-        self._clear_event_details()
-        self._update_favorite_button()
+        deleted_id = favorites.favorite_id_for_event(event)
+
+        def matches(candidate: dict | None) -> bool:
+            return candidate is event or (
+                candidate is not None
+                and deleted_id is not None
+                and favorites.favorite_id_for_event(candidate) == deleted_id
+            )
+
+        self._events = [candidate for candidate in self._events if not matches(candidate)]
+        if matches(self._current_event):
+            self._reset_current_event()
         self._fill_event_rows()
         return GLib.SOURCE_REMOVE
 
@@ -1873,7 +2130,7 @@ class HistoryPage(Gtk.Box):
             if filter_device is None or _event_matches_device(e, filter_device)
         ]
         if "favorite" in self._active_filter_keys:
-            favorite_events = favorites.favorite_events()
+            favorite_events = favorites.cached_favorite_events()
             if filter_device is not None:
                 favorite_events = [
                     event
@@ -1891,7 +2148,7 @@ class HistoryPage(Gtk.Box):
     def _event_matches_filter(self, event: dict, key: str) -> bool:
         activity_key = activity_icons.activity_key(event)
         if key == "favorite":
-            return bool(event.get("_is_local_favorite")) or favorites.is_favorited(event)
+            return bool(event.get("_is_local_favorite")) or favorites.cached_is_favorited(event)
         if key == "motion":
             return normalized_event_kind(event) == "motion" and activity_key == "motion"
         return activity_key == key
@@ -1932,7 +2189,7 @@ class HistoryPage(Gtk.Box):
             return
 
         self._favorite_btn.set_sensitive(True)
-        if event.get("_is_local_favorite") or favorites.is_favorited(event):
+        if event.get("_is_local_favorite") or favorites.cached_is_favorited(event):
             self._favorite_btn.set_icon_name("starred-symbolic")
             self._favorite_btn.set_tooltip_text("Remove from Favorites")
         else:

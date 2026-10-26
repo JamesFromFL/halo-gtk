@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from halo_gtk import network_status
 
 
@@ -55,3 +57,38 @@ def test_camera_network_status_uses_ethernet_icon_for_wired_connection():
 
     assert status.icon_name == "network-wired-symbolic"
     assert status.tooltip == "Ethernet: 100%"
+
+
+@pytest.mark.parametrize("connection", ["wlan", "wireless LAN", "Wi-Fi"])
+def test_wireless_lan_is_not_classified_as_ethernet(connection):
+    status = network_status.camera_network_status(
+        _Device({"connection_type": connection, "signal_percentage": 100})
+    )
+
+    assert status.icon_name == "network-wireless-signal-excellent-symbolic"
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), "-inf", "nan", 10**1000])
+def test_invalid_signal_values_fall_back_to_valid_health_data(value):
+    status = network_status.camera_network_status(
+        _Device({"signal_percentage": value, "rssi": -67})
+    )
+
+    assert status.tooltip == "Moderate: 66%"
+
+
+def test_missing_signal_does_not_claim_an_online_camera_is_disconnected():
+    status = network_status.camera_network_status(_Device())
+
+    assert status.tooltip == "Connection: Unknown"
+    assert status.icon_name == "network-wireless-symbolic"
+
+
+def test_offline_status_overrides_cached_signal_strength():
+    device = _Device({"connection_type": "ethernet", "signal_percentage": 100})
+    device.connection_status = "offline"
+
+    status = network_status.camera_network_status(device)
+
+    assert status.tooltip == "Disconnected: 0%"
+    assert status.icon_name == "network-offline-symbolic"

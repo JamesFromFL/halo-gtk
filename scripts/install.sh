@@ -4,7 +4,8 @@ set -euo pipefail
 APP_ID="io.github.JamesFromFL.HaloGtk"
 APP_NAME="halo-gtk"
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-DATA_HOME="${XDG_DATA_HOME:-"$HOME/.local/share"}"
+DATA_HOME="${XDG_DATA_HOME:-}"
+[[ "$DATA_HOME" = /* ]] || DATA_HOME="$HOME/.local/share"
 BIN_DIR="$HOME/.local/bin"
 DESKTOP_DIR="$DATA_HOME/applications"
 ICON_THEME_DIR="$DATA_HOME/icons/hicolor"
@@ -81,41 +82,17 @@ refresh_caches() {
 }
 
 stop_running_app() {
-  local pattern="$REPO_ROOT/.venv/bin/$APP_NAME"
-
-  if ! command -v pgrep >/dev/null 2>&1 || ! command -v pkill >/dev/null 2>&1; then
-    return
-  fi
-
-  if ! pgrep -f -- "$pattern" >/dev/null 2>&1; then
-    return
-  fi
-
-  log "Stopping running Halo instance"
-  pkill -f -- "$pattern" || true
-
-  for _ in 1 2 3 4 5; do
-    if ! pgrep -f -- "$pattern" >/dev/null 2>&1; then
-      return
-    fi
-    sleep 0.2
-  done
+  python3 "$REPO_ROOT/scripts/desktop_integration.py" stop "$REPO_ROOT/.venv/bin/$APP_NAME"
 }
 
 install_launcher() {
-  mkdir -p "$BIN_DIR"
-  cat >"$BIN_DIR/$APP_NAME" <<EOF
-#!/usr/bin/env bash
-exec "$REPO_ROOT/.venv/bin/$APP_NAME" "\$@"
-EOF
-  chmod 0755 "$BIN_DIR/$APP_NAME"
+  python3 "$REPO_ROOT/scripts/desktop_integration.py" launcher \
+    "$BIN_DIR/$APP_NAME" "$REPO_ROOT/.venv/bin/$APP_NAME"
 }
 
 install_desktop_file() {
-  mkdir -p "$DESKTOP_DIR"
-  sed "s|^Exec=.*|Exec=\"$BIN_DIR/$APP_NAME\"|" \
-    "$REPO_ROOT/data/$APP_ID.desktop" >"$DESKTOP_DIR/$APP_ID.desktop"
-  chmod 0644 "$DESKTOP_DIR/$APP_ID.desktop"
+  python3 "$REPO_ROOT/scripts/desktop_integration.py" desktop \
+    "$DESKTOP_DIR/$APP_ID.desktop" "$BIN_DIR/$APP_NAME" "$REPO_ROOT/data/$APP_ID.desktop"
 }
 
 install_icons() {
@@ -182,12 +159,13 @@ main() {
   fi
 
   require_command uv
+  require_command python3
 
-  ensure_venv
   log "Checking locked dependency graph"
   uv --project "$REPO_ROOT" lock --check
 
   stop_running_app
+  ensure_venv
 
   log "Installing Python dependencies"
   uv --project "$REPO_ROOT" sync --frozen --no-dev

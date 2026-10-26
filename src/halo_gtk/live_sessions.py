@@ -50,7 +50,7 @@ class LiveStreamViewProtocol(Protocol):
 
     def set_volume(self, value: float) -> None: ...
 
-    def start_talking(self) -> None: ...
+    def start_talking(self, *, on_state_changed=None) -> None: ...
 
     def stop_talking(self) -> None: ...
 
@@ -123,8 +123,11 @@ class LiveStreamSession:
         self.volume = max(0.0, min(1.0, value))
         self.view.set_volume(self.volume)
 
-    def start_talking(self) -> None:
-        self.view.start_talking()
+    def start_talking(self, *, on_state_changed=None) -> None:
+        if on_state_changed is None:
+            self.view.start_talking()
+        else:
+            self.view.start_talking(on_state_changed=on_state_changed)
 
     def stop_talking(self) -> None:
         self.view.stop_talking()
@@ -183,8 +186,11 @@ class LiveSessionManager:
         except Exception:
             session.owners.discard(owner)
             if created or not session.owners:
-                session.stop()
                 self._sessions.pop(device_id, None)
+                try:
+                    session.stop()
+                except Exception:
+                    _log.exception("Failed to clean up live session %s after startup", device_id)
             raise
         return session
 
@@ -209,13 +215,17 @@ class LiveSessionManager:
             return
         session.owners.discard(owner)
         if not session.owners:
-            session.stop()
             self._sessions.pop(int(device_id), None)
+            session.stop()
 
     def stop_all(self) -> None:
-        for session in list(self._sessions.values()):
-            session.stop()
+        sessions = list(self._sessions.values())
         self._sessions.clear()
+        for session in sessions:
+            try:
+                session.stop()
+            except Exception:
+                _log.exception("Failed to stop live session %s", session.device_id)
 
     def enforce_limit(self, max_streams: int | None = None) -> bool:
         """Return True if within cap; stop everything if a bug exceeded it."""

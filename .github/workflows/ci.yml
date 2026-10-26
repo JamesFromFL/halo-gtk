@@ -43,11 +43,14 @@ jobs:
             --no-emit-project \
             --output-file /tmp/halo-requirements.txt
       - name: Audit locked production dependencies
+        # OAuthlib's PKCE authorization-server advisory does not affect Halo's
+        # password-grant client. Ring currently requires oauthlib<4; see SECURITY.md.
         run: |
           uv run --frozen --only-group audit pip-audit \
             --require-hashes \
             --disable-pip \
             --progress-spinner off \
+            --ignore-vuln CVE-2026-49265 \
             --requirement /tmp/halo-requirements.txt
 
   test:

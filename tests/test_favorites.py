@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import multiprocessing
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from halo_gtk import favorites
 
@@ -253,3 +256,71 @@ def test_remove_favorite_does_not_delete_paths_outside_managed_roots(monkeypatch
     assert outside_video.read_bytes() == b"keep"
     assert outside_thumbnail.read_bytes() == b"keep"
     assert favorites.index_entries() == []
+
+
+@pytest.mark.parametrize("value", [None, {}, "invalid", 1])
+def test_malformed_favorites_list_does_not_break_history(monkeypatch, tmp_path, value):
+    root = _redirect_favorites(monkeypatch, tmp_path)
+    root.mkdir(parents=True)
+    favorites.FAVORITES_INDEX.write_text(json.dumps({"favorites": value}))
+
+    assert favorites.index_entries() == []
+    assert favorites.is_favorited(_event()) is False
+
+
+def test_favorite_download_does_not_block_index_reads(monkeypatch, tmp_path):
+    _redirect_favorites(monkeypatch, tmp_path)
+    readers = []
+
+    def fake_download(_url, destination):
+        reader = threading.Thread(target=favorites.index_entries, daemon=True)
+        readers.append(reader)
+        reader.start()
+        reader.join(timeout=1)
+        assert not reader.is_alive(), "Network download must not hold the index lock"
+        Path(destination).write_bytes(b"video")
+
+    monkeypatch.setattr(favorites, "download_https", fake_download)
+    try:
+        entry = favorites.add_favorite(_event(), "https://example.test/video.mp4")
+    finally:
+        for reader in readers:
+            reader.join(timeout=1)
+
+    assert Path(entry["video_path"]).read_bytes() == b"video"
+    assert not list(favorites.FAVORITE_VIDEOS_DIR.glob("*.part"))
+
+
+def test_same_name_cameras_never_overwrite_each_others_favorites(monkeypatch, tmp_path):
+    _redirect_favorites(monkeypatch, tmp_path)
+    event = _event()
+    second_device = type("OtherDevice", (), {"id": 102, "name": _Device.name})()
+    monkeypatch.setattr(
+        favorites,
+        "download_https",
+        lambda url, destination: Path(destination).write_bytes(url.encode()),
+    )
+
+    first = favorites.add_favorite(event, "https://example.test/first")
+    second = favorites.add_favorite(
+        {**event, "_device": second_device}, "https://example.test/second"
+    )
+
+    assert first["video_path"] != second["video_path"]
+    assert Path(first["video_path"]).read_bytes() == b"https://example.test/first"
+    assert Path(second["video_path"]).read_bytes() == b"https://example.test/second"
+
+
+def test_failed_favorite_download_cleans_staging_file(monkeypatch, tmp_path):
+    _redirect_favorites(monkeypatch, tmp_path)
+
+    def fail_download(_url, destination):
+        Path(destination).write_bytes(b"partial")
+        raise OSError("network failed")
+
+    monkeypatch.setattr(favorites, "download_https", fail_download)
+
+    with pytest.raises(OSError, match="network failed"):
+        favorites.add_favorite(_event(), "https://example.test/video.mp4")
+
+    assert list(favorites.FAVORITE_VIDEOS_DIR.iterdir()) == []

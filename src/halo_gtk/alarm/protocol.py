@@ -8,6 +8,7 @@ It is deliberately isolated here because Ring does not publish this protocol.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -160,6 +161,8 @@ def _validate_json_bounds(value: Any, max_depth: int) -> None:
             raise AlarmSchemaError("CLAP frame contains too many JSON values")
         if depth > max_depth:
             raise AlarmSchemaError("CLAP frame exceeds the JSON nesting limit")
+        if isinstance(item, float) and not math.isfinite(item):
+            raise AlarmSchemaError("CLAP frame contains a non-finite JSON number")
         if isinstance(item, Mapping):
             stack.extend((child, depth + 1) for child in item.values())
         elif isinstance(item, list | tuple):
@@ -308,7 +311,7 @@ def parse_clap_frame(
         )
     except AlarmProtocolError:
         raise
-    except (json.JSONDecodeError, RecursionError) as exc:
+    except (ValueError, RecursionError) as exc:
         raise AlarmSchemaError("CLAP frame is not valid JSON") from exc
 
     _validate_json_bounds(payload, max_depth)

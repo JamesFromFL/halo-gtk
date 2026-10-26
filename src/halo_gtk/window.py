@@ -93,7 +93,8 @@ class RingWindow(Adw.ApplicationWindow):
         )
         self._split_view.connect("notify::collapsed", self._on_collapsed_changed)
         self._split_view.connect("notify::show-sidebar", self._on_sidebar_visibility_changed)
-        self.set_content(self._split_view)
+        self._toast_overlay = Adw.ToastOverlay(child=self._split_view)
+        self.set_content(self._toast_overlay)
 
         content_toolbar = Adw.ToolbarView()
 
@@ -257,6 +258,15 @@ class RingWindow(Adw.ApplicationWindow):
         compact.add_setter(self._sidebar_toggle_btn, "visible", True)
         compact.add_setter(self._history_page.split_view, "collapsed", True)
         self.add_breakpoint(compact)
+
+    def show_toast(self, message: str, *, button_label=None, callback=None):
+        """Show a bounded operation result without interrupting the current view."""
+        toast = Adw.Toast(title=message, timeout=6, use_markup=False)
+        if button_label and callback is not None:
+            toast.set_button_label(button_label)
+            toast.connect("button-clicked", lambda *_args: callback())
+        self._toast_overlay.add_toast(toast)
+        return toast
 
     def _make_nav_row(self, label: str, icon: str) -> Gtk.ListBoxRow:
         row = Gtk.ListBoxRow(activatable=True)

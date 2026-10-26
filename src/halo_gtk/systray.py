@@ -139,48 +139,186 @@ class SystemTray:
         self._registration_id: int | None = None
         self._menu_registration_id: int | None = None
         self._bus_name_id: int | None = None
+        self._name_owned = False
+        self._ownership_generation = 0
         self._watcher_signal_id: int | None = None
         self._retry_source_id: int | None = None
         self._item_bus_name = f"org.kde.StatusNotifierItem-{os.getpid()}-Halo"
         self._enabled = False
         self._registered_with_watcher = False
         self._setup_pending = False
+        self._generation = 0
+        self._cancellable: Gio.Cancellable | None = None
+        self._attempt_timeout_id: int | None = None
 
     def setup(self) -> bool:
         """Enable the tray and register asynchronously, off the startup path."""
         self._enabled = True
-        # Defer the synchronous D-Bus connection + registration to an idle
-        # callback so a slow or contended session bus can't block app startup.
+        if (
+            self._registered_with_watcher
+            and self._connection is not None
+            and not self._connection.is_closed()
+        ):
+            return True
         if not self._setup_pending:
             self._setup_pending = True
-            GLib.idle_add(self._setup_now)
+            GLib.idle_add(self._setup_now, self._generation)
         return True
 
-    def _setup_now(self) -> bool:
-        self._setup_pending = False
-        if not self._enabled:
+    def _setup_now(self, expected_generation: int | None = None) -> bool:
+        if not self._enabled or (
+            expected_generation is not None and expected_generation != self._generation
+        ):
             return GLib.SOURCE_REMOVE
-
-        if not self._ensure_connection():
-            self._schedule_retry()
-            return GLib.SOURCE_REMOVE
-
-        if not self._export_objects() or not self._own_bus_name():
-            self.shutdown()
-            return GLib.SOURCE_REMOVE
-
-        self._watch_watcher_owner()
-        if self._register_with_watcher():
-            self._cancel_retry()
-            return GLib.SOURCE_REMOVE
-
-        self._schedule_retry()
+        self._generation += 1
+        generation = self._generation
+        self._cancellable = Gio.Cancellable()
+        self._attempt_timeout_id = GLib.timeout_add_seconds(5, self._on_attempt_timeout, generation)
+        if self._connection is not None and not self._connection.is_closed():
+            self._continue_setup(generation)
+        else:
+            self._release_connection()
+            try:
+                Gio.bus_get(
+                    Gio.BusType.SESSION,
+                    self._cancellable,
+                    lambda source, result, *_: self._on_bus_acquired(source, result, generation),
+                )
+            except Exception as exc:
+                self._registration_failed(generation, exc)
         return GLib.SOURCE_REMOVE
+
+    def _current_attempt(self, generation: int) -> bool:
+        return self._enabled and generation == self._generation
+
+    def _on_bus_acquired(self, _source, result, generation: int) -> None:
+        try:
+            connection = Gio.bus_get_finish(result)
+        except Exception as exc:
+            self._registration_failed(generation, exc)
+            return
+        if not self._current_attempt(generation):
+            return
+        self._connection = connection
+        self._continue_setup(generation)
+
+    def _continue_setup(self, generation: int) -> None:
+        if not self._export_objects() or not self._own_bus_name():
+            self._release_connection()
+            self._registration_failed(generation, "Could not export the tray item")
+            return
+        if self._name_owned:
+            self._check_watcher(generation)
+
+    def _check_watcher(self, generation: int) -> None:
+        if not self._current_attempt(generation):
+            return
+        try:
+            self._watch_watcher_owner()
+            self._connection.call(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "NameHasOwner",
+                GLib.Variant("(s)", (_WATCHER_BUS,)),
+                GLib.VariantType.new("(b)"),
+                Gio.DBusCallFlags.NONE,
+                1000,
+                self._cancellable,
+                lambda connection, result, *_: self._on_watcher_checked(
+                    connection, result, generation
+                ),
+            )
+        except Exception as exc:
+            self._registration_failed(generation, exc)
+
+    def _on_watcher_checked(self, connection, result, generation: int) -> None:
+        try:
+            available = bool(connection.call_finish(result).unpack()[0])
+        except Exception as exc:
+            self._registration_failed(generation, exc)
+            return
+        if not self._current_attempt(generation):
+            return
+        if not available:
+            self._registration_failed(generation)
+            return
+        try:
+            connection.call(
+                _WATCHER_BUS,
+                _WATCHER_PATH,
+                _WATCHER_IFACE,
+                "RegisterStatusNotifierItem",
+                GLib.Variant("(s)", (self._item_bus_name,)),
+                None,
+                Gio.DBusCallFlags.NONE,
+                1000,
+                self._cancellable,
+                lambda connection, result, *_: self._on_watcher_registered(
+                    connection, result, generation
+                ),
+            )
+        except Exception as exc:
+            self._registration_failed(generation, exc)
+
+    def _on_watcher_registered(self, connection, result, generation: int) -> None:
+        try:
+            connection.call_finish(result)
+        except Exception as exc:
+            self._registration_failed(generation, exc)
+            return
+        if not self._current_attempt(generation):
+            return
+        self._setup_pending = False
+        self._cancellable = None
+        self._cancel_attempt_timeout()
+        self._registered_with_watcher = True
+        self._cancel_retry()
+        _log.info("StatusNotifier tray icon registered")
+
+    def _registration_failed(self, generation: int, error=None) -> None:
+        if not self._current_attempt(generation):
+            return
+        self._setup_pending = False
+        self._cancellable = None
+        self._cancel_attempt_timeout()
+        self._registered_with_watcher = False
+        if error is not None:
+            _log.debug("Tray registration will retry: %s", error)
+        self._schedule_retry()
 
     def shutdown(self) -> None:
         """Unregister the D-Bus object if it was exported."""
         self._enabled = False
+        self._invalidate_attempt()
         self._cancel_retry()
+        self._release_connection()
+
+    def _invalidate_attempt(self) -> None:
+        self._generation += 1
+        if self._cancellable is not None:
+            self._cancellable.cancel()
+            self._cancellable = None
+        self._setup_pending = False
+        self._cancel_attempt_timeout()
+
+    def _cancel_attempt_timeout(self) -> None:
+        if self._attempt_timeout_id is not None:
+            GLib.source_remove(self._attempt_timeout_id)
+            self._attempt_timeout_id = None
+
+    def _on_attempt_timeout(self, generation: int) -> bool:
+        if self._current_attempt(generation):
+            self._attempt_timeout_id = None
+            self._invalidate_attempt()
+            self._registered_with_watcher = False
+            self._schedule_retry()
+        return GLib.SOURCE_REMOVE
+
+    def _release_connection(self) -> None:
+        # Gio can deliver a queued name-lost callback with a NULL connection.
+        # Bind callbacks to ownership lifetime, independent of watcher retries.
+        self._ownership_generation += 1
         if (
             self._connection is not None
             and self._watcher_signal_id is not None
@@ -196,20 +334,10 @@ class SystemTray:
         self._registration_id = None
         self._menu_registration_id = None
         self._bus_name_id = None
+        self._name_owned = False
         self._watcher_signal_id = None
         self._registered_with_watcher = False
         self._connection = None
-
-    def _ensure_connection(self) -> bool:
-        if self._connection is not None and not self._connection.is_closed():
-            return True
-        try:
-            self._connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
-            return True
-        except Exception as exc:
-            _log.warning("Failed to connect to the session bus for tray icon: %s", exc)
-            self._connection = None
-            return False
 
     def _export_objects(self) -> bool:
         if self._connection is None:
@@ -242,18 +370,45 @@ class SystemTray:
         if self._bus_name_id is not None:
             return True
         try:
+            self._ownership_generation += 1
+            generation = self._ownership_generation
             self._bus_name_id = Gio.bus_own_name_on_connection(
                 self._connection,
                 self._item_bus_name,
                 Gio.BusNameOwnerFlags.NONE,
-                None,
-                None,
+                lambda connection, name, *_: self._on_name_acquired(connection, name, generation),
+                lambda connection, name, *_: self._on_name_lost(connection, name, generation),
             )
             return True
         except Exception as exc:
             _log.warning("Failed to own tray icon bus name: %s", exc)
             self._bus_name_id = None
             return False
+
+    def _on_name_acquired(self, connection, _name, generation: int) -> None:
+        if (
+            not self._enabled
+            or connection is not self._connection
+            or generation != self._ownership_generation
+        ):
+            return
+        self._name_owned = True
+        if self._setup_pending:
+            self._check_watcher(self._generation)
+
+    def _on_name_lost(self, connection, _name, generation: int) -> None:
+        if (
+            not self._enabled
+            or generation != self._ownership_generation
+            or (connection is not None and connection is not self._connection)
+        ):
+            return
+        self._name_owned = False
+        self._registered_with_watcher = False
+        self._invalidate_attempt()
+        if connection is None or connection.is_closed():
+            self._release_connection()
+        self._schedule_retry()
 
     def _watch_watcher_owner(self) -> None:
         if self._connection is None or self._watcher_signal_id is not None:
@@ -277,45 +432,20 @@ class SystemTray:
         _signal_name,
         parameters,
     ) -> None:
+        if _connection is not None and _connection is not self._connection:
+            return
         _name, _old_owner, new_owner = parameters.unpack()
         self._registered_with_watcher = False
         if not self._enabled:
             return
+        self._invalidate_attempt()
         if new_owner:
             # Watcher reappeared — retry now, but cancel any pending timeout retry
             # first so its orphaned source can't fire a duplicate setup() later.
             self._cancel_retry()
-            GLib.idle_add(self._retry_setup)
+            self.setup()
         else:
             self._schedule_retry()
-
-    def _register_with_watcher(self) -> bool:
-        if self._registered_with_watcher:
-            return True
-        if self._connection is None:
-            return False
-        if not self._watcher_available():
-            _log.info("No StatusNotifierWatcher found; tray icon registration will retry")
-            return False
-        try:
-            self._connection.call_sync(
-                _WATCHER_BUS,
-                _WATCHER_PATH,
-                _WATCHER_IFACE,
-                "RegisterStatusNotifierItem",
-                GLib.Variant("(s)", (self._item_bus_name,)),
-                None,
-                Gio.DBusCallFlags.NONE,
-                1000,
-                None,
-            )
-            self._registered_with_watcher = True
-            _log.info("StatusNotifier tray icon registered")
-            return True
-        except Exception as exc:
-            self._registered_with_watcher = False
-            _log.warning("Failed to register tray icon: %s", exc)
-            return False
 
     def _schedule_retry(self) -> None:
         if not self._enabled or self._retry_source_id is not None:
@@ -334,25 +464,6 @@ class SystemTray:
             return GLib.SOURCE_REMOVE
         self.setup()
         return GLib.SOURCE_REMOVE
-
-    def _watcher_available(self) -> bool:
-        if self._connection is None:
-            return False
-        try:
-            reply = self._connection.call_sync(
-                "org.freedesktop.DBus",
-                "/org/freedesktop/DBus",
-                "org.freedesktop.DBus",
-                "NameHasOwner",
-                GLib.Variant("(s)", (_WATCHER_BUS,)),
-                GLib.VariantType.new("(b)"),
-                Gio.DBusCallFlags.NONE,
-                1000,
-                None,
-            )
-            return bool(reply.unpack()[0])
-        except Exception:
-            return False
 
     def _on_method_call(
         self,

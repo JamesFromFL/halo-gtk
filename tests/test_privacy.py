@@ -53,3 +53,42 @@ def test_clear_debug_logs_truncates_active_and_rotated_logs(monkeypatch, tmp_pat
     assert active_log.read_text() == ""
     assert rotated_log.read_text() == ""
     assert other_log.read_text() == "other"
+
+
+def test_clear_debug_logs_does_not_follow_symlinks(monkeypatch, tmp_path):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    outside = tmp_path / "unrelated.log"
+    outside.write_text("preserve")
+    (state_dir / "halo-gtk.log.1").symlink_to(outside)
+    monkeypatch.setattr(privacy, "STATE_DIR", state_dir)
+
+    assert privacy.clear_debug_logs() == 0
+    assert outside.read_text() == "preserve"
+
+
+def test_clear_preview_cache_removes_dangling_symlink(monkeypatch, tmp_path):
+    (tmp_path / "previews").symlink_to(tmp_path / "missing")
+    monkeypatch.setattr(privacy, "CACHE_DIR", tmp_path)
+
+    assert privacy.clear_preview_cache() == 1
+    assert not (tmp_path / "previews").is_symlink()
+
+
+def test_clear_debug_logs_does_not_truncate_active_symlink_target(monkeypatch, tmp_path):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    outside = tmp_path / "unrelated.log"
+    outside.write_text("preserve")
+    log_path = state_dir / "halo-gtk.log"
+    log_path.symlink_to(outside)
+    handler = FileHandler(log_path)
+    logging.getLogger().addHandler(handler)
+    monkeypatch.setattr(privacy, "STATE_DIR", state_dir)
+    try:
+        assert privacy.clear_debug_logs() == 0
+    finally:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+
+    assert outside.read_text() == "preserve"

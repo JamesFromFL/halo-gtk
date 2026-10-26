@@ -25,16 +25,17 @@ dependencies = [
     # Halo patches the 0.9.14 WebRTC close contract; validate before widening.
     "ring-doorbell==0.9.14",
     # HTTP client APIs used directly and by ring-doorbell
-    "aiohttp>=3.14.2",
+    "aiohttp>=3.14.4",
     "requests>=2.32",
-    # Halo patches aiortc 1.14.0 internals; validate any upgrade before widening.
-    "aiortc==1.14.0",
+    # Halo patches aiortc 1.15.0 internals; validate any upgrade before widening.
+    "aiortc==1.15.0",
     # Live stream frame conversion/padding via PyAV VideoFrame.to_ndarray().
     "numpy>=1.26",
-    "Pillow>=12.3.0",
+    "Pillow>=13.0.0",
     # PyAV — first-frame decode from Ring recording URLs for motion-off tiles.
-    # Already pulled in transitively by aiortc; declared here to pin the requirement.
-    "av>=10.0",
+    # Validated with aiortc 1.15.0 and the threads=1 RGB conversion API.
+    # PyAV 19 requires Python 3.12 and is outside aiortc's supported range.
+    "av==17.1.0",
 ]
 # ---------------------------------------------------------------------------
 # Required system packages (Arch Linux) — NOT managed by uv

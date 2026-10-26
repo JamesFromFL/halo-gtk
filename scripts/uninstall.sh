@@ -3,8 +3,10 @@ set -euo pipefail
 
 APP_ID="io.github.JamesFromFL.HaloGtk"
 APP_NAME="halo-gtk"
-CONFIG_HOME="${XDG_CONFIG_HOME:-"$HOME/.config"}"
-DATA_HOME="${XDG_DATA_HOME:-"$HOME/.local/share"}"
+CONFIG_HOME="${XDG_CONFIG_HOME:-}"
+[[ "$CONFIG_HOME" = /* ]] || CONFIG_HOME="$HOME/.config"
+DATA_HOME="${XDG_DATA_HOME:-}"
+[[ "$DATA_HOME" = /* ]] || DATA_HOME="$HOME/.local/share"
 BIN_DIR="$HOME/.local/bin"
 AUTOSTART_DIR="$CONFIG_HOME/autostart"
 DESKTOP_DIR="$DATA_HOME/applications"
@@ -31,6 +33,11 @@ refresh_caches() {
 
 main() {
   local icon
+
+  if [ "$#" -ne 0 ]; then
+    printf 'Usage: %s\n' "$0" >&2
+    exit 2
+  fi
 
   log "Removing launcher"
   rm -f "$BIN_DIR/$APP_NAME"
