@@ -435,6 +435,10 @@ class RingWindow(Adw.ApplicationWindow):
         populate()
         self._update_back_button()
 
+    def open_intercom(self, api_id, epoch, generation):
+        self._show_page("devices")
+        return self._devices_page.open_intercom(api_id, epoch, generation)
+
     def open_camera_live(self, device_id: int) -> bool:
         """Show focused live monitoring for a device."""
         client = get_client()

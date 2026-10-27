@@ -68,6 +68,9 @@ from halo_gtk.alarm.provider import (
 from halo_gtk.alarm.rest import DEVICES_ENDPOINT, LOCATIONS_ENDPOINT
 from halo_gtk.alarm.rest import RingAlarmRestGateway as _RingAlarmRestGateway
 from halo_gtk.chime_client import ChimeClientState
+from halo_gtk.intercom_client import IntercomClientState
+from halo_gtk.light_groups_client import LightGroupsClientState
+from halo_gtk.lighting_actions import LightingActions
 from halo_gtk.preview import PreviewManager
 from halo_gtk.secret_store import (
     clear_ring_account_email,
@@ -308,6 +311,10 @@ def _publish_session_candidate(
         client_chimes = getattr(client, "_chimes", None)
         if client_chimes is not None:
             client_chimes.initialize(generation)
+        for name in ("_light_groups", "_lighting_actions", "_intercoms"):
+            feature = getattr(client, name, None)
+            if feature is not None:
+                feature.initialize(generation)
         _client = client
         if previous is not None and previous is not client:
             invalidate_alarm = getattr(previous, "_invalidate_alarm_state", None)
@@ -316,6 +323,10 @@ def _publish_session_candidate(
             previous_chimes = getattr(previous, "_chimes", None)
             if previous_chimes is not None:
                 previous_chimes.invalidate(generation)
+            for name in ("_light_groups", "_lighting_actions", "_intercoms"):
+                feature = getattr(previous, name, None)
+                if feature is not None:
+                    feature.invalidate(generation)
         return True, previous
 
 
@@ -459,6 +470,10 @@ def logout_client(*, expected_client: RingClient | None = None) -> bool:
             client_chimes = getattr(client, "_chimes", None)
             if client_chimes is not None:
                 client_chimes.invalidate(generation)
+            for name in ("_light_groups", "_lighting_actions", "_intercoms"):
+                feature = getattr(client, name, None)
+                if feature is not None:
+                    feature.invalidate(generation)
 
         for clear_secret in (
             _clear_token,
@@ -497,6 +512,10 @@ def shutdown_client() -> None:
             client_chimes = getattr(client, "_chimes", None)
             if client_chimes is not None:
                 client_chimes.invalidate(generation)
+            for name in ("_light_groups", "_lighting_actions", "_intercoms"):
+                feature = getattr(client, name, None)
+                if feature is not None:
+                    feature.invalidate(generation)
 
     _set_listener_state(LISTENER_OFFLINE, generation=generation)
     _stop_client_quietly(client)
@@ -598,6 +617,9 @@ class RingClient:
         self._alarm_gateway = None
         self._ring_json_transport = None
         self._chimes = ChimeClientState(self, is_current=_is_active_client_generation)
+        self._light_groups = LightGroupsClientState(self, is_current=_is_active_client_generation)
+        self._intercoms = IntercomClientState(self, is_current=_is_active_client_generation)
+        self._lighting_actions = LightingActions(self, is_current=_is_active_client_generation)
         self._alarm_history_service = None
         self._alarm_discovery_task = None
         self._alarm_discovery_at = None
@@ -1183,6 +1205,73 @@ class RingClient:
     def get_chime_snapshot(self):
         """Return cached immutable state without starting account traffic."""
         return self._chimes.snapshot()
+
+    def get_intercom_snapshot(self):
+        return self._intercoms.snapshot()
+
+    def add_intercom_callback(self, callback):
+        self._intercoms.add_callback(callback)
+
+    def remove_intercom_callback(self, callback):
+        self._intercoms.remove_callback(callback)
+
+    def refresh_intercoms(self, *, force=False):
+        return self.submit(self._intercoms.refresh(force=force))
+
+    def request_intercom_unlock(self, api_id, *, expected_revision, intent_id):
+        return self.submit(
+            self._intercoms.command(api_id, expected_revision=expected_revision, intent=intent_id)
+        )
+
+    def acknowledge_intercom_request(self, api_id, operation_id):
+        return self.submit(self._intercoms.acknowledge(api_id, operation_id))
+
+    @staticmethod
+    def cancel_intercom_intent(intent):
+        IntercomClientState.cancel_intent(intent)
+
+    def get_light_group_snapshot(self):
+        """Return cached lighting state without starting network work."""
+        return self._light_groups.snapshot()
+
+    def add_light_group_callback(self, callback):
+        self._light_groups.add_callback(callback)
+
+    def remove_light_group_callback(self, callback):
+        self._light_groups.remove_callback(callback)
+
+    def refresh_light_locations(self, *, force=False):
+        return self.submit(self._light_groups.read("refresh_locations", force=force))
+
+    def refresh_light_groups(self, location_id, *, force=False):
+        return self.submit(self._light_groups.read("refresh_groups", location_id, force=force))
+
+    def refresh_light_group_details(self, location_id, group_id, *, force=False):
+        return self.submit(
+            self._light_groups.read("refresh_details", location_id, group_id, force=force)
+        )
+
+    def request_light_group_lights(
+        self, location_id, group_id, on, *, duration, expected_revision, intent_id
+    ):
+        return self.submit(
+            self._light_groups.command(
+                location_id,
+                group_id,
+                on,
+                duration=duration,
+                expected_revision=expected_revision,
+                intent=intent_id,
+            )
+        )
+
+    @staticmethod
+    def cancel_light_group_intent(intent_id):
+        LightGroupsClientState.cancel_intent(intent_id)
+
+    def camera_light_command(self, device, on):
+        """Build an owned, bounded camera-light coroutine for this client's loop."""
+        return self._lighting_actions.camera_light(device, on)
 
     def add_chime_callback(self, callback):
         self._chimes.add_callback(callback)
@@ -1811,6 +1900,9 @@ class RingClient:
             await gateway.close()
         self._alarm_history_service = None
         self._alarm_gateway = None
+        await self._intercoms.close()
+        await self._light_groups.close()
+        await self._lighting_actions.close()
         await self._chimes.close()
         transport = self._ring_json_transport
         self._ring_json_transport = None
@@ -2089,7 +2181,27 @@ class RingClient:
         generation = self._published_generation
         if not _is_active_client_generation(self, generation):
             return
+        kind = (
+            event.get("device_kind")
+            if isinstance(event, dict)
+            else getattr(event, "device_kind", None)
+        )
+        if isinstance(kind, str) and kind.startswith("intercom_"):
+            # No worker/media enrichment and no automatic write for access events.
+            self._intercoms.queue_event(event)
+            return
         GLib.idle_add(self._dispatch_event, event, generation)
+
+    def _dispatch_intercom_event(self, device, generation):
+        if not _is_active_client_generation(self, generation):
+            return False
+        current = self.get_intercom_snapshot().find_device(device.api_id)
+        if current is None or current.identity_epoch != device.identity_epoch:
+            return False
+        from halo_gtk.intercom_notifications import send_intercom_notification
+
+        send_intercom_notification(current, device.observations[0], generation)
+        return False
 
     def _dispatch_event(self, event, generation: int) -> bool:
         if not _is_active_client_generation(self, generation):

@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import math
-import threading
-import weakref
 from datetime import datetime
 
 import gi
 
 gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
-from gi.repository import Adw, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gtk  # noqa: E402
+from gi.repository import GLib as GLib  # noqa: E402
 
 from halo_gtk.chime import (  # noqa: E402
     HEALTH_CACHE_SECONDS,
@@ -22,6 +21,7 @@ from halo_gtk.chime import (  # noqa: E402
     ChimeReadStatus,
     chime_monotonic_time,
 )
+from halo_gtk.device_view_session import DeviceViewSession  # noqa: E402
 from halo_gtk.ring_client import get_client  # noqa: E402
 
 
@@ -119,175 +119,11 @@ def _operation_text(operation) -> str:
     }.get(operation.status, "Chime request status unavailable.")
 
 
-class _ChimeViewSession:
-    """One subscription, one GTK delivery and a bounded set of view consumers.
-
-    Read futures are cancelled on retirement. Commands remain service-owned;
-    cancelling their intent only prevents work that has not been admitted.
-    """
+class _ChimeViewSession(DeviceViewSession):
+    snapshot_freshness = staticmethod(_freshness)
 
     def __init__(self, changed, retired, *, provider=None):
-        self._changed = changed
-        self._retired = retired
-        self._provider = provider or (lambda: get_client())
-        self._lock = threading.Lock()
-        self.client = None
-        self.generation = None
-        self.active = False
-        self._epoch = 0
-        self._futures = {}
-        self._completed = {}
-        self._intent = None
-        self._idle_pending = False
-        self._idle_id = None
-        self._watch_id = None
-        self._freshness = ()
-
-    def current(self):
-        client = self.client
-        if (
-            not self.active
-            or client is None
-            or self._provider() is not client
-            or not client.is_authenticated
-        ):
-            return None
-        snapshot = client.get_chime_snapshot()
-        return snapshot if snapshot.generation == self.generation else None
-
-    def open(self, client) -> bool:
-        if self.active and client is self.client and self.current() is not None:
-            return False
-        self.close()
-        snapshot = client.get_chime_snapshot()
-        self.client, self.generation, self.active = client, snapshot.generation, True
-        client.add_chime_callback(self._on_snapshot)
-        reference = weakref.ref(self)
-        self._watch_id = GLib.timeout_add(250, self._watch, reference)
-        self._queue()
-        return True
-
-    def close(self) -> None:
-        with self._lock:
-            self.active = False
-            self._epoch += 1
-            client, self.client = self.client, None
-            reads = [
-                future for key, future in self._futures.items() if key in {"inventory", "details"}
-            ]
-            intent, self._intent = self._intent, None
-            self._futures.clear()
-            self._completed.clear()
-            idle, self._idle_id = self._idle_id, None
-            self._idle_pending = False
-            watch, self._watch_id = self._watch_id, None
-        if client is not None:
-            client.remove_chime_callback(self._on_snapshot)
-        if intent is not None:
-            intent.cancel()
-            if client is not None:
-                client.cancel_chime_intent(intent)
-        for future in reads:
-            future.cancel()
-        for source in (idle, watch):
-            if source is not None:
-                GLib.source_remove(source)
-
-    def pending(self, key) -> bool:
-        with self._lock:
-            return key in self._futures
-
-    def request(self, key, invoke, *, intent=None) -> bool:
-        if key not in {"inventory", "details", "command", "ack"}:
-            return False
-        if self.current() is None or self.pending(key):
-            return False
-        if intent is not None:
-            self._intent = intent
-        try:
-            future = invoke()
-        except Exception:
-            if intent is not None:
-                intent.cancel()
-            with self._lock:
-                self._completed[key] = None
-            self._queue()
-            return False
-        with self._lock:
-            self._futures[key] = future
-            epoch = self._epoch
-        reference = weakref.ref(self)
-
-        def done(completed):
-            owner = reference()
-            if owner is None:
-                return
-            with owner._lock:
-                if (
-                    not owner.active
-                    or owner._epoch != epoch
-                    or owner._futures.get(key) is not completed
-                ):
-                    return
-                owner._completed[key] = completed
-            owner._queue()
-
-        future.add_done_callback(done)
-        self._queue()
-        return True
-
-    def _on_snapshot(self, _snapshot) -> None:
-        # Do not retain a queued payload containing a retired account's names.
-        self._queue()
-
-    def _queue(self) -> None:
-        with self._lock:
-            if not self.active or self._idle_pending:
-                return
-            self._idle_pending = True
-            epoch = self._epoch
-        source = GLib.idle_add(self._deliver, weakref.ref(self), epoch)
-        with self._lock:
-            if self.active and self._epoch == epoch and self._idle_pending:
-                self._idle_id = source
-
-    @staticmethod
-    def _deliver(reference, epoch):
-        owner = reference()
-        if owner is None:
-            return False
-        with owner._lock:
-            if not owner.active or owner._epoch != epoch:
-                return False
-            owner._idle_pending = False
-            owner._idle_id = None
-            completed, owner._completed = owner._completed, {}
-            for key, future in completed.items():
-                if future is not None and owner._futures.get(key) is future:
-                    owner._futures.pop(key)
-        snapshot = owner.current()
-        if snapshot is None:
-            owner.close()
-            owner._retired()
-        else:
-            owner._freshness = _freshness(snapshot)
-            owner._changed(snapshot, completed)
-        return False
-
-    @staticmethod
-    def _watch(reference):
-        owner = reference()
-        if owner is None or not owner.active:
-            return False
-        snapshot = owner.current()
-        if snapshot is None:
-            owner._watch_id = None
-            owner.close()
-            owner._retired()
-            return False
-        if _freshness(snapshot) != owner._freshness:
-            owner._queue()
-        return True
+        super().__init__(changed, retired, provider=provider or (lambda: get_client()))
 
 
 def _label(text="", **kwargs):

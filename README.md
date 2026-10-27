@@ -99,13 +99,25 @@ See what Halo discovered on the connected account and jump back to the camera
 grid. Chime cards open account-reported device details, volume controls, and
 explicit Ring or Motion sound tests for recognized legacy models. These controls
 are experimental until checked against a real device; unrecognized models and
-accounts without positive ownership evidence remain read-only. Light groups and
-intercom controls are still planned.
+accounts without positive ownership evidence remain read-only. Light Groups has
+a separate location selector, reported group/member details, explicit timed On
+and Off requests, and fresh report verification. Group controls are experimental;
+an aggregate report does not establish every lamp's physical state. Intercom Audio
+and Video devices have reported status, incoming call/unlock observations and
+explicit entrance release with an expiring confirmation. Acceptance never proves
+a physical door opened or relocked. Calling remains in the Ring app; see
+[Intercom support and limits](doc/intercom-support.md).
 
 Volume changes require Apply and a fresh Ring report before Halo confirms them.
 After a sound request, confirm **The sound has stopped** before changing another
 setting. Request acceptance cannot establish that the device played a sound.
 See [Chime support and limits](doc/chime-support.md).
+
+Light Groups offers 1-, 5- and 15-minute On requests, with a one-minute default.
+These are Halo duration choices; actual shutoff behavior requires hardware
+validation. Off does not disable Ring motion rules or schedules. Group and camera
+light actions share a bounded no-queue guard, while streams and other device
+controls remain independent. See [Light Groups support and limits](doc/light-groups-support.md).
 
 ![Halo Devices page showing discovered cameras and planned device families](doc/images/halo-devices.webp)
 

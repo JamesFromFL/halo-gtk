@@ -8,8 +8,11 @@ from ring_doorbell.const import (
     KIND_DING,
     KIND_MOTION,
     PUSH_ACTION_DING,
+    PUSH_ACTION_INTERCOM_UNLOCK,
     PUSH_ACTION_MOTION,
     PUSH_NOTIFICATION_DING,
+    PUSH_NOTIFICATION_INTERCOM,
+    PUSH_NOTIFICATION_INTERCOM_UNLOCK,
     PUSH_NOTIFICATION_MOTION,
 )
 
@@ -17,7 +20,13 @@ _MOTION_KINDS = frozenset(
     str(kind).casefold() for kind in (KIND_MOTION, PUSH_ACTION_MOTION, PUSH_NOTIFICATION_MOTION)
 )
 _DING_KINDS = frozenset(
-    str(kind).casefold() for kind in (KIND_DING, PUSH_ACTION_DING, PUSH_NOTIFICATION_DING)
+    str(kind).casefold()
+    for kind in (KIND_DING, PUSH_ACTION_DING, PUSH_NOTIFICATION_DING, PUSH_NOTIFICATION_INTERCOM)
+)
+
+_UNLOCK_KINDS = frozenset(
+    str(kind).casefold()
+    for kind in ("intercom_unlock", PUSH_ACTION_INTERCOM_UNLOCK, PUSH_NOTIFICATION_INTERCOM_UNLOCK)
 )
 
 
@@ -30,6 +39,8 @@ def normalized_event_kind(event_or_kind: Any) -> str:
     else:
         value = getattr(event_or_kind, "kind", None)
     kind = str(value or "").casefold()
+    if kind in _UNLOCK_KINDS:
+        return "intercom_unlock"
     if kind in _MOTION_KINDS:
         return KIND_MOTION
     if kind in _DING_KINDS:

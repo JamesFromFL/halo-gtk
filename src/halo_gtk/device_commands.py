@@ -40,6 +40,17 @@ def reported_siren_active(device) -> bool:
     return _first_reported_state(device, ("siren",), include_active=True)
 
 
+def command_failure_summary(name, error):
+    if getattr(error, "possibly_sent", False):
+        return (
+            f"The result for {name} is unknown. The request may have reached Ring. "
+            "Check the device or refresh its status before making another request."
+        )
+    if getattr(error, "code", None) == "lighting-busy":
+        return "Another lighting request is still running. This request was not sent."
+    return f"Could not complete the command for {name}."
+
+
 def _first_reported_state(
     device,
     attributes: tuple[str, ...],
@@ -125,6 +136,14 @@ class DeviceCommandState:
                 state.light_enabled = bool(enabled)
                 state.light_expires_at = self._clock() + _COMMAND_STATE_RECONCILE_SECONDS
 
+    def invalidate_light(self, client, device) -> None:
+        """Retire only a camera's optimistic light value, preserving siren state."""
+        with self._lock:
+            state = self._state_for(client, device, create=False)
+            if state is not None:
+                state.light_enabled = None
+                state.light_expires_at = None
+
     def record_siren_success(self, client, device, duration: int) -> None:
         with self._lock:
             state = self._state_for(client, device, create=True)
@@ -187,6 +206,13 @@ class DeviceCommandState:
 
 
 def _device_key(device) -> tuple[tuple[Any, ...], Any | None]:
+    scope = []
+    for attribute in ("family", "location_id", "kind"):
+        try:
+            value = getattr(device, attribute, None)
+        except Exception:
+            value = None
+        scope.append(value if isinstance(value, str) else None)
     for attribute in ("id", "device_api_id"):
         try:
             value = getattr(device, attribute)
@@ -194,7 +220,7 @@ def _device_key(device) -> tuple[tuple[Any, ...], Any | None]:
         except Exception:
             continue
         if value is not None:
-            return (attribute, type(value), value), None
+            return (*scope, attribute, type(value), value), None
     return ("identity", id(device)), device
 
 

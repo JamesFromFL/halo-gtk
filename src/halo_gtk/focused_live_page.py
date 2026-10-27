@@ -575,9 +575,9 @@ class FocusedLivePage(Gtk.Box):
             return
         device = self._device
         requested_active = btn.get_active()
-        setter = getattr(self._device, "async_set_light", None)
         client = _ring_client()
-        if client is None or not callable(setter):
+        command_builder = getattr(client, "camera_light_command", None)
+        if client is None or not callable(command_builder):
             self._finish_light_command(
                 device,
                 requested_active,
@@ -586,7 +586,7 @@ class FocusedLivePage(Gtk.Box):
             return
         btn.set_sensitive(False)
         try:
-            command = setter(requested_active)
+            command = command_builder(device, requested_active)
         except Exception as exc:
             self._finish_light_command(device, requested_active, exc)
             return
@@ -609,20 +609,15 @@ class FocusedLivePage(Gtk.Box):
         *,
         client=None,
     ) -> bool:
-        if error is None:
-            device_commands.command_state.record_light_success(
-                client,
-                device,
-                requested_active,
-            )
+        if client is not None and _ring_client() is not client:
+            return GLib.SOURCE_REMOVE
         if self._device is device:
             self._light_btn.set_sensitive(True)
-        if error is not None and self._device is device:
             self._light_btn.handler_block_by_func(self._on_light_toggled)
-            self._light_btn.set_active(not requested_active)
+            self._light_btn.set_active(device_commands.command_state.light_enabled(client, device))
             self._light_btn.handler_unblock_by_func(self._on_light_toggled)
             self._refresh_light_icon()
-        if error is not None:
+        if error is not None and self._device is device:
             action = "turn on" if requested_active else "turn off"
             self._present_device_command_error(f"Could not {action} light", device, error)
         return GLib.SOURCE_REMOVE
@@ -709,12 +704,10 @@ class FocusedLivePage(Gtk.Box):
 
     def _present_device_command_error(self, heading: str, device, error: Exception) -> None:
         _log.warning("%s for %s: %s", heading, device.name, error)
+        summary = device_commands.command_failure_summary(device_names.display_name(device), error)
         dialog = Adw.AlertDialog(
             heading=heading,
-            body=(
-                f"{device_names.display_name(device)} did not accept the command.\n\n"
-                f"{redact_text(error)}"
-            ),
+            body=(f"{summary}\n\n{redact_text(error)}"),
         )
         dialog.add_response("close", "Close")
         root = self.get_root()

@@ -2409,10 +2409,10 @@ class CamerasPage(Gtk.Box):
 
     def _on_tile_light_toggle(self, device, active: bool) -> None:
         client = get_client()
-        setter = getattr(device, "async_set_light", None)
+        command_builder = getattr(client, "camera_light_command", None)
         device_id = int(device.id)
         tile = self._cards.get(device_id)
-        if client is None or not callable(setter):
+        if client is None or not callable(command_builder):
             self._finish_tile_light_command(
                 device,
                 active,
@@ -2423,7 +2423,7 @@ class CamerasPage(Gtk.Box):
         if tile is not None and tile._light_btn is not None:
             tile._light_btn.set_sensitive(False)
         try:
-            command = setter(active)
+            command = command_builder(device, active)
         except Exception as exc:
             self._finish_tile_light_command(device, active, exc, tile)
             return
@@ -2448,23 +2448,18 @@ class CamerasPage(Gtk.Box):
         *,
         client=None,
     ) -> bool:
-        if error is None:
-            device_commands.command_state.record_light_success(
-                client,
-                device,
-                requested_active,
-            )
+        if client is not None and get_client() is not client:
+            return GLib.SOURCE_REMOVE
         tile = self._cards.get(int(device.id))
         if expected_tile is not None and tile is not expected_tile:
             tile = None
         if tile is not None and tile._light_btn is not None:
             tile._light_btn.set_sensitive(True)
-            if error is not None:
-                tile._light_btn.handler_block_by_func(tile._on_light_toggled)
-                tile._light_btn.set_active(not requested_active)
-                tile._light_btn.handler_unblock_by_func(tile._on_light_toggled)
-                tile._refresh_light_icon()
-        if error is not None:
+            tile._light_btn.handler_block_by_func(tile._on_light_toggled)
+            tile._light_btn.set_active(device_commands.command_state.light_enabled(client, device))
+            tile._light_btn.handler_unblock_by_func(tile._on_light_toggled)
+            tile._refresh_light_icon()
+        if error is not None and tile is not None:
             action = "turn on" if requested_active else "turn off"
             self._present_device_command_error(
                 f"Could not {action} light",
@@ -2558,12 +2553,10 @@ class CamerasPage(Gtk.Box):
 
     def _present_device_command_error(self, heading: str, device, error: Exception) -> None:
         _log.warning("%s for %s: %s", heading, device.name, error)
+        summary = device_commands.command_failure_summary(device_names.display_name(device), error)
         dialog = Adw.AlertDialog(
             heading=heading,
-            body=(
-                f"{device_names.display_name(device)} did not accept the command.\n\n"
-                f"{redact_text(error)}"
-            ),
+            body=(f"{summary}\n\n{redact_text(error)}"),
         )
         dialog.add_response("close", "Close")
         root = self.get_root()

@@ -9,6 +9,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 This section tracks the work toward Halo GTK's first tagged release.
 
 ### Added
+- Experimental Intercom status, bounded live call/unlock observations and notifications,
+  and single-use confirmed entrance release with honest RPC/uncertain outcomes.
+  No physical lock state is inferred; calling remains in the Ring app.
+- Experimental Light Groups discovery by location, reported state/member details,
+  explicit duration-based On and Off requests, and bounded fresh readback.
+  Group reports do not establish every lamp's state; live validation is deferred.
 - Experimental Chime details, explicit legacy volume Apply with fresh readback,
   and separate Ring/Motion sound requests with a session-owned completion
   acknowledgment. Unknown hardware and unverified ownership stay read-only;
@@ -38,6 +44,9 @@ This section tracks the work toward Halo GTK's first tagged release.
 - Automated lint, test, dependency-audit, schema, desktop-file, and installed-wheel checks.
 
 ### Changed
+- Camera and group light actions share a client-owned no-queue reservation with
+  bounded deadlines. Camera results are recorded before releasing the guard, so
+  delayed GTK callbacks cannot revive overrides cleared by a newer group action.
 - Alarm and Chime now share a bounded JSON transport using the existing Auth;
   Alarm remains GET-only and Chime writes use fixed routes with no replay.
 - Alarm REST uses the maintained ticket service and bounded authenticated JSON

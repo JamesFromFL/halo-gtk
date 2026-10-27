@@ -49,6 +49,7 @@ class RingWriteReceipt:
     status: int
     body_complete: bool = True
     body_error: str | None = None
+    response_json: dict | None = None
 
     @property
     def accepted(self):
@@ -129,8 +130,13 @@ class RingJsonTransport:
         timeout=10,
         admission: Callable[[], None] | None = None,
         on_admitted: Callable[[], None] | None = None,
+        read_json: bool = False,
     ) -> RingWriteReceipt:
-        if method not in {"PUT", "POST"} or not isinstance(json, Mapping):
+        if (
+            method not in {"PUT", "POST"}
+            or not isinstance(json, Mapping)
+            or not isinstance(read_json, bool)
+        ):
             raise RingJsonError("operation-not-allowed")
         try:
             encoded = json_module.dumps(dict(json), allow_nan=False, ensure_ascii=True).encode()
@@ -150,6 +156,7 @@ class RingJsonTransport:
             admission=admission,
             on_admitted=on_admitted,
             timeout_limit=10,
+            decode_write_json=read_json,
         )
 
     def _check_auth(self):
@@ -215,6 +222,7 @@ class RingJsonTransport:
         admission,
         on_admitted,
         timeout_limit,
+        decode_write_json=False,
     ):
         _validate_url(url)
         duration = _duration(timeout, timeout_limit)
@@ -296,7 +304,12 @@ class RingJsonTransport:
                         if write:
                             if asyncio.get_running_loop().time() >= deadline:
                                 return RingWriteReceipt(accepted_status, False, "timeout")
-                            return RingWriteReceipt(accepted_status)
+                            reply = None
+                            if decode_write_json:
+                                reply = _decode_json(data, MAX_JSON_DEPTH, MAX_JSON_NODES)
+                                if not isinstance(reply, dict):
+                                    raise RingJsonError("invalid-response")
+                            return RingWriteReceipt(accepted_status, response_json=reply)
                         result = _decode_json(data, bounds[1][0], bounds[2][0])
                         if asyncio.get_running_loop().time() >= deadline:
                             raise RingJsonError("timeout")
