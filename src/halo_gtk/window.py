@@ -358,6 +358,8 @@ class RingWindow(Adw.ApplicationWindow):
             self._history_page.on_page_hidden()
         elif previous_page == "alarm" and name != "alarm":
             self._alarm_page.on_page_hidden()
+        elif previous_page == "devices" and name != "devices":
+            self._devices_page.on_page_hidden()
 
         self._active_page_name = name
         if name in self._nav_rows:
@@ -376,7 +378,8 @@ class RingWindow(Adw.ApplicationWindow):
         elif name == "history":
             self._history_page.refresh()
         elif name == "devices":
-            self._devices_page.refresh()
+            shown = getattr(self._devices_page, "on_page_shown", self._devices_page.refresh)
+            shown()
         elif name == "alarm":
             self._alarm_page.refresh()
         split_view = getattr(self, "_split_view", None)
@@ -554,6 +557,11 @@ class RingWindow(Adw.ApplicationWindow):
         self._cameras_page.deactivate_snapshot_updates()
         self._cameras_page.stop_live_monitoring()
         self._history_page.on_page_hidden()
+        for name in ("_devices_page", "_alarm_page"):
+            page = getattr(self, name, None)
+            hidden = getattr(page, "on_page_hidden", None)
+            if callable(hidden):
+                hidden()
         get_live_session_manager().stop_all()
 
     # ------------------------------------------------------------------
@@ -583,7 +591,11 @@ class RingWindow(Adw.ApplicationWindow):
             self._cameras_page.refresh()
         else:
             self._cameras_page.enforce_live_monitoring_limits()
-        self._devices_page.refresh()
+        if self._active_page_name == "devices":
+            shown = getattr(self._devices_page, "on_page_shown", self._devices_page.refresh)
+            shown()
+        else:
+            self._devices_page.refresh()
         self._alarm_page.refresh()
 
     def _on_listener_state(self, state: str) -> None:

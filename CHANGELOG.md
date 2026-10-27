@@ -9,6 +9,10 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 This section tracks the work toward Halo GTK's first tagged release.
 
 ### Added
+- Experimental Chime details, explicit legacy volume Apply with fresh readback,
+  and separate Ring/Motion sound requests with a session-owned completion
+  acknowledgment. Unknown hardware and unverified ownership stay read-only;
+  physical-device validation remains deferred.
 - Experimental Alarm cloud history with a separate non-video view, bounded
   session cache, cancellation, source labels and explicit coverage limitations.
 - Semantic live Alarm notifications, opt-in routine activity, default-redacted
@@ -34,6 +38,8 @@ This section tracks the work toward Halo GTK's first tagged release.
 - Automated lint, test, dependency-audit, schema, desktop-file, and installed-wheel checks.
 
 ### Changed
+- Alarm and Chime now share a bounded JSON transport using the existing Auth;
+  Alarm remains GET-only and Chime writes use fixed routes with no replay.
 - Alarm REST uses the maintained ticket service and bounded authenticated JSON
   reads with coordinated token refresh. Normal mode approvals expire, require
   current inventory, and remain fenced at the socket send boundary.

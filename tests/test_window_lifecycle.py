@@ -241,3 +241,44 @@ def test_alarm_navigation_refreshes_and_closes_compact_sidebar():
         ("sidebar", False),
         ("back", True),
     ]
+
+
+def test_devices_navigation_uses_visible_entry_and_retires_on_exit():
+    calls = []
+    page = SimpleNamespace(
+        _active_page_name="devices",
+        _page_history=[],
+        _devices_page=SimpleNamespace(
+            refresh=lambda: calls.append("cached"),
+            on_page_shown=lambda: calls.append("shown"),
+            on_page_hidden=lambda: calls.append("hidden"),
+        ),
+        _alarm_page=SimpleNamespace(refresh=lambda: calls.append("alarm")),
+        _nav_rows={"devices": object(), "alarm": object()},
+        _content_stack=SimpleNamespace(set_visible_child_name=lambda _: None),
+        _select_nav_row=lambda _: None,
+        _update_title=lambda _: None,
+        _update_back_button=lambda: None,
+    )
+    RingWindow._show_page(page, "devices")
+    RingWindow._show_page(page, "alarm")
+    assert calls == ["shown", "hidden", "alarm"]
+
+
+def test_window_teardown_retires_chime_dialogs_and_alarm_view(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        window_module, "get_live_session_manager", lambda: SimpleNamespace(stop_all=lambda: None)
+    )
+    page = SimpleNamespace(
+        _focused_live_page=SimpleNamespace(leave=lambda: None),
+        _dashboard_cameras_page=SimpleNamespace(deactivate_snapshot_updates=lambda: None),
+        _cameras_page=SimpleNamespace(
+            deactivate_snapshot_updates=lambda: None, stop_live_monitoring=lambda: None
+        ),
+        _history_page=SimpleNamespace(on_page_hidden=lambda: None),
+        _devices_page=SimpleNamespace(on_page_hidden=lambda: calls.append("devices")),
+        _alarm_page=SimpleNamespace(on_page_hidden=lambda: calls.append("alarm")),
+    )
+    RingWindow.stop_runtime_streams(page)
+    assert calls == ["devices", "alarm"]

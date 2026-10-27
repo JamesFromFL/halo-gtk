@@ -96,9 +96,16 @@ are available where Ring provides the recording and action for the account.
 ### Devices
 
 See what Halo discovered on the connected account and jump back to the camera
-grid. Camera support is the current focus; chimes, light groups, and intercom
-families are shown honestly as planned rather than presented as finished
-controls.
+grid. Chime cards open account-reported device details, volume controls, and
+explicit Ring or Motion sound tests for recognized legacy models. These controls
+are experimental until checked against a real device; unrecognized models and
+accounts without positive ownership evidence remain read-only. Light groups and
+intercom controls are still planned.
+
+Volume changes require Apply and a fresh Ring report before Halo confirms them.
+After a sound request, confirm **The sound has stopped** before changing another
+setting. Request acceptance cannot establish that the device played a sound.
+See [Chime support and limits](doc/chime-support.md).
 
 ![Halo Devices page showing discovered cameras and planned device families](doc/images/halo-devices.webp)
 

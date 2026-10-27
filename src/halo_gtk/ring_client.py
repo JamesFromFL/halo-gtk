@@ -67,6 +67,7 @@ from halo_gtk.alarm.provider import (
 )
 from halo_gtk.alarm.rest import DEVICES_ENDPOINT, LOCATIONS_ENDPOINT
 from halo_gtk.alarm.rest import RingAlarmRestGateway as _RingAlarmRestGateway
+from halo_gtk.chime_client import ChimeClientState
 from halo_gtk.preview import PreviewManager
 from halo_gtk.secret_store import (
     clear_ring_account_email,
@@ -304,11 +305,17 @@ def _publish_session_candidate(
         initialize_alarm = getattr(client, "_initialize_alarm_generation", None)
         if callable(initialize_alarm):
             initialize_alarm(generation)
+        client_chimes = getattr(client, "_chimes", None)
+        if client_chimes is not None:
+            client_chimes.initialize(generation)
         _client = client
         if previous is not None and previous is not client:
             invalidate_alarm = getattr(previous, "_invalidate_alarm_state", None)
             if callable(invalidate_alarm):
                 invalidate_alarm(generation)
+            previous_chimes = getattr(previous, "_chimes", None)
+            if previous_chimes is not None:
+                previous_chimes.invalidate(generation)
         return True, previous
 
 
@@ -449,6 +456,10 @@ def logout_client(*, expected_client: RingClient | None = None) -> bool:
             if callable(invalidate_alarm):
                 invalidate_alarm(generation)
 
+            client_chimes = getattr(client, "_chimes", None)
+            if client_chimes is not None:
+                client_chimes.invalidate(generation)
+
         for clear_secret in (
             _clear_token,
             clear_ring_account_email,
@@ -482,6 +493,10 @@ def shutdown_client() -> None:
             invalidate_alarm = getattr(client, "_invalidate_alarm_state", None)
             if callable(invalidate_alarm):
                 invalidate_alarm(generation)
+
+            client_chimes = getattr(client, "_chimes", None)
+            if client_chimes is not None:
+                client_chimes.invalidate(generation)
 
     _set_listener_state(LISTENER_OFFLINE, generation=generation)
     _stop_client_quietly(client)
@@ -581,6 +596,8 @@ class RingClient:
         self._alarm_stop_event: asyncio.Event | None = None
         self._alarm_service = None
         self._alarm_gateway = None
+        self._ring_json_transport = None
+        self._chimes = ChimeClientState(self, is_current=_is_active_client_generation)
         self._alarm_history_service = None
         self._alarm_discovery_task = None
         self._alarm_discovery_at = None
@@ -893,11 +910,22 @@ class RingClient:
         except Exception:
             return seeds
 
+    def _get_ring_json_transport(self):
+        if self._ring_json_transport is None:
+            if self._ring is None:
+                raise RuntimeError("Not signed in to Ring")
+            from halo_gtk.ring_json import RingJsonTransport
+
+            self._ring_json_transport = RingJsonTransport(self._ring.auth)
+        return self._ring_json_transport
+
     def _get_alarm_gateway(self):
         if self._alarm_gateway is None:
             if self._ring is None:
                 raise RuntimeError("Not signed in to Ring")
-            self._alarm_gateway = _RingAlarmRestGateway(self._ring.auth)
+            self._alarm_gateway = _RingAlarmRestGateway(
+                self._ring.auth, transport=self._get_ring_json_transport()
+            )
         return self._alarm_gateway
 
     def _get_alarm_history_service(self):
@@ -1151,6 +1179,43 @@ class RingClient:
         """Return the latest immutable Ring Alarm account snapshot."""
         with self._alarm_snapshot_lock:
             return self._alarm_snapshot
+
+    def get_chime_snapshot(self):
+        """Return cached immutable state without starting account traffic."""
+        return self._chimes.snapshot()
+
+    def add_chime_callback(self, callback):
+        self._chimes.add_callback(callback)
+
+    def remove_chime_callback(self, callback):
+        self._chimes.remove_callback(callback)
+
+    def refresh_chimes(self, *, force=False):
+        return self.submit(self._chimes.refresh(force=force))
+
+    def refresh_chime_details(self, api_id, *, force=False):
+        return self.submit(self._chimes.refresh_details(api_id, force=force))
+
+    def request_chime_volume(self, api_id, value, *, expected_revision, intent_id):
+        return self.submit(
+            self._chimes.command(
+                api_id, value, expected_revision=expected_revision, intent=intent_id
+            )
+        )
+
+    def request_chime_test_sound(self, api_id, kind, *, expected_revision, intent_id):
+        return self.submit(
+            self._chimes.command(
+                api_id, kind, expected_revision=expected_revision, intent=intent_id, sound=True
+            )
+        )
+
+    def acknowledge_chime_sound_finished(self, api_id, operation_id):
+        return self.submit(self._chimes.acknowledge(api_id, operation_id))
+
+    @staticmethod
+    def cancel_chime_intent(intent_id):
+        ChimeClientState.cancel_intent(intent_id)
 
     def _initialize_alarm_generation(self, generation: int) -> None:
         with self._alarm_snapshot_lock:
@@ -1722,7 +1787,7 @@ class RingClient:
             _log.debug("%s stopped with error (%s)", label, type(exc).__name__)
 
     async def _async_close(self) -> None:
-        """Close Alarm transports before the Ring Auth-owned HTTP session."""
+        """Close feature requests, shared transport, then Auth-owned HTTP."""
         discovery = self._alarm_discovery_task
         self._alarm_discovery_task = None
         if discovery is not None and not discovery.done():
@@ -1746,6 +1811,11 @@ class RingClient:
             await gateway.close()
         self._alarm_history_service = None
         self._alarm_gateway = None
+        await self._chimes.close()
+        transport = self._ring_json_transport
+        self._ring_json_transport = None
+        if transport is not None:
+            await transport.close()
         ring = self._ring
         self._authenticated = False
         self._ring = None
