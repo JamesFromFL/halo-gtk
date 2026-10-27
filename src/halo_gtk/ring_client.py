@@ -48,19 +48,25 @@ from dataclasses import replace
 from functools import partial, wraps
 from typing import Any
 
+from halo_gtk.alarm.events import MAX_PENDING_EVENTS, AlarmEventBuffer, AlarmEventReducer
 from halo_gtk.alarm.models import (
     AlarmAccountSnapshot,
     AlarmMode,
     AlarmServiceStatus,
+    alarm_monotonic_time,
     empty_alarm_snapshot,
 )
 from halo_gtk.alarm.provider import (
     AlarmCommandResult,
     AlarmCommandSupersededError,
     AlarmLocationSeed,
-    AlarmRequestError,
+    AlarmModePreparation,
+    AlarmRefreshResult,
+    AlarmRefreshStatus,
     location_seeds_from_base_stations,
 )
+from halo_gtk.alarm.rest import DEVICES_ENDPOINT, LOCATIONS_ENDPOINT
+from halo_gtk.alarm.rest import RingAlarmRestGateway as _RingAlarmRestGateway
 from halo_gtk.preview import PreviewManager
 from halo_gtk.secret_store import (
     clear_ring_account_email,
@@ -102,6 +108,9 @@ _LISTENER_RECONNECT_MIN = 5
 _LISTENER_RECONNECT_MAX = 120
 _RING_LOCATIONS_ENDPOINT = "https://api.ring.com/devices/v1/locations"
 _ALARM_LOCATION_DISCOVERY_TIMEOUT = 10
+_ALARM_DISCOVERY_RECORD_LIMIT = 1_024
+_ALARM_DISCOVERY_LOCATION_LIMIT = 128
+_ALARM_DISCOVERY_IDENTIFIER_LIMIT = 512
 _PREVIEW_CALL_SLOTS = threading.BoundedSemaphore(2)
 
 
@@ -157,55 +166,6 @@ _connection_callbacks: list = []
 
 class SessionSupersededError(RuntimeError):
     """Raised when a newer login or logout invalidates session work."""
-
-
-class _RingAlarmRestGateway:
-    """Expose validated JSON requests while keeping OAuth ownership in Ring Auth."""
-
-    def __init__(self, auth) -> None:
-        self._auth = auth
-
-    async def request_json(
-        self,
-        url: str,
-        *,
-        method: str = "GET",
-        json: Mapping[str, Any] | None = None,
-        timeout: float | None = None,
-    ) -> Mapping[str, Any]:
-        from ring_doorbell import AuthenticationError
-
-        request_kwargs = {
-            "method": method,
-            "json": dict(json) if json is not None else None,
-            "timeout": timeout,
-            "raise_for_status": False,
-        }
-        try:
-            response = await self._auth.async_query(url, **request_kwargs)
-            # ring-doorbell 0.9.14 refreshes Auth after a 401 but returns that
-            # original response. Replay one safe read with the rotated token.
-            if getattr(response, "status_code", 200) == 401 and method.upper() == "GET":
-                response = await self._auth.async_query(url, **request_kwargs)
-        except AuthenticationError:
-            raise AlarmRequestError("authentication-required") from None
-        except Exception:
-            raise AlarmRequestError("request-failed") from None
-        status_code = getattr(response, "status_code", 200)
-        if status_code == 401:
-            raise AlarmRequestError("authentication-required")
-        if status_code == 429:
-            # Auth.Response in ring-doorbell 0.9.14 drops Retry-After headers.
-            raise AlarmRequestError("rate-limited", retry_after=60.0)
-        if not isinstance(status_code, int) or not 200 <= status_code < 300:
-            raise AlarmRequestError("request-failed")
-        try:
-            payload = response.json()
-        except Exception:
-            raise AlarmRequestError("invalid-response") from None
-        if not isinstance(payload, Mapping):
-            raise AlarmRequestError("invalid-response")
-        return dict(payload)
 
 
 def _install_serialized_auth_refresh(auth) -> None:
@@ -620,6 +580,18 @@ class RingClient:
         self._alarm_future = None  # concurrent.futures.Future from run_coroutine_threadsafe
         self._alarm_stop_event: asyncio.Event | None = None
         self._alarm_service = None
+        self._alarm_gateway = None
+        self._alarm_history_service = None
+        self._alarm_discovery_task = None
+        self._alarm_discovery_at = None
+        self._alarm_discovery_generation = None
+        self._alarm_discovery_service = None
+        self._alarm_event_reducer = AlarmEventReducer()
+        self._alarm_event_buffer = AlarmEventBuffer()
+        self._alarm_pending_revocations: set[str] = set()
+        self._alarm_withdraw_all = False
+        self._alarm_dispatch_pending = False
+        self._alarm_notification_gap_count = 0
         self._alarm_closing_service = None
         self._alarm_close_task: asyncio.Task | None = None
         self._stop_event = threading.Event()
@@ -630,6 +602,10 @@ class RingClient:
         self._alarm_callbacks: list = []
         self._alarm_snapshot_lock = threading.Lock()
         self._alarm_snapshot = empty_alarm_snapshot()
+        # Retirement shares this fence with snapshot admission. Never acquire
+        # the global session lock while holding the snapshot lock: publishing
+        # a replacement client takes those locks in the opposite order.
+        self._alarm_generation: int | None = None
         self._loop_lock = threading.Lock()
         self._last_device_update_at = 0.0
         self._published_generation: int | None = None
@@ -909,13 +885,180 @@ class RingClient:
         if auth is None:
             return seeds
         try:
-            payload = await _RingAlarmRestGateway(auth).request_json(
+            payload = await self._get_alarm_gateway().request_json(
                 _RING_LOCATIONS_ENDPOINT,
                 timeout=_ALARM_LOCATION_DISCOVERY_TIMEOUT,
             )
             return self._alarm_location_seeds(raw_locations=payload)
         except Exception:
             return seeds
+
+    def _get_alarm_gateway(self):
+        if self._alarm_gateway is None:
+            if self._ring is None:
+                raise RuntimeError("Not signed in to Ring")
+            self._alarm_gateway = _RingAlarmRestGateway(self._ring.auth)
+        return self._alarm_gateway
+
+    def _get_alarm_history_service(self):
+        from halo_gtk.alarm.history import AlarmHistoryService
+
+        if self._alarm_history_service is None:
+            self._alarm_history_service = AlarmHistoryService(self._get_alarm_gateway())
+        return self._alarm_history_service
+
+    def alarm_history(self, location_id, *, offset=0, limit=50, cancel_event=None, force=False):
+        """Bounded worker-thread history API; cancellation reaches the coroutine."""
+        coro = self._async_alarm_history(location_id, offset=offset, limit=limit, force=force)
+        if cancel_event is not None and cancel_event.is_set():
+            coro.close()
+            raise concurrent.futures.CancelledError
+        future = self.submit(coro)
+        deadline = time.monotonic() + 31
+        while True:
+            if (cancel_event is not None and cancel_event.is_set()) or time.monotonic() >= deadline:
+                future.cancel()
+                raise concurrent.futures.CancelledError
+            try:
+                return future.result(timeout=0.05)
+            except concurrent.futures.TimeoutError:
+                if future.done():
+                    return future.result()
+
+    async def _async_alarm_history(self, location_id, *, offset=0, limit=50, force=False):
+        generation = self._published_generation
+        self._require_alarm_location(location_id, generation)
+        result = await self._get_alarm_history_service().fetch_page(
+            location_id, offset=offset, limit=limit, force=force
+        )
+        self._require_alarm_location(location_id, generation)
+        return result
+
+    def _require_alarm_location(self, location_id, generation):
+        if not _is_active_client_generation(self, generation):
+            raise SessionSupersededError("Ring session changed")
+        if self.get_alarm_snapshot().find_location(location_id) is None:
+            raise RuntimeError("Alarm location unavailable")
+
+    async def _async_refresh_alarm_discovery(self):
+        """Refresh Alarm-only ownership/discovery without mutating camera SDK data."""
+        generation = self._published_generation
+        service = self._alarm_service
+        if service is None or not _is_active_client_generation(self, generation):
+            return False
+        now = alarm_monotonic_time()
+        if (
+            self._alarm_discovery_generation == generation
+            and self._alarm_discovery_service is service
+            and self._alarm_discovery_at is not None
+            and 0 <= now - self._alarm_discovery_at < 5
+        ):
+            return True
+        task = self._alarm_discovery_task
+        if task is None or task.done():
+            task = asyncio.create_task(self._async_read_alarm_discovery())
+            self._alarm_discovery_task = task
+            task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        return await asyncio.shield(task)
+
+    async def _async_read_alarm_discovery(self):
+        generation = self._published_generation
+        service = self._alarm_service
+        if service is None or not _is_active_client_generation(self, generation):
+            return False
+        try:
+            async with asyncio.timeout(12):
+                gateway = self._get_alarm_gateway()
+                async with asyncio.TaskGroup() as group:
+                    device_task = group.create_task(gateway.request_json(DEVICES_ENDPOINT))
+                    location_task = group.create_task(gateway.request_json(LOCATIONS_ENDPOINT))
+                devices, locations = device_task.result(), location_task.result()
+                stations = devices.get("base_stations")
+                if not isinstance(stations, list) or len(stations) > _ALARM_DISCOVERY_RECORD_LIMIT:
+                    return False
+                location_ids = set()
+                for station in stations:
+                    if not isinstance(station, Mapping):
+                        return False
+                    # Match the provider's ordered field fallback and text
+                    # normalization, but reject any record it would drop.
+                    identity = None
+                    for key in ("location_id", "locationId"):
+                        value = station.get(key)
+                        if isinstance(value, int) and not isinstance(value, bool):
+                            value = str(value)
+                        if (
+                            isinstance(value, str)
+                            and value.strip()
+                            and len(value.strip()) <= _ALARM_DISCOVERY_IDENTIFIER_LIMIT
+                            and not any(ord(character) < 32 for character in value)
+                        ):
+                            identity = value.strip()
+                            break
+                    if identity is None:
+                        return False
+                    location_ids.add(identity)
+                    if len(location_ids) > _ALARM_DISCOVERY_LOCATION_LIMIT:
+                        return False
+                seeds = location_seeds_from_base_stations(stations, raw_locations=locations)
+                # Forgiving normalization must never turn partial discovery
+                # into authoritative removal of other locations.
+                if {seed.location_id for seed in seeds} != location_ids:
+                    return False
+                if (
+                    not _is_active_client_generation(self, generation)
+                    or service is not self._alarm_service
+                ):
+                    return False
+                await service.reconcile(seeds)
+                if (
+                    not _is_active_client_generation(self, generation)
+                    or service is not self._alarm_service
+                ):
+                    return False
+                self._alarm_discovery_at = alarm_monotonic_time()
+                self._alarm_discovery_generation = generation
+                self._alarm_discovery_service = service
+                return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A failed/unsupported read must never mean every location vanished.
+            return False
+
+    def refresh_alarm(self, location_id=None):
+        return self.submit(self._async_refresh_alarm(location_id))
+
+    async def _async_refresh_alarm(self, location_id=None):
+        generation = self._published_generation
+        if not _is_active_client_generation(self, generation):
+            raise SessionSupersededError("Ring session changed")
+        service = self._alarm_service
+        if service is None:
+            raise RuntimeError("Alarm service unavailable")
+        discovery_ok = await self._async_refresh_alarm_discovery()
+        result = await service.refresh(location_id)
+        if not discovery_ok:
+            return AlarmRefreshResult(AlarmRefreshStatus.INCOMPLETE, code="discovery-unavailable")
+        if not _is_active_client_generation(self, generation):
+            raise SessionSupersededError("Ring session changed")
+        return result
+
+    def prepare_alarm_mode(self, location_id):
+        return self.submit(self._async_prepare_alarm_mode(location_id))
+
+    async def _async_prepare_alarm_mode(self, location_id):
+        generation = self._published_generation
+        self._require_alarm_location(location_id, generation)
+        service = self._alarm_service
+        if service is None:
+            raise RuntimeError("Alarm service unavailable")
+        if not await self._async_refresh_alarm_discovery():
+            return AlarmModePreparation(None, code="discovery-unavailable")
+        self._require_alarm_location(location_id, generation)
+        result = await service.prepare_mode(location_id)
+        self._require_alarm_location(location_id, generation)
+        return result
 
     def _create_alarm_service(
         self,
@@ -928,7 +1071,7 @@ class RingClient:
         if ring is None:
             raise RuntimeError("Not signed in to Ring")
         return RingAlarmService(
-            _RingAlarmRestGateway(ring.auth),
+            self._get_alarm_gateway(),
             tuple(locations) if locations is not None else self._alarm_location_seeds(),
             self._on_alarm_snapshot,
             generation=generation,
@@ -1011,11 +1154,42 @@ class RingClient:
 
     def _initialize_alarm_generation(self, generation: int) -> None:
         with self._alarm_snapshot_lock:
+            self._alarm_generation = generation
             self._alarm_snapshot = empty_alarm_snapshot(generation)
+            self._alarm_dispatch_pending = False
+            self._alarm_pending_revocations.clear()
+            self._alarm_withdraw_all = False
+            self._alarm_event_buffer.clear()
+            self._alarm_event_reducer.clear()
+            self._alarm_notification_gap_count = 0
 
     def _invalidate_alarm_state(self, generation: int) -> None:
+        retired_generation = self.get_alarm_snapshot().generation
         self._initialize_alarm_generation(generation)
         self._alarm_callbacks.clear()
+        discovery = self._alarm_discovery_task
+        if discovery is not None and not discovery.done():
+            loop = discovery.get_loop()
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(discovery.cancel)
+        self._alarm_discovery_at = None
+        self._alarm_discovery_generation = None
+        self._alarm_discovery_service = None
+        with self._alarm_snapshot_lock:
+            self._alarm_event_buffer.clear()
+            self._alarm_event_reducer.clear()
+            self._alarm_dispatch_pending = False
+            self._alarm_notification_gap_count = 0
+        history = self._alarm_history_service
+        if history is not None:
+            history.clear()
+        from gi.repository import GLib
+
+        from halo_gtk.notifications import withdraw_alarm_notifications
+
+        GLib.idle_add(
+            lambda: (withdraw_alarm_notifications(generation=retired_generation), False)[1]
+        )
 
     def _publish_alarm_error(self, generation: int) -> None:
         with self._alarm_snapshot_lock:
@@ -1044,6 +1218,10 @@ class RingClient:
             )
         )
 
+    def get_alarm_notification_gap_count(self):
+        with self._alarm_snapshot_lock:
+            return self._alarm_notification_gap_count
+
     def add_alarm_callback(self, callback) -> None:
         """Register a GTK-thread callback for immutable Alarm snapshots."""
         if callback not in self._alarm_callbacks:
@@ -1061,6 +1239,7 @@ class RingClient:
         *,
         expected_revision: int,
         bypass_ids: Iterable[str] = (),
+        approval_id: str | None = None,
     ) -> concurrent.futures.Future[AlarmCommandResult]:
         """Submit one confirmed Alarm mode request without blocking GTK."""
         return self.submit(
@@ -1069,6 +1248,7 @@ class RingClient:
                 target,
                 expected_revision=expected_revision,
                 bypass_ids=bypass_ids,
+                approval_id=approval_id,
             )
         )
 
@@ -1079,6 +1259,7 @@ class RingClient:
         *,
         expected_revision: int,
         bypass_ids: Iterable[str],
+        approval_id: str | None = None,
     ) -> AlarmCommandResult:
         generation = self._published_generation
         if not _is_active_client_generation(self, generation):
@@ -1086,12 +1267,10 @@ class RingClient:
         service = self._alarm_service
         if service is None:
             raise RuntimeError("Ring Alarm service is not running")
-        result = await service.request_mode(
-            location_id,
-            target,
-            bypass_zids=bypass_ids,
-            expected_revision=expected_revision,
-        )
+        kwargs = {"bypass_zids": bypass_ids, "expected_revision": expected_revision}
+        if approval_id is not None:
+            kwargs["approval_id"] = approval_id
+        result = await service.request_mode(location_id, target, **kwargs)
         if not _is_active_client_generation(self, generation):
             raise SessionSupersededError("Ring session was superseded during Alarm command")
         return result
@@ -1544,6 +1723,11 @@ class RingClient:
 
     async def _async_close(self) -> None:
         """Close Alarm transports before the Ring Auth-owned HTTP session."""
+        discovery = self._alarm_discovery_task
+        self._alarm_discovery_task = None
+        if discovery is not None and not discovery.done():
+            discovery.cancel()
+            await asyncio.gather(discovery, return_exceptions=True)
         service = self._alarm_service
         self._alarm_service = None
         self._alarm_stop_event = None
@@ -1554,6 +1738,14 @@ class RingClient:
                 await self._async_close_alarm_service(service)
             except Exception as exc:
                 _log.debug("Ring Alarm close failed (%s)", type(exc).__name__)
+        history = self._alarm_history_service
+        if history is not None:
+            await history.close()
+        gateway = self._alarm_gateway
+        if gateway is not None:
+            await gateway.close()
+        self._alarm_history_service = None
+        self._alarm_gateway = None
         ring = self._ring
         self._authenticated = False
         self._ring = None
@@ -1717,12 +1909,41 @@ class RingClient:
         """Receive an Alarm snapshot on the asyncio thread and marshal it to GTK."""
         from gi.repository import GLib
 
+        from halo_gtk import config
+        from halo_gtk.notifications import alarm_event_enabled
+
         generation = self._published_generation
         if snapshot.generation != generation or not _is_active_client_generation(self, generation):
             return
+        cfg = config.load()
         with self._alarm_snapshot_lock:
+            if self._alarm_generation not in (None, generation):
+                return
+            self._alarm_generation = generation
+            previous_ids = {location.location_id for location in self._alarm_snapshot.locations}
             self._alarm_snapshot = snapshot
-        GLib.idle_add(self._dispatch_alarm_snapshot, snapshot, generation)
+            for event in self._alarm_event_reducer.update(snapshot):
+                if alarm_event_enabled(event, cfg):
+                    self._alarm_event_buffer.put(event)
+            removed = previous_ids - {location.location_id for location in snapshot.locations}
+            if snapshot.status in {
+                AlarmServiceStatus.ONLINE,
+                AlarmServiceStatus.DEGRADED,
+                AlarmServiceStatus.NO_SYSTEM,
+            }:
+                for location_id in removed:
+                    self._alarm_event_buffer.revoke(location_id)
+                    if not self._alarm_withdraw_all:
+                        self._alarm_pending_revocations.add(location_id)
+                        if len(self._alarm_pending_revocations) > MAX_PENDING_EVENTS:
+                            self._alarm_pending_revocations.clear()
+                            self._alarm_withdraw_all = True
+                    if self._alarm_history_service is not None:
+                        self._alarm_history_service.revoke_location(location_id)
+            schedule = not self._alarm_dispatch_pending
+            self._alarm_dispatch_pending = True
+        if schedule:
+            GLib.idle_add(self._dispatch_alarm_snapshot, snapshot, generation)
 
     def _dispatch_alarm_snapshot(
         self,
@@ -1731,7 +1952,50 @@ class RingClient:
     ) -> bool:
         if snapshot.generation != generation or not _is_active_client_generation(self, generation):
             return False
+        with self._alarm_snapshot_lock:
+            if self._alarm_generation not in (None, generation):
+                return False
+            if self._alarm_dispatch_pending:
+                snapshot = self._alarm_snapshot
+                self._alarm_dispatch_pending = False
+            events, suppressed = self._alarm_event_buffer.drain()
+            self._alarm_notification_gap_count += suppressed
+            revoked = tuple(self._alarm_pending_revocations)
+            withdraw_all = self._alarm_withdraw_all
+            self._alarm_pending_revocations.clear()
+            self._alarm_withdraw_all = False
+        from halo_gtk.notifications import send_alarm_notification, withdraw_alarm_notifications
+
+        # Revoke old displays before showing current events, including a
+        # location removed then regranted during the same GTK dispatch gap.
+        if withdraw_all:
+            withdraw_alarm_notifications(generation=generation)
+        else:
+            for location_id in revoked:
+                withdraw_alarm_notifications(generation=generation, location_id=location_id)
+        for event in events:
+            if not _is_active_client_generation(self, generation):
+                return False
+            with self._alarm_snapshot_lock:
+                allowed = (
+                    self._alarm_generation == generation
+                    and self._alarm_snapshot.generation == generation
+                    and self._alarm_snapshot.find_location(event.location_id) is not None
+                )
+            if allowed:
+                # Preserve a transient critical observation even if its
+                # signal cleared, while discarding revoked location data.
+                send_alarm_notification(event)
+        if suppressed:
+            _log.warning("Alarm notification updates coalesced or dropped (%d)", suppressed)
         for callback in list(self._alarm_callbacks):
+            if not _is_active_client_generation(self, generation):
+                return False
+            with self._alarm_snapshot_lock:
+                if self._alarm_generation not in (None, generation):
+                    return False
+                if self._alarm_generation is not None:
+                    snapshot = self._alarm_snapshot
             try:
                 callback(snapshot)
             except Exception as exc:

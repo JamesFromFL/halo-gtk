@@ -12,6 +12,7 @@ from math import isfinite
 
 from halo_gtk import config as _config
 from halo_gtk import device_names
+from halo_gtk.alarm.events import AlarmEvent
 from halo_gtk.ring_events import normalized_event_kind
 
 _log = logging.getLogger(__name__)
@@ -25,6 +26,7 @@ _NOTIFY_WORKERS = 2
 _NOTIFY_QUEUE_MAX = 32
 _notify_queue: queue.Queue | None = None
 _notify_lock = threading.Lock()
+_alarm_notifications: list = []
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,15 @@ class _NotificationTarget:
     device_id: int | None
     event_id: int | None
     expires_at: float
+
+
+@dataclass(frozen=True)
+class AlarmNotificationTarget:
+    generation: int
+    location_id: str
+    asset_id: str | None = None
+    zid: str | None = None
+    expires_at: float = 0.0
 
 
 def _ensure_notify() -> bool:
@@ -60,12 +71,15 @@ def send_notification(
     *,
     image_bytes: bytes | None = None,
     image_pixbuf=None,
-    target: _NotificationTarget | None = None,
+    target: _NotificationTarget | AlarmNotificationTarget | None = None,
     urgency: str = "normal",
 ) -> None:
     """Show a desktop notification via libnotify."""
     if not _ensure_notify():
-        _log.info("Notification (no libnotify): %s — %s", summary, body)
+        if isinstance(target, AlarmNotificationTarget):
+            _log.info("Alarm notification unavailable")
+        else:
+            _log.info("Notification (no libnotify): %s — %s", summary, body)
         return
 
     from gi.repository import Notify  # type: ignore[attr-defined]
@@ -83,11 +97,20 @@ def send_notification(
     if pixbuf is not None:
         notif.set_image_from_pixbuf(pixbuf)
 
-    if target is not None and target.device_id is not None:
+    if isinstance(target, AlarmNotificationTarget) or (
+        target is not None and target.device_id is not None
+    ):
         notif.add_action("view", "View", _on_view_action, target)
 
     notif.connect("closed", _on_notification_closed)
     _active_notifications.append(notif)
+    if isinstance(target, AlarmNotificationTarget):
+        _alarm_notifications.append((notif, target))
+        if len(_alarm_notifications) > 128:
+            old, _old_target = _alarm_notifications[0]
+            with suppress(Exception):
+                old.close()
+            _drop_notification(old)
     try:
         notif.show()
     except Exception as exc:
@@ -118,6 +141,64 @@ def _on_notification_closed(notification, *_) -> None:
 def _drop_notification(notification) -> None:
     with suppress(ValueError):
         _active_notifications.remove(notification)
+    _alarm_notifications[:] = [item for item in _alarm_notifications if item[0] is not notification]
+
+
+def withdraw_alarm_notifications(*, generation=None, location_id=None) -> None:
+    """GTK-thread cleanup; logout/revocation also removes already displayed text."""
+    for notification, target in tuple(_alarm_notifications):
+        if generation is not None and target.generation != generation:
+            continue
+        if location_id is not None and target.location_id != location_id:
+            continue
+        with suppress(Exception):
+            notification.close()
+        _drop_notification(notification)
+
+
+def alarm_event_enabled(event: AlarmEvent, cfg: dict) -> bool:
+    if not _notifications_enabled(cfg) or not cfg.get("notify_alarm", True):
+        return False
+    return event.category == "alarm" or (
+        event.category in {"mode", "sensor", "health"}
+        and bool(cfg.get(f"notify_alarm_{event.category}", False))
+    )
+
+
+def send_alarm_notification(event: AlarmEvent) -> None:
+    """Render a typed live observation; history never calls this function."""
+    from html import escape
+
+    cfg = _config.load()
+    if not alarm_event_enabled(event, cfg):
+        return
+    # Only explicitly opted-in detail includes household/device identifiers.
+    summary = "Ring Alarm alert" if event.critical else "Ring Alarm update"
+    detail = event.title
+    if event.detail:
+        detail += f": {event.detail}"
+    if cfg.get("alarm_notification_details", False):
+        names = " · ".join(name[:256] for name in (event.location_name, event.device_name) if name)
+        if names:
+            detail = f"{names}\n{detail}"
+        custom = cfg.get("custom_alarm_message", "")
+        if (
+            cfg.get("custom_notification_messages", False)
+            and isinstance(custom, str)
+            and custom.strip()
+        ):
+            detail += "\n" + custom.strip()[:512]
+    if event.critical:
+        detail += "\nUse the Ring app or keypad for critical response."
+    send_notification(
+        summary,
+        escape(detail[:2048]),
+        "security-high-symbolic",
+        target=AlarmNotificationTarget(
+            event.generation, event.location_id, event.asset_id, event.zid, time.time() + 3600
+        ),
+        urgency="critical" if event.critical else "normal",
+    )
 
 
 def _on_view_action(notification, action: str, target: _NotificationTarget) -> None:
@@ -153,6 +234,25 @@ def _open_notification_target_on_main(target: _NotificationTarget) -> bool:
     if win is None:
         return False
 
+    if isinstance(target, AlarmNotificationTarget):
+        from halo_gtk.ring_client import get_client
+
+        client = get_client()
+        snapshot = client.get_alarm_snapshot() if client is not None else None
+        valid = (
+            snapshot is not None
+            and snapshot.generation == target.generation
+            and time.time() < target.expires_at
+            and snapshot.find_location(target.location_id) is not None
+        )
+        if hasattr(win, "open_alarm_location"):
+            win.open_alarm_location(
+                target.location_id if valid else None,
+                asset_id=target.asset_id if valid else None,
+                zid=target.zid if valid else None,
+            )
+        return False
+
     if (
         time.time() < target.expires_at
         and hasattr(win, "open_camera_live")
@@ -186,6 +286,11 @@ def send_ring_notification(event) -> None:
     """Translate a ring-doorbell event into a desktop notification."""
     cfg = _config.load()
     kind = _event_kind(event)
+    # The pinned Python FCM parser does not establish an Alarm event schema.
+    # A prefix must not make arm/disarm/silenced messages critical, nor duplicate
+    # the dedicated normalized CLAP observation stream.
+    if _is_alarm_kind(kind):
+        return
     if not _notifications_enabled(cfg) or not _event_type_enabled(kind, cfg):
         return
     _enqueue_notification(event, cfg)
@@ -233,6 +338,8 @@ def _prepare_ring_notification(
 ) -> None:
     cfg = cfg or _config.load()
     kind = _event_kind(event)
+    if _is_alarm_kind(kind):
+        return
     if not _notifications_enabled(cfg) or not _event_type_enabled(kind, cfg):
         return
 

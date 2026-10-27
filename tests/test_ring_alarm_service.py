@@ -210,7 +210,10 @@ class _StreamingTransport:
         self.closed = True
         self.connected = False
 
-    async def request_inventory(self, asset_id, *, epoch):
+    async def request_inventory(self, asset_id, *, epoch, admission=None):
+        if admission is not None:
+            with admission():
+                pass
         self.inventory_requests.append((asset_id, epoch))
 
 

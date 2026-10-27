@@ -455,3 +455,22 @@ def test_timeout_unknown_has_a_dedicated_non_retry_path():
 
     assert returned == alarm_page_module.GLib.SOURCE_REMOVE
     assert calls == ["clear", "refresh", "unknown"]
+
+
+def test_mode_dialog_from_another_selected_location_cannot_submit():
+    location = _location()
+    client = _Client(_snapshot(location))
+    submitted = []
+    page = SimpleNamespace(
+        _alarm_client=client,
+        _view_active=True,
+        _selected_location_id="other",
+        _approval_ids={"home": "approved"},
+        _snapshot=_snapshot(location),
+        _add_toast=lambda *_args: None,
+        _submit_mode=lambda *args: submitted.append(args),
+    )
+    AlarmPage._on_mode_confirmed(
+        page, None, "confirm", client, "home", location.revision, AlarmMode.AWAY, "approved"
+    )
+    assert submitted == []

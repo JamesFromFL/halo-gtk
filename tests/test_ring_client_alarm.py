@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import logging
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -19,11 +21,9 @@ from halo_gtk.alarm.models import (
     AlarmServiceStatus,
     empty_alarm_snapshot,
 )
-from halo_gtk.alarm.provider import AlarmRequestError
 from halo_gtk.ring_client import (
     RingClient,
     _install_serialized_auth_refresh,
-    _RingAlarmRestGateway,
 )
 
 
@@ -204,103 +204,6 @@ async def test_installed_auth_deduplicates_staggered_401_refresh_and_persists_la
 
 
 @pytest.mark.asyncio
-async def test_alarm_gateway_uses_active_auth_and_returns_detached_mapping():
-    calls = []
-    payload = {"ticket": "redacted"}
-
-    class Response:
-        status_code = 200
-
-        @staticmethod
-        def json():
-            return payload
-
-    class FakeAuth:
-        async def async_query(self, url, **kwargs):
-            calls.append((url, kwargs))
-            return Response()
-
-    auth = FakeAuth()
-    gateway = _RingAlarmRestGateway(auth)
-
-    result = await gateway.request_json(
-        "https://example.invalid/alarm",
-        method="POST",
-        json={"request": "inventory"},
-        timeout=3,
-    )
-
-    assert result == payload
-    assert result is not payload
-    assert calls == [
-        (
-            "https://example.invalid/alarm",
-            {
-                "method": "POST",
-                "json": {"request": "inventory"},
-                "timeout": 3,
-                "raise_for_status": False,
-            },
-        )
-    ]
-
-
-@pytest.mark.asyncio
-async def test_alarm_gateway_replays_one_get_after_ring_auth_refreshes_401():
-    calls = []
-
-    class Response:
-        def __init__(self, status_code, payload):
-            self.status_code = status_code
-            self._payload = payload
-
-        def json(self):
-            return self._payload
-
-    responses = [Response(401, {}), Response(200, {"ticket": "fresh"})]
-
-    class FakeAuth:
-        @staticmethod
-        async def async_query(url, **kwargs):
-            calls.append((url, kwargs))
-            return responses.pop(0)
-
-    result = await _RingAlarmRestGateway(FakeAuth()).request_json("https://example.invalid/alarm")
-
-    assert result == {"ticket": "fresh"}
-    assert len(calls) == 2
-    assert calls[0] == calls[1]
-
-
-@pytest.mark.asyncio
-async def test_alarm_gateway_never_replays_non_get_after_401():
-    calls = []
-
-    class Response:
-        status_code = 401
-
-        @staticmethod
-        def json():
-            return {}
-
-    class FakeAuth:
-        @staticmethod
-        async def async_query(url, **kwargs):
-            calls.append((url, kwargs))
-            return Response()
-
-    with pytest.raises(AlarmRequestError) as exc_info:
-        await _RingAlarmRestGateway(FakeAuth()).request_json(
-            "https://example.invalid/alarm",
-            method="POST",
-            json={"command": "write"},
-        )
-
-    assert exc_info.value.code == "authentication-required"
-    assert len(calls) == 1
-
-
-@pytest.mark.asyncio
 async def test_alarm_location_discovery_keeps_only_bounded_names():
     calls = []
     payload = {
@@ -320,18 +223,39 @@ async def test_alarm_location_discovery_keeps_only_bounded_names():
         ]
     }
 
-    class Response:
-        status_code = 200
-
-        @staticmethod
-        def json():
-            return payload
-
     class FakeAuth:
-        @staticmethod
-        async def async_query(url, **kwargs):
-            calls.append((url, kwargs))
-            return Response()
+        user_agent = "fixture"
+        _halo_refresh_serialized = True
+        _halo_auth_request_scope = staticmethod(nullcontext)
+        get_hardware_id = staticmethod(lambda: "fixture")
+        _oauth_client = SimpleNamespace(
+            add_token=lambda url, **kwargs: (url, kwargs["headers"], None)
+        )
+
+        class _session:
+            @staticmethod
+            async def request(method, url, **kwargs):
+                calls.append((str(url), kwargs))
+                data = json.dumps(payload).encode()
+
+                class Response:
+                    status = 200
+                    headers = {}
+
+                    async def __aenter__(self):
+                        return self
+
+                    async def __aexit__(self, *_args):
+                        return None
+
+                    async def read(self, size):
+                        nonlocal data
+                        result, data = data[:size], data[size:]
+                        return result
+
+                response = Response()
+                response.content = response
+                return response
 
     client = RingClient()
     client._ring = SimpleNamespace(
@@ -366,10 +290,22 @@ async def test_alarm_location_discovery_keeps_only_bounded_names():
 
 @pytest.mark.asyncio
 async def test_alarm_location_discovery_falls_back_without_logging_response_details(caplog):
+    calls = []
+
     class FakeAuth:
-        @staticmethod
-        async def async_query(*_args, **_kwargs):
-            raise RuntimeError("private response detail")
+        user_agent = "fixture"
+        _halo_refresh_serialized = True
+        _halo_auth_request_scope = staticmethod(nullcontext)
+        get_hardware_id = staticmethod(lambda: "fixture")
+        _oauth_client = SimpleNamespace(
+            add_token=lambda url, **kwargs: (url, kwargs["headers"], None)
+        )
+
+        class _session:
+            @staticmethod
+            async def request(*_args, **_kwargs):
+                calls.append(True)
+                raise RuntimeError("private response detail")
 
     client = RingClient()
     client._ring = SimpleNamespace(
@@ -388,80 +324,8 @@ async def test_alarm_location_discovery_falls_back_without_logging_response_deta
     seeds = await client._async_alarm_location_seeds()
 
     assert [(seed.location_id, seed.name) for seed in seeds] == [("home", "Fallback Home")]
+    assert calls == [True]
     assert "private response detail" not in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_alarm_gateway_rejects_non_object_json():
-    class Response:
-        status_code = 200
-
-        @staticmethod
-        def json():
-            return []
-
-    class FakeAuth:
-        @staticmethod
-        async def async_query(*_args, **_kwargs):
-            return Response()
-
-    with pytest.raises(AlarmRequestError) as exc_info:
-        await _RingAlarmRestGateway(FakeAuth()).request_json("https://example.invalid/alarm")
-    assert exc_info.value.code == "invalid-response"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("status_code", "expected_code", "expected_retry_after"),
-    [
-        (401, "authentication-required", None),
-        (429, "rate-limited", 60.0),
-        (503, "request-failed", None),
-    ],
-)
-async def test_alarm_gateway_classifies_http_failures(
-    status_code,
-    expected_code,
-    expected_retry_after,
-):
-    class Response:
-        @staticmethod
-        def json():
-            return {}
-
-    Response.status_code = status_code
-
-    class FakeAuth:
-        @staticmethod
-        async def async_query(*_args, **_kwargs):
-            return Response()
-
-    with pytest.raises(AlarmRequestError) as exc_info:
-        await _RingAlarmRestGateway(FakeAuth()).request_json("https://example.invalid/alarm")
-    assert exc_info.value.code == expected_code
-    assert exc_info.value.retry_after == expected_retry_after
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("error", "expected_code"),
-    [
-        (AuthenticationError("secret detail"), "authentication-required"),
-        (RuntimeError("secret detail"), "request-failed"),
-    ],
-)
-async def test_alarm_gateway_sanitizes_query_failures(error, expected_code):
-    class FakeAuth:
-        @staticmethod
-        async def async_query(*_args, **_kwargs):
-            raise error
-
-    with pytest.raises(AlarmRequestError) as exc_info:
-        await _RingAlarmRestGateway(FakeAuth()).request_json("https://example.invalid/alarm")
-
-    assert exc_info.value.code == expected_code
-    assert str(exc_info.value) == expected_code
-    assert "secret detail" not in str(exc_info.value)
 
 
 class _PendingFuture(concurrent.futures.Future):

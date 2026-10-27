@@ -23,6 +23,10 @@ _DEFAULTS: dict[str, Any] = {
     "notify_doorbell": True,
     "notify_motion": True,
     "notify_alarm": True,
+    "notify_alarm_mode": False,
+    "notify_alarm_sensor": False,
+    "notify_alarm_health": False,
+    "alarm_notification_details": False,
     "notification_preview_images": True,
     "notification_summaries": True,
     "custom_notification_messages": False,
@@ -190,6 +194,13 @@ def _normalise_config(config: dict[str, Any]) -> dict[str, Any]:
     data["notify_doorbell"] = _coerce_bool(data["notify_doorbell"], _DEFAULTS["notify_doorbell"])
     data["notify_motion"] = _coerce_bool(data["notify_motion"], _DEFAULTS["notify_motion"])
     data["notify_alarm"] = _coerce_bool(data["notify_alarm"], _DEFAULTS["notify_alarm"])
+    for key in (
+        "notify_alarm_mode",
+        "notify_alarm_sensor",
+        "notify_alarm_health",
+        "alarm_notification_details",
+    ):
+        data[key] = _coerce_bool(data[key], _DEFAULTS[key])
     data["notification_preview_images"] = _coerce_bool(
         data["notification_preview_images"], _DEFAULTS["notification_preview_images"]
     )

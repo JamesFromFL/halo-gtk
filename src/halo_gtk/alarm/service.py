@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import random
+import secrets
 import time
 from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
@@ -19,10 +20,13 @@ from halo_gtk.alarm.models import (
     AlarmInventoryStatus,
     AlarmLocationSnapshot,
     AlarmMode,
+    AlarmOperationSnapshot,
+    AlarmOperationStatus,
     AlarmPhase,
     AlarmServiceStatus,
     AlarmWriteAuthorization,
     TriState,
+    alarm_monotonic_time,
     empty_alarm_snapshot,
 )
 from halo_gtk.alarm.policy import asset_reason, authorization_reason, panel_reason
@@ -38,6 +42,9 @@ from halo_gtk.alarm.provider import (
     AlarmCommandStatus,
     AlarmCommandSupersededError,
     AlarmLocationSeed,
+    AlarmModePreparation,
+    AlarmRefreshResult,
+    AlarmRefreshStatus,
     AlarmRestGateway,
 )
 from halo_gtk.alarm.store import AlarmStateBoundsError, AlarmStateStore
@@ -60,6 +67,25 @@ class _LocationRuntime:
     sync_task: asyncio.Task[None] | None = None
     stable_task: asyncio.Task[None] | None = None
     connected_at: float | None = None
+    maintenance_task: asyncio.Task[None] | None = None
+
+
+@dataclass(slots=True)
+class _InventoryWaiter:
+    future: asyncio.Future[None]
+    baseline: int = 0
+    armed: bool = False
+
+
+@dataclass(slots=True)
+class _ModeApproval:
+    token: str
+    epoch: int
+    revision: int
+    panel_asset_id: str
+    panel_zid: str
+    issued_at: float
+    target: AlarmMode | None = None
 
 
 @dataclass(slots=True)
@@ -79,6 +105,11 @@ class _CommandConnectionLost(RuntimeError):
 
 class _CommandRevisionChanged(AlarmCommandSupersededError):
     pass
+
+
+class _CommandAdmissionRejected(AlarmCommandSupersededError):
+    def __init__(self, code: str) -> None:
+        self.code = code
 
 
 class RingAlarmService:
@@ -101,6 +132,13 @@ class RingAlarmService:
         jitter: Callable[[float], float] | None = None,
         poll_interval: float = 0.1,
         wall_clock: Callable[[], float] = time.time,
+        monotonic_clock: Callable[[], float] = alarm_monotonic_time,
+        refresh_timeout: float = 15.0,
+        manual_refresh_cooldown: float = 5.0,
+        health_refresh_interval: float = 300.0,
+        initial_sync_retries: int = 2,
+        approval_lifetime: float = 60.0,
+        inventory_max_age: float = 30.0,
         command_admission: Callable[[], AbstractContextManager[None]] | None = None,
     ) -> None:
         if reconnect_min < 0 or reconnect_max < reconnect_min:
@@ -114,6 +152,15 @@ class RingAlarmService:
             raise ValueError("service timeouts are invalid")
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
+        if (
+            refresh_timeout <= 0
+            or manual_refresh_cooldown < 0
+            or health_refresh_interval <= 0
+            or initial_sync_retries < 0
+            or approval_lifetime <= 0
+            or inventory_max_age <= 0
+        ):
+            raise ValueError("refresh and approval bounds are invalid")
         self._request = request
         self._on_snapshot = on_snapshot
         self._generation = generation
@@ -127,12 +174,29 @@ class RingAlarmService:
         self._jitter = jitter or _default_jitter
         self._poll_interval = poll_interval
         self._wall_clock = wall_clock
+        self._monotonic_clock = monotonic_clock
+        self._refresh_timeout = refresh_timeout
+        self._manual_refresh_cooldown = manual_refresh_cooldown
+        self._health_refresh_interval = health_refresh_interval
+        self._initial_sync_retries = initial_sync_retries
+        self._approval_lifetime = approval_lifetime
+        self._inventory_max_age = inventory_max_age
         self._command_admission = command_admission or contextlib.nullcontext
-        self._store = AlarmStateStore(generation=generation)
+        self._store = AlarmStateStore(
+            generation=generation, clock=wall_clock, monotonic_clock=monotonic_clock
+        )
         self._seeds = _index_seeds(locations)
         self._runtimes: dict[str, _LocationRuntime] = {}
         self._mode_locks: dict[str, asyncio.Lock] = {}
         self._pending: dict[str, _PendingCommand] = {}
+        self._refresh_tasks: dict[str, asyncio.Task[AlarmRefreshResult]] = {}
+        self._refresh_started: dict[str, float] = {}
+        self._inventory_waiters: dict[tuple[str, str, int], _InventoryWaiter] = {}
+        self._approvals: dict[str, _ModeApproval] = {}
+        self._active_modes: set[str] = set()
+        self._operations: dict[str, AlarmOperationSnapshot] = {}
+        self._operation_counter = 0
+        self._uncertain_inventory: dict[str, tuple[str, int, int]] = {}
         self._last_emitted = empty_alarm_snapshot(generation)
         self._change_event = asyncio.Event()
         self._stop_event: Any | None = None
@@ -189,8 +253,16 @@ class RingAlarmService:
         self._pending.clear()
 
         tasks: list[asyncio.Task[Any]] = []
+        self._approvals.clear()
+        for refresh in self._refresh_tasks.values():
+            refresh.cancel()
+            tasks.append(refresh)
+        self._refresh_tasks.clear()
         transports: list[RingAlarmTransport] = []
         for runtime in self._runtimes.values():
+            if runtime.maintenance_task is not None:
+                runtime.maintenance_task.cancel()
+                tasks.append(runtime.maintenance_task)
             if runtime.sync_task is not None:
                 runtime.sync_task.cancel()
                 tasks.append(runtime.sync_task)
@@ -228,6 +300,10 @@ class RingAlarmService:
                 remover(location_id)
             self._fail_pending(location_id)
             self._mode_locks.pop(location_id, None)
+            self._approvals.pop(location_id, None)
+            self._operations.pop(location_id, None)
+            self._uncertain_inventory.pop(location_id, None)
+            self._refresh_started.pop(location_id, None)
 
         self._seeds = updated
         for seed in updated.values():
@@ -261,6 +337,186 @@ class RingAlarmService:
             return
         self._reconcile_revision += 1
 
+    async def refresh(
+        self, location_id: str | None = None, *, force: bool = False
+    ) -> AlarmRefreshResult:
+        """Join one bounded inventory reread per location, without replaying writes."""
+        ids = (location_id,) if location_id is not None else tuple(self._seeds)
+        if self._closed or not ids or any(item not in self._seeds for item in ids):
+            return AlarmRefreshResult(AlarmRefreshStatus.UNAVAILABLE, code="location-unavailable")
+        tasks = []
+        results = []
+        for item in ids:
+            task = self._refresh_tasks.get(item)
+            if task is None or task.done():
+                now = self._monotonic_clock()
+                last = self._refresh_started.get(item)
+                if not force and last is not None and now - last < self._manual_refresh_cooldown:
+                    results.append(
+                        AlarmRefreshResult(AlarmRefreshStatus.COOLDOWN, (item,), "cooldown")
+                    )
+                    continue
+                self._refresh_started[item] = now
+                task = asyncio.create_task(self._refresh_location(item), name="ring-alarm-refresh")
+                self._refresh_tasks[item] = task
+            tasks.append(asyncio.shield(task))
+        if tasks:
+            results.extend(await asyncio.gather(*tasks))
+        statuses = {result.status for result in results}
+        if len(statuses) == 1:
+            status = results[0].status
+        elif AlarmRefreshStatus.REFRESHED in statuses or AlarmRefreshStatus.INCOMPLETE in statuses:
+            status = AlarmRefreshStatus.INCOMPLETE
+        elif AlarmRefreshStatus.TIMED_OUT in statuses:
+            status = AlarmRefreshStatus.TIMED_OUT
+        else:
+            status = AlarmRefreshStatus.UNAVAILABLE
+        code = results[0].code if len(results) == 1 else None
+        return AlarmRefreshResult(status, ids, code)
+
+    async def _refresh_location(self, location_id: str) -> AlarmRefreshResult:
+        runtime = self._runtimes.get(location_id)
+        if runtime is None:
+            return AlarmRefreshResult(
+                AlarmRefreshStatus.UNAVAILABLE, (location_id,), "connection-unavailable"
+            )
+        self._reconcile_revision += 1
+        waiters: list[tuple[tuple[str, str, int], _InventoryWaiter]] = []
+        try:
+            async with asyncio.timeout(self._refresh_timeout):
+                while not runtime.transport.connected:
+                    if self._closed or self._runtimes.get(location_id) is not runtime:
+                        return AlarmRefreshResult(
+                            AlarmRefreshStatus.UNAVAILABLE, (location_id,), "connection-unavailable"
+                        )
+                    await asyncio.sleep(self._poll_interval)
+                epoch = runtime.epoch
+                assets = runtime.transport.assets
+                if not assets:
+                    return AlarmRefreshResult(
+                        AlarmRefreshStatus.INCOMPLETE, (location_id,), "inventory-incomplete"
+                    )
+                for asset in assets:
+                    key = (location_id, asset.asset_id, epoch)
+                    waiter = _InventoryWaiter(asyncio.get_running_loop().create_future())
+                    self._inventory_waiters[key] = waiter
+                    waiters.append((key, waiter))
+
+                    @contextlib.contextmanager
+                    def admit_inventory(asset_id=asset.asset_id, waiter=waiter):
+                        if (
+                            self._closed
+                            or self._runtimes.get(location_id) is not runtime
+                            or runtime.epoch != epoch
+                            or not runtime.transport.connected
+                        ):
+                            raise AlarmCommandSupersededError
+                        current = self._store.snapshot.find_location(location_id)
+                        current_asset = current.find_asset(asset_id) if current else None
+                        if current_asset is None:
+                            raise AlarmCommandSupersededError
+                        waiter.baseline = current_asset.inventory_revision
+                        waiter.armed = True
+                        yield
+
+                    await runtime.transport.request_inventory(
+                        asset.asset_id, epoch=epoch, admission=admit_inventory
+                    )
+                await asyncio.gather(*(waiter.future for _, waiter in waiters))
+                return AlarmRefreshResult(AlarmRefreshStatus.REFRESHED, (location_id,))
+        except TimeoutError:
+            location = self.snapshot.find_location(location_id)
+            status = (
+                AlarmRefreshStatus.INCOMPLETE
+                if location is not None
+                and any(
+                    waiter.future.done()
+                    and not waiter.future.cancelled()
+                    and waiter.future.exception() is None
+                    for _, waiter in waiters
+                )
+                else AlarmRefreshStatus.TIMED_OUT
+            )
+            return AlarmRefreshResult(status, (location_id,), "refresh-timeout")
+        except (AlarmTransportError, AlarmCommandSupersededError):
+            return AlarmRefreshResult(
+                AlarmRefreshStatus.UNAVAILABLE, (location_id,), "connection-unavailable"
+            )
+        finally:
+            for key, waiter in waiters:
+                if self._inventory_waiters.get(key) is waiter:
+                    self._inventory_waiters.pop(key, None)
+                if not waiter.future.done():
+                    waiter.future.cancel()
+
+    def _complete_inventory_waiter(self, runtime: _LocationRuntime, message: ClapMessage) -> None:
+        if not isinstance(message, DeviceInfoDocList):
+            return
+        key = (runtime.seed.location_id, message.asset_id, runtime.epoch)
+        waiter = self._inventory_waiters.get(key)
+        location = self._store.snapshot.find_location(runtime.seed.location_id)
+        asset = location.find_asset(message.asset_id) if location is not None else None
+        if (
+            waiter is not None
+            and waiter.armed
+            and not waiter.future.done()
+            and asset is not None
+            and asset.epoch == runtime.epoch
+            and asset.inventory_revision > waiter.baseline
+            and not asset.stale
+            and asset.inventory is AlarmInventoryStatus.COMPLETE
+        ):
+            waiter.future.set_result(None)
+
+    def _fresh_inventory(self, location: AlarmLocationSnapshot) -> bool:
+        panel = location.security_panel
+        asset = location.find_asset(panel.asset_id) if panel is not None else None
+        return bool(
+            asset is not None
+            and not asset.stale
+            and asset.inventory_monotonic is not None
+            and 0 <= self._monotonic_clock() - asset.inventory_monotonic <= self._inventory_max_age
+        )
+
+    async def prepare_mode(self, location_id: str) -> AlarmModePreparation:
+        """Read-only preflight; issue one bounded approval token for a dialog."""
+        if location_id in self._active_modes:
+            return AlarmModePreparation(code="busy")
+        location = self.snapshot.find_location(location_id)
+        if location is None or self._closed:
+            return AlarmModePreparation(code="location-unavailable")
+        if not self._fresh_inventory(location) or location_id in self._uncertain_inventory:
+            refreshed = await self.refresh(location_id, force=True)
+            location = self.snapshot.find_location(location_id)
+            # A missing optional bridge must not override a newly authoritative
+            # panel response. Mode admission still checks the unique panel asset.
+            if refreshed.status is not AlarmRefreshStatus.REFRESHED and (
+                location is None or not self._fresh_inventory(location)
+            ):
+                return AlarmModePreparation(code=refreshed.code or "inventory-incomplete")
+        if location_id in self._active_modes:
+            return AlarmModePreparation(code="busy")
+        if location is None or not location.can_set_mode or not self._fresh_inventory(location):
+            return AlarmModePreparation(
+                location=location,
+                code=location.command_unavailable_reason if location else "location-unavailable",
+            )
+        panel = location.security_panel
+        assert panel is not None
+        uncertain_error = self._uncertain_error(location)
+        if uncertain_error is not None:
+            return AlarmModePreparation(location=location, code=uncertain_error)
+        token = secrets.token_urlsafe(24)
+        self._approvals[location_id] = _ModeApproval(
+            token,
+            location.epoch,
+            location.revision,
+            panel.asset_id,
+            panel.zid,
+            self._monotonic_clock(),
+        )
+        return AlarmModePreparation(location, token)
+
     async def request_mode(
         self,
         location_id: str,
@@ -268,6 +524,7 @@ class RingAlarmService:
         *,
         bypass_zids: Iterable[str] = (),
         expected_revision: int | None = None,
+        approval_id: str | None = None,
     ) -> AlarmCommandResult:
         """Send one revision-checked command and confirm it from panel state."""
 
@@ -278,14 +535,64 @@ class RingAlarmService:
                 AlarmMode.UNKNOWN,
                 code="invalid-mode",
             )
-        lock = self._mode_locks.setdefault(location_id, asyncio.Lock())
-        async with lock:
-            return await self._request_mode_locked(
+        if self._closed or location_id not in self._seeds:
+            return self._command_result(
+                AlarmCommandStatus.UNAVAILABLE, location_id, mode, code="location-unavailable"
+            )
+        if location_id in self._active_modes:
+            return self._command_result(AlarmCommandStatus.BUSY, location_id, mode, code="busy")
+        # No await between admission and ownership: callers cannot accumulate
+        # unbounded lock waiters while a mode's outcome is pending.
+        self._active_modes.add(location_id)
+        self._operation_counter += 1
+        operation_id = self._operation_counter
+        self._operations[location_id] = AlarmOperationSnapshot(
+            operation_id, mode, AlarmOperationStatus.PREPARING
+        )
+        self._publish()
+        try:
+            result = await self._request_mode_locked(
                 location_id,
                 mode,
                 bypass_zids,
                 expected_revision,
+                approval_id,
             )
+            status = (
+                AlarmOperationStatus.REPORTED_TARGET
+                if result.confirmed
+                else AlarmOperationStatus.OUTCOME_UNKNOWN
+                if result.status is AlarmCommandStatus.TIMEOUT_UNKNOWN
+                else AlarmOperationStatus.REJECTED
+            )
+            if location_id in self._runtimes:
+                self._operations[location_id] = AlarmOperationSnapshot(
+                    operation_id, mode, status, result.code
+                )
+            if result.status is AlarmCommandStatus.TIMEOUT_UNKNOWN:
+                self._remember_uncertain(location_id)
+            if result.status is not AlarmCommandStatus.NEEDS_BYPASS:
+                self._approvals.pop(location_id, None)
+            return result
+        except asyncio.CancelledError:
+            if location_id in self._runtimes:
+                self._operations[location_id] = AlarmOperationSnapshot(
+                    operation_id, mode, AlarmOperationStatus.OUTCOME_UNKNOWN, "command-cancelled"
+                )
+                self._remember_uncertain(location_id)
+            self._approvals.pop(location_id, None)
+            raise
+        except Exception:
+            if location_id in self._runtimes:
+                self._operations[location_id] = AlarmOperationSnapshot(
+                    operation_id, mode, AlarmOperationStatus.OUTCOME_UNKNOWN, "command-failed"
+                )
+                self._remember_uncertain(location_id)
+            self._approvals.pop(location_id, None)
+            raise
+        finally:
+            self._active_modes.discard(location_id)
+            self._publish()
 
     async def set_mode(
         self,
@@ -303,6 +610,67 @@ class RingAlarmService:
             expected_revision=expected_revision,
         )
 
+    def _approval_error(
+        self, location: AlarmLocationSnapshot, target: AlarmMode, approval_id: str | None
+    ) -> str | None:
+        if not self._fresh_inventory(location):
+            return "state-too-old"
+        uncertain_error = self._uncertain_error(location)
+        if uncertain_error is not None:
+            return uncertain_error
+        panel = location.security_panel
+        assert panel is not None
+        if approval_id is None:
+            # Compatibility for immediate provider callers. GTK uses a prepared
+            # token so time spent in confirmation/bypass dialogs is bounded.
+            return None
+        approval = self._approvals.get(location.location_id)
+        if (
+            approval is None
+            or approval.token != approval_id
+            or not 0 <= self._monotonic_clock() - approval.issued_at <= self._approval_lifetime
+        ):
+            return "approval-expired"
+        if (
+            approval.epoch != location.epoch
+            or approval.revision != location.revision
+            or approval.panel_asset_id != panel.asset_id
+            or approval.panel_zid != panel.zid
+        ):
+            return "approval-stale"
+        if approval.target is not None and approval.target is not target:
+            return "approval-stale"
+        approval.target = target
+        return None
+
+    def _remember_uncertain(self, location_id: str) -> None:
+        current = self._store.snapshot.find_location(location_id)
+        panel = current.security_panel if current else None
+        asset = current.find_asset(panel.asset_id) if panel else None
+        if asset is not None:
+            self._uncertain_inventory[location_id] = (
+                asset.asset_id,
+                asset.epoch,
+                asset.inventory_revision,
+            )
+
+    def _uncertain_error(self, location: AlarmLocationSnapshot) -> str | None:
+        panel = location.security_panel
+        asset = location.find_asset(panel.asset_id) if panel else None
+        if asset is None:
+            return "panel-unavailable"
+        uncertain = self._uncertain_inventory.get(location.location_id)
+        if uncertain is not None:
+            old_asset, old_epoch, old_revision = uncertain
+            if (
+                asset.asset_id == old_asset
+                and asset.epoch == old_epoch
+                and asset.inventory_revision <= old_revision
+            ):
+                return "fresh-inventory-required"
+            self._uncertain_inventory.pop(location.location_id, None)
+        return None
+
     def _start_runtime(self, seed: AlarmLocationSeed) -> None:
         if self._closed or seed.location_id in self._runtimes:
             return
@@ -317,8 +685,22 @@ class RingAlarmService:
             self._supervise_location(runtime),
             name="ring-alarm-location",
         )
+        runtime.maintenance_task = asyncio.create_task(
+            self._maintain_location(runtime), name="ring-alarm-health-refresh"
+        )
+
+    async def _maintain_location(self, runtime: _LocationRuntime) -> None:
+        while not self._should_stop() and self._runtimes.get(runtime.seed.location_id) is runtime:
+            await asyncio.sleep(self._health_refresh_interval)
+            if not self._should_stop():
+                await self.refresh(runtime.seed.location_id, force=True)
 
     async def _stop_runtime(self, runtime: _LocationRuntime) -> None:
+        if runtime.maintenance_task is not None:
+            runtime.maintenance_task.cancel()
+        refresh = self._refresh_tasks.pop(runtime.seed.location_id, None)
+        if refresh is not None:
+            refresh.cancel()
         if runtime.sync_task is not None:
             runtime.sync_task.cancel()
         if runtime.stable_task is not None:
@@ -326,7 +708,13 @@ class RingAlarmService:
         if runtime.task is not None:
             runtime.task.cancel()
         await runtime.transport.close()
-        for task in (runtime.sync_task, runtime.stable_task, runtime.task):
+        for task in (
+            runtime.sync_task,
+            runtime.stable_task,
+            runtime.task,
+            runtime.maintenance_task,
+            refresh,
+        ):
             if task is not None:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
@@ -412,6 +800,10 @@ class RingAlarmService:
             SessionInfo(sessions=sessions),
             runtime.epoch,
         )
+        for asset in assets:
+            self._store.record_ticket_power(
+                runtime.seed.location_id, asset.asset_id, runtime.epoch, asset.on_battery
+            )
         runtime.phase = "syncing"
         runtime.connected_at = asyncio.get_running_loop().time()
         if runtime.sync_task is not None:
@@ -444,6 +836,7 @@ class RingAlarmService:
             self._store.apply_message(runtime.seed.location_id, message, runtime.epoch)
         except AlarmStateBoundsError:
             raise AlarmTransportError("retained-state-limit") from None
+        self._complete_inventory_waiter(runtime, message)
         if isinstance(message, SessionInfo):
             for session in message.sessions:
                 previous_asset = (
@@ -514,6 +907,13 @@ class RingAlarmService:
         if runtime.epoch == epoch and runtime.phase == "syncing" and not self._should_stop():
             runtime.phase = "degraded"
             self._publish()
+            for _attempt in range(self._initial_sync_retries):
+                if runtime.epoch != epoch or self._should_stop():
+                    return
+                result = await self.refresh(runtime.seed.location_id, force=True)
+                if result.status is AlarmRefreshStatus.REFRESHED:
+                    return
+                await asyncio.sleep(self._initial_sync_timeout)
 
     async def _mark_connection_stable(
         self,
@@ -563,6 +963,7 @@ class RingAlarmService:
         target: AlarmMode,
         bypass_ids: Iterable[str],
         expected_revision: int | None,
+        approval_id: str | None = None,
     ) -> AlarmCommandResult:
         location = self.snapshot.find_location(location_id)
         runtime = self._runtimes.get(location_id)
@@ -593,6 +994,11 @@ class RingAlarmService:
                 target,
                 confirmed_mode=location.mode,
                 code=location.command_unavailable_reason or "panel-unavailable",
+            )
+        approval_error = self._approval_error(location, target, approval_id)
+        if approval_error is not None:
+            return self._command_result(
+                AlarmCommandStatus.UNAVAILABLE, location_id, target, code=approval_error
             )
         if target is not AlarmMode.DISARMED and location.phase in {
             AlarmPhase.ENTRY_DELAY,
@@ -662,6 +1068,13 @@ class RingAlarmService:
                 # A session update can be awaiting an inventory request before
                 # its UI snapshot is published. Admission uses the live store.
                 current = self._store.snapshot.find_location(location_id)
+                approval_error = (
+                    self._approval_error(current, target, approval_id)
+                    if current
+                    else "location-unavailable"
+                )
+                if approval_error is not None:
+                    raise _CommandAdmissionRejected(approval_error)
                 if (
                     self._closed
                     or self._runtimes.get(location_id) is not runtime
@@ -671,6 +1084,12 @@ class RingAlarmService:
                 ):
                     raise _CommandRevisionChanged
                 pending.armed = True
+                operation = self._operations.get(location_id)
+                if operation is not None:
+                    self._operations[location_id] = replace(
+                        operation, status=AlarmOperationStatus.WAITING
+                    )
+                    self._publish()
                 yield
 
         try:
@@ -682,6 +1101,10 @@ class RingAlarmService:
                     epoch=runtime.epoch,
                     bypass_ids=requested_bypass,
                     admission=admit_send,
+                )
+            except _CommandAdmissionRejected as exc:
+                return self._command_result(
+                    AlarmCommandStatus.UNAVAILABLE, location_id, target, code=exc.code
                 )
             except _CommandRevisionChanged:
                 current = self.snapshot.find_location(location_id)
@@ -957,6 +1380,7 @@ class RingAlarmService:
             location,
             can_set_mode=reason is None,
             command_unavailable_reason=reason,
+            operation=self._operations.get(location.location_id),
         )
 
     def _derive_status(self) -> AlarmServiceStatus:

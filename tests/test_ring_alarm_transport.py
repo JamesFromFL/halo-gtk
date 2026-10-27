@@ -235,6 +235,9 @@ async def test_transport_uses_authenticated_ticket_and_owned_wss_session():
     await transport.close()
 
     ticket_url, ticket_kwargs = gateway.calls[0]
+    assert urlsplit(ticket_url).scheme == "https"
+    assert urlsplit(ticket_url).hostname == "prd-api-us.prd.rings.solutions"
+    assert urlsplit(ticket_url).path == "/api/v1/clap/tickets"
     assert parse_qs(urlsplit(ticket_url).query) == {
         "locationID": ["location/one"],
         "enableExtendedEmergencyCellUsage": ["true"],
@@ -301,7 +304,8 @@ async def test_transport_gets_fresh_ticket_and_keeps_sequence_monotonic():
 
 
 @pytest.mark.asyncio
-async def test_mode_admission_runs_after_send_lock_and_rejection_preserves_socket():
+@pytest.mark.parametrize("operation", ["mode", "inventory"])
+async def test_mode_admission_runs_after_send_lock_and_rejection_preserves_socket(operation):
     websocket = _WebSocket()
     transport = RingAlarmTransport(_Gateway(), AlarmLocationSeed("location-1"))
     transport._websocket = websocket
@@ -315,15 +319,17 @@ async def test_mode_admission_runs_after_send_lock_and_rejection_preserves_socke
         yield
 
     await transport._send_lock.acquire()
-    command = asyncio.create_task(
-        transport.send_mode(
+    if operation == "mode":
+        request = transport.send_mode(
             "asset-1",
             "panel-1",
             AlarmMode.AWAY,
             epoch=1,
             admission=reject_replaced_client,
         )
-    )
+    else:
+        request = transport.request_inventory("asset-1", epoch=1, admission=reject_replaced_client)
+    command = asyncio.create_task(request)
     await asyncio.sleep(0)
     assert entered == []
     transport._send_lock.release()
@@ -530,3 +536,16 @@ async def test_transport_bounds_invalid_frames_and_never_reports_raw_data():
     assert raised.value.code == "invalid-frame-limit"
     assert raw_secret not in str(raised.value)
     await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_default_wss_session_has_no_auth_cookies_or_proxy_environment():
+    session = RingAlarmTransport._new_session()
+    try:
+        assert isinstance(session.cookie_jar, aiohttp.DummyCookieJar)
+        assert not session.headers and session._default_auth is None
+        assert session.trust_env is False
+        session.cookie_jar.update_cookies({"private": "must-not-be-forwarded"})
+        assert not session.cookie_jar.filter_cookies("https://alarm.example.test")
+    finally:
+        await session.close()

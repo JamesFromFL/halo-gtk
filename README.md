@@ -254,29 +254,42 @@ Screenshot and recording folders can be changed in Settings.
 
 ## Experimental Ring Alarm
 
-Halo's Alarm page is connected to an **experimental** Ring Alarm backend that
-shares the same authenticated Ring session as the camera experience. Switch
-between reported Alarm locations, see the current mode, transition phase,
-connection, and inventory status, and review Entry, Motion, Safety, and System
-devices with their reported state and health details.
+Halo's native Alarm backend shares its authenticated Ring session with cameras.
+The Alarm page shows reported modes, transition state, sensor supervision and
+health, with location selection and a real inventory refresh. Offline sensor
+values remain last-known even while the hub is online. Reported hub battery
+power and siren state are read-only.
 
-Disarmed, Home, and Away controls are available only when Halo has a current,
-writable Alarm snapshot. Every mode request requires confirmation, faulted
-sensors require a separate explicit bypass review, and Halo waits for Ring to
-confirm the result instead of assuming a change succeeded.
+Disarmed, Home and Away requests require fresh inventory and discovery evidence,
+a time-limited confirmation, and a separate review of any supported faulted
+sensors to bypass. Halo sends a request once and waits for an explicit panel
+update. It shows an uncertain outcome when confirmation is lost; navigating away
+does not cancel a request that may have reached Ring. Pending and terminal
+outcomes are retained by the service while the application runs.
 
-This integration uses undocumented Ring CLAP interfaces and has been validated
-only with bounded synthetic fixtures. It has **not** been validated against live
-Alarm hardware, so treat the page as a preview rather than a primary control
-surface.
+Event History now has a separate **experimental Alarm cloud history** view.
+It uses a bounded session cache and labels unsupported fields and uncertain
+coverage. It does not provide a guaranteed complete archive, persist an Alarm
+journal, or treat historical events as current state. Unique server event IDs,
+account-specific schemas, pagination and live history coverage remain unverified.
 
-Halo is not an emergency-monitoring service. The Alarm page does not provide
-panic, dispatch, Alarm siren, lock, switch, schedule, or device-configuration
-controls, and it does not replace Ring's emergency or life-safety workflows.
-Keep the official Ring app or keypad available for setup, verification, mode
-control, and critical security response. Halo's protocol behavior was
-independently implemented against a pinned
-[`ring-client-api` reference](https://github.com/koush/ring/tree/516e96a24ec279168c246795e623b6bfdf58ec45/packages/ring-client-api).
+Recognized current Alarm signals can produce desktop alerts. Routine mode,
+sensor and health notifications are opt-in. Alarm notification details are off
+by default; enabling them can expose location/device names on a lock screen.
+These are observations while Halo is running, with gaps during outages—not a
+replacement for Ring's monitoring or emergency notifications.
+
+The integration uses undocumented Ring CLAP interfaces, with contracts checked
+against the maintained [`ring-client-api` reference](https://github.com/dgreif/ring/tree/3bcc624acc35b6f97c391089a12bff582bb6ed4a/packages/ring-client-api).
+It has **not** been validated against live Alarm hardware. Unknown authorization,
+active alarm/life-safety conditions, cellular backup and incomplete status remain
+read-only. Current shared-role permissions are not guessed from camera access.
+
+Halo is not an emergency-monitoring service. Panic/dispatch, Alarm siren,
+lock/switch/valve controls, schedules, access codes and device configuration
+remain outside this scope. Keep the official Ring app or keypad available for
+setup, mode control and critical response. See [Alarm implementation notes](doc/alarm-implementation-2026-10-26.md)
+for architecture, bounds and the live validation checklist.
 
 ## Current status
 
@@ -290,7 +303,7 @@ available for setup, account management, and critical security workflows.
 ### Planned work
 
 - Expand support for non-camera Ring devices.
-- Add Alarm and sensor event history; current Alarm support shows live status and mode controls.
+- Validate and expand experimental Alarm history, notifications and controls against live hardware.
 - Add broader Linux packaging, including AUR and Flatpak options.
 - Build a dedicated browser for locally saved Favorites and media.
 - Add more advanced per-device notification behavior.

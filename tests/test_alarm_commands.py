@@ -174,7 +174,9 @@ class _CommandTransport:
             # Deliver before send_mode returns. The waiter must already exist.
             await self.on_message(DeviceInfoDocUpdate("asset-1", (_panel(raw_mode),)))
 
-    async def request_inventory(self, asset_id, *, epoch):
+    async def request_inventory(self, asset_id, *, epoch, admission=None):
+        with admission() if admission is not None else nullcontext():
+            pass
         self.inventory_requests.append((asset_id, epoch))
         if self.send_behavior == "reconcile-unrelated":
             await self.on_message(DeviceInfoDocUpdate("asset-1", (_contact(faulted=True),)))
@@ -918,3 +920,174 @@ async def test_cancellation_during_blocked_send_removes_pending_waiter():
     assert service._pending == {}
     assert len(transport.send_calls) == 1
     await _stop(stop, task)
+
+
+@pytest.mark.asyncio
+async def test_service_owned_pending_status_survives_view_and_rejects_busy_without_queue():
+    service, transport, stop, task = await _start_service((_panel(),), send_behavior="block")
+    try:
+        location = service.snapshot.locations[0]
+        prepared = await service.prepare_mode("location-1")
+        first = asyncio.create_task(
+            service.request_mode(
+                "location-1",
+                AlarmMode.HOME,
+                expected_revision=location.revision,
+                approval_id=prepared.approval_id,
+            )
+        )
+        await transport.send_started.wait()
+        operation = service.snapshot.locations[0].operation
+        assert operation.active
+        assert operation.status.value == "waiting"
+        second = await service.request_mode(
+            "location-1", AlarmMode.AWAY, expected_revision=location.revision
+        )
+        assert second.status is AlarmCommandStatus.BUSY
+        assert service.snapshot.locations[0].operation == operation
+        assert len(transport.send_calls) == 1
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert service.snapshot.locations[0].operation.status.value == "outcome-unknown"
+        assert not service.snapshot.locations[0].operation.active
+    finally:
+        await _stop(stop, task)
+
+
+@pytest.mark.asyncio
+async def test_prepared_approval_expires_even_after_identical_inventory_refresh():
+    now = [100.0]
+    service, transport, stop, task = await _start_service(
+        (_panel(),), monotonic_clock=lambda: now[0]
+    )
+    try:
+        prepared = await service.prepare_mode("location-1")
+        now[0] += 61
+        await transport.on_message(DeviceInfoDocList("asset-1", (_panel(),)))
+        result = await service.request_mode(
+            "location-1",
+            AlarmMode.HOME,
+            expected_revision=prepared.location.revision,
+            approval_id=prepared.approval_id,
+        )
+        assert result.code == "approval-expired"
+        assert not transport.send_calls
+    finally:
+        await _stop(stop, task)
+
+
+@pytest.mark.asyncio
+async def test_freshness_is_rechecked_at_socket_admission_after_queue_wait():
+    now = [100.0]
+    service, transport, stop, task = await _start_service(
+        (_panel(),), monotonic_clock=lambda: now[0]
+    )
+    original = transport.send_mode
+
+    async def delayed(*args, **kwargs):
+        now[0] += 31
+        await original(*args, **kwargs)
+
+    transport.send_mode = delayed
+    try:
+        prepared = await service.prepare_mode("location-1")
+        result = await service.request_mode(
+            "location-1",
+            AlarmMode.HOME,
+            expected_revision=prepared.location.revision,
+            approval_id=prepared.approval_id,
+        )
+        assert result.code == "state-too-old"
+        assert not transport.send_calls
+    finally:
+        await _stop(stop, task)
+
+
+@pytest.mark.asyncio
+async def test_bypass_review_reuses_same_prepared_token_without_implicit_retry():
+    service, transport, stop, task = await _start_service((_panel(), _contact(faulted=True)))
+    try:
+        prepared = await service.prepare_mode("location-1")
+        first = await service.request_mode(
+            "location-1",
+            AlarmMode.HOME,
+            expected_revision=prepared.location.revision,
+            approval_id=prepared.approval_id,
+        )
+        assert first.status is AlarmCommandStatus.NEEDS_BYPASS
+        assert not transport.send_calls
+        result = await service.request_mode(
+            "location-1",
+            AlarmMode.HOME,
+            expected_revision=prepared.location.revision,
+            approval_id=prepared.approval_id,
+            bypass_zids=first.bypass_ids,
+        )
+        assert result.confirmed
+        assert len(transport.send_calls) == 1
+    finally:
+        await _stop(stop, task)
+
+
+@pytest.mark.asyncio
+async def test_unknown_outcome_is_terminal_but_requires_new_authoritative_read_and_approval():
+    service, transport, stop, task = await _start_service((_panel(),), send_behavior="error")
+    try:
+        prepared = await service.prepare_mode("location-1")
+        first = await service.request_mode(
+            "location-1",
+            AlarmMode.HOME,
+            expected_revision=prepared.location.revision,
+            approval_id=prepared.approval_id,
+        )
+        assert first.status is AlarmCommandStatus.TIMEOUT_UNKNOWN
+        assert not service.snapshot.locations[0].operation.active
+        denied = await service.request_mode(
+            "location-1", AlarmMode.HOME, expected_revision=prepared.location.revision
+        )
+        assert denied.code == "fresh-inventory-required"
+        assert len(transport.send_calls) == 1
+
+        async def reply_inventory(asset_id, *, epoch, admission=None):
+            with admission() if admission is not None else nullcontext():
+                pass
+            await transport.on_message(DeviceInfoDocList(asset_id, (_panel(),)))
+
+        transport.request_inventory = reply_inventory
+        transport.send_behavior = "confirm"
+        prepared_again = await service.prepare_mode("location-1")
+        assert prepared_again.approval_id and prepared_again.approval_id != prepared.approval_id
+        result = await service.request_mode(
+            "location-1",
+            AlarmMode.HOME,
+            expected_revision=prepared_again.location.revision,
+            approval_id=prepared_again.approval_id,
+        )
+        assert result.confirmed
+        assert len(transport.send_calls) == 2
+    finally:
+        await _stop(stop, task)
+
+
+@pytest.mark.asyncio
+async def test_preflight_refreshes_old_evidence_without_sending_a_mode():
+    now = [100.0]
+    service, transport, stop, task = await _start_service(
+        (_panel(),), monotonic_clock=lambda: now[0]
+    )
+
+    async def reply_inventory(asset_id, *, epoch, admission=None):
+        with admission() if admission is not None else nullcontext():
+            pass
+        await transport.on_message(DeviceInfoDocList(asset_id, (_panel(),)))
+
+    transport.request_inventory = reply_inventory
+    try:
+        now[0] += 31
+        prepared = await service.prepare_mode("location-1")
+        assert prepared.approval_id
+        assert prepared.location.assets[0].inventory_monotonic == now[0]
+        assert transport.send_calls == []
+    finally:
+        await _stop(stop, task)

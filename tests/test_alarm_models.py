@@ -151,3 +151,12 @@ def test_tri_state_only_treats_real_booleans_as_known():
     assert TriState.from_bool(False) is TriState.INACTIVE
     assert TriState.from_bool(1) is TriState.UNKNOWN
     assert TriState.from_bool(None) is TriState.UNKNOWN
+
+
+def test_alarm_freshness_clock_counts_suspend_when_platform_supports_it(monkeypatch):
+    import halo_gtk.alarm.models as models
+
+    monkeypatch.setattr(models.time, "CLOCK_BOOTTIME", 7, raising=False)
+    monkeypatch.setattr(models.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(models.time, "clock_gettime", lambda clock: 161.0 if clock == 7 else 0)
+    assert models.alarm_monotonic_time() == 161.0

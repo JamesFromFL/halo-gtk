@@ -25,6 +25,7 @@ from halo_gtk.alarm.models import (
     AlarmSignal,
     AlarmWriteAuthorization,
     TriState,
+    alarm_monotonic_time,
     empty_alarm_snapshot,
 )
 from halo_gtk.alarm.policy import asset_reason, authorization_reason, panel_reason
@@ -141,6 +142,12 @@ class _AssetState:
     connection: AlarmConnectionStatus = AlarmConnectionStatus.UNKNOWN
     inventory: AlarmInventoryStatus = AlarmInventoryStatus.EMPTY
     stale: bool = False
+    on_battery: TriState = TriState.UNKNOWN
+    power_observed_at: float | None = None
+    power_observed_monotonic: float | None = None
+    inventory_received_at: float | None = None
+    inventory_monotonic: float | None = None
+    inventory_revision: int = 0
     devices: dict[str, _DeviceState] = field(default_factory=dict)
     revision: int = 1
     epoch: int = 0
@@ -178,12 +185,13 @@ _RETAINED_SCALAR_FIELDS = {
     "locked",
     "on",
     "valveState",
-    "siren",
     "mode",
     "transitionDelayEndTimestamp",
     "alarmStatus",
+    "commStatus",
 }
 _RETAINED_NESTED_FIELDS = {
+    "siren": ("state",),
     "flood": ("faulted",),
     "freeze": ("faulted",),
     "smoke": ("alarmStatus",),
@@ -426,11 +434,11 @@ def _phase(data: Mapping[str, Any]) -> AlarmPhase:
     return AlarmPhase.UNKNOWN
 
 
-def _deadline(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
-        return None
-    result = float(value)
-    return result / 1000 if result >= 100_000_000_000 else result
+def _deadline(_value: object) -> float | None:
+    # The maintained upstream type declares a number but establishes no units.
+    # Keep the reported transition phase, without inventing an absolute clock
+    # or implying completion when a guessed seconds/milliseconds timer expires.
+    return None
 
 
 def _signal(data: Mapping[str, Any]) -> AlarmSignal:
@@ -671,6 +679,15 @@ def _normalize_device(
         if kind is AlarmDeviceKind.SECURITY_PANEL
         else _life_safety_signal(capabilities, smoke, carbon_monoxide)
     )
+    # commStatus is device supervision, not the enclosing hub's cloud link.
+    # Only the explicit values used by the reference are known; no heartbeat
+    # interval or omitted communication value is invented here.
+    communication = {
+        "ok": AlarmConnectionStatus.ONLINE,
+        "down": AlarmConnectionStatus.OFFLINE,
+    }.get(data.get("commStatus"), AlarmConnectionStatus.UNKNOWN)
+    if asset.connection is not AlarmConnectionStatus.ONLINE:
+        communication = AlarmConnectionStatus.UNKNOWN
     return AlarmDeviceSnapshot(
         location_id=location_id,
         asset_id=asset.asset_id,
@@ -682,8 +699,9 @@ def _normalize_device(
         category_id=_category(data.get("categoryId")),
         parent_zid=parent_zid,
         capabilities=capabilities,
-        connection=asset.connection,
-        stale=asset.stale,
+        connection=communication,
+        asset_connection=asset.connection,
+        stale=asset.stale or data.get("commStatus") == "down",
         battery_level=_battery_level(data.get("batteryLevel")),
         battery_low=battery_low,
         tamper=_tri_from_status(
@@ -722,6 +740,7 @@ def _normalize_device(
             active={"ok"},
             inactive={"error"},
         ),
+        siren_on=_nested_tri(data, "siren", "state", active={"on"}, inactive={"off"}),
         switch_on=TriState.from_bool(data.get("on")),
         valve_open=_tri_from_status(
             data.get("valveState"),
@@ -750,8 +769,10 @@ class AlarmStateStore:
         generation: int = 0,
         *,
         clock: Callable[[], float] = time.time,
+        monotonic_clock: Callable[[], float] = alarm_monotonic_time,
     ) -> None:
         self._clock = clock
+        self._monotonic_clock = monotonic_clock
         self._generation = generation
         self._revision = 0
         self._status = AlarmServiceStatus.STOPPED
@@ -866,6 +887,8 @@ class AlarmStateStore:
             asset.epoch = location.epoch
             asset.stale = True
             asset.inventory = AlarmInventoryStatus.STALE
+            asset.inventory_monotonic = None
+            asset.power_observed_monotonic = None
             asset.revision += 1
             asset.updated_at = now
             self._touch_devices(asset, now, epoch=location.epoch)
@@ -889,6 +912,10 @@ class AlarmStateStore:
         changed = False
         if isinstance(message, DeviceInfoDocList):
             changed = self._replace_asset_devices(location, message.asset_id, message.devices, now)
+            asset = location.assets[message.asset_id]
+            asset.inventory_received_at = now
+            asset.inventory_monotonic = self._monotonic_clock()
+            asset.inventory_revision += 1
         elif isinstance(message, DeviceInfoDocUpdate):
             changed = self._merge_asset_devices(location, message.asset_id, message.devices, now)
         elif isinstance(message, SessionInfo):
@@ -899,8 +926,24 @@ class AlarmStateStore:
         if changed:
             location.revision += 1
             location.updated_at = now
+        if changed or isinstance(message, DeviceInfoDocList):
             self._publish(now)
         return self._snapshot
+
+    def record_ticket_power(
+        self, location_id: str, asset_id: str, epoch: int, on_battery: bool | None
+    ) -> None:
+        """Retain a ticket-time observation without claiming realtime power health."""
+        location = self._locations.get(location_id)
+        if location is None or epoch != location.epoch:
+            return
+        asset = location.assets.get(asset_id)
+        if asset is None:
+            return
+        asset.on_battery = TriState.from_bool(on_battery)
+        asset.power_observed_at = self._clock()
+        asset.power_observed_monotonic = self._monotonic_clock()
+        self._publish(self._clock())
 
     def mark_location_stale(
         self,
@@ -1213,6 +1256,22 @@ class AlarmStateStore:
             assets=assets,
             can_set_mode=can_set_mode,
             command_unavailable_reason=reason,
+            inventory_received_at=(
+                min(asset.inventory_received_at for asset in assets)
+                if assets
+                and all(
+                    asset.inventory_received_at is not None and not asset.stale for asset in assets
+                )
+                else None
+            ),
+            inventory_monotonic=(
+                min(asset.inventory_monotonic for asset in assets)
+                if assets
+                and all(
+                    asset.inventory_monotonic is not None and not asset.stale for asset in assets
+                )
+                else None
+            ),
             revision=location.revision,
             epoch=location.epoch,
             updated_at=location.updated_at,
@@ -1231,6 +1290,12 @@ class AlarmStateStore:
             connection=asset.connection,
             inventory=asset.inventory,
             stale=asset.stale,
+            on_battery=asset.on_battery,
+            power_observed_at=asset.power_observed_at,
+            power_observed_monotonic=asset.power_observed_monotonic,
+            inventory_received_at=asset.inventory_received_at,
+            inventory_monotonic=asset.inventory_monotonic,
+            inventory_revision=asset.inventory_revision,
             devices=devices,
             revision=asset.revision,
             epoch=asset.epoch,

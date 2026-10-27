@@ -31,8 +31,9 @@ from halo_gtk.alarm.provider import (
     AlarmRequestError,
     AlarmRestGateway,
 )
+from halo_gtk.alarm.rest import TICKET_ENDPOINT
 
-_TICKET_ENDPOINT = "https://app.ring.com/api/v1/clap/tickets"
+_TICKET_ENDPOINT = TICKET_ENDPOINT
 _MAX_TICKET_LENGTH = 16_384
 _MAX_HOST_LENGTH = 512
 _MAX_ASSETS = 128
@@ -122,6 +123,8 @@ class RingAlarmTransport:
         return aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=None, connect=20, sock_connect=20),
             raise_for_status=True,
+            cookie_jar=aiohttp.DummyCookieJar(),
+            trust_env=False,
         )
 
     @property
@@ -227,12 +230,19 @@ class RingAlarmTransport:
                 self._connection_epoch = None
             await _close_websocket(websocket, timeout=self._close_timeout)
 
-    async def request_inventory(self, asset_id: str, *, epoch: int) -> None:
+    async def request_inventory(
+        self,
+        asset_id: str,
+        *,
+        epoch: int,
+        admission: Callable[[], AbstractContextManager[None]] | None = None,
+    ) -> None:
         """Request a fresh complete device list on the current connection."""
 
         await self._send_encoded(
             lambda sequence: encode_device_list_request(asset_id, sequence),
             epoch=epoch,
+            admission=admission,
         )
 
     async def send_mode(

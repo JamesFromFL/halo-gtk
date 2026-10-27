@@ -9,6 +9,12 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 This section tracks the work toward Halo GTK's first tagged release.
 
 ### Added
+- Experimental Alarm cloud history with a separate non-video view, bounded
+  session cache, cancellation, source labels and explicit coverage limitations.
+- Semantic live Alarm notifications, opt-in routine activity, default-redacted
+  detail, account-aware navigation and revocation cleanup.
+- Real Alarm inventory/discovery refresh, sensor supervision, read-only siren and
+  ticket power status, and service-owned pending/uncertain mode outcomes.
 - Ring sign-in, two-factor authentication, Secret Service token storage, and background
   session restore.
 - Experimental native Ring Alarm page and backend sharing the existing authenticated Ring
@@ -28,6 +34,10 @@ This section tracks the work toward Halo GTK's first tagged release.
 - Automated lint, test, dependency-audit, schema, desktop-file, and installed-wheel checks.
 
 ### Changed
+- Alarm REST uses the maintained ticket service and bounded authenticated JSON
+  reads with coordinated token refresh. Normal mode approvals expire, require
+  current inventory, and remain fenced at the socket send boundary.
+- Unknown transition timestamp units no longer produce a guessed countdown.
 - Updated the validated media stack to aiortc 1.15.0 / PyAV 17.1.0 with explicit
   single-thread RGB conversion and permanent real-media compatibility contracts.
 - Recording previews now use verified, bounded HTTPS and a stoppable decode

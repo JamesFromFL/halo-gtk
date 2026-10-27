@@ -356,6 +356,8 @@ class RingWindow(Adw.ApplicationWindow):
             self._cameras_page.on_page_hidden()
         elif previous_page == "history" and name != "history":
             self._history_page.on_page_hidden()
+        elif previous_page == "alarm" and name != "alarm":
+            self._alarm_page.on_page_hidden()
 
         self._active_page_name = name
         if name in self._nav_rows:
@@ -397,6 +399,13 @@ class RingWindow(Adw.ApplicationWindow):
         """Show Event History, optionally filtered to one camera."""
         self._enter_history_page(lambda: self._history_page.refresh(filter_device_id=device_id))
 
+    def open_alarm_location(self, location_id=None, *, asset_id=None, zid=None, event_id=None):
+        self._show_page("alarm")
+        self._alarm_page.open_location(location_id, asset_id=asset_id, zid=zid, event_id=event_id)
+
+    def open_alarm_history(self, location_id=None):
+        self._enter_history_page(lambda: self._history_page.show_alarm_history(location_id))
+
     def open_history_event(self, device_id: int, event_id: int) -> None:
         """Show Event History and play a specific event."""
         self._enter_history_page(lambda: self._history_page.show_event_by_id(device_id, event_id))
@@ -409,6 +418,8 @@ class RingWindow(Adw.ApplicationWindow):
                 self._dashboard_cameras_page.on_page_hidden()
             elif self._active_page_name == "cameras":
                 self._cameras_page.on_page_hidden()
+            elif self._active_page_name == "alarm":
+                self._alarm_page.on_page_hidden()
             elif self._active_page_name == "focused_live":
                 self._leave_focused_live("history")
                 append_history = False

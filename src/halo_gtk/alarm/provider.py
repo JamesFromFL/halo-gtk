@@ -8,7 +8,7 @@ from enum import StrEnum, unique
 from itertools import islice
 from typing import Any, Protocol
 
-from halo_gtk.alarm.models import AlarmMode, AlarmWriteAuthorization
+from halo_gtk.alarm.models import AlarmLocationSnapshot, AlarmMode, AlarmWriteAuthorization
 
 JsonObject = Mapping[str, Any]
 _MAX_DISCOVERY_RECORDS = 1_024
@@ -106,6 +106,29 @@ class AlarmCommandStatus(StrEnum):
     STALE_REVISION = "stale-revision"
     TIMEOUT_UNKNOWN = "timeout-unknown"
     SUPERSEDED = "superseded"
+    BUSY = "busy"
+
+
+class AlarmRefreshStatus(StrEnum):
+    REFRESHED = "refreshed"
+    INCOMPLETE = "incomplete"
+    UNAVAILABLE = "unavailable"
+    TIMED_OUT = "timed-out"
+    COOLDOWN = "cooldown"
+
+
+@dataclass(frozen=True, slots=True)
+class AlarmRefreshResult:
+    status: AlarmRefreshStatus
+    location_ids: tuple[str, ...] = ()
+    code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AlarmModePreparation:
+    location: AlarmLocationSnapshot | None = None
+    approval_id: str | None = None
+    code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

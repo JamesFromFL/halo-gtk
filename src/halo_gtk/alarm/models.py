@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from enum import StrEnum, unique
 
@@ -169,6 +170,47 @@ class AlarmLockState(StrEnum):
     JAMMED = "jammed"
 
 
+class AlarmOperationStatus(StrEnum):
+    PREPARING = "preparing"
+    WAITING = "waiting"
+    REPORTED_TARGET = "reported-target"
+    REJECTED = "rejected"
+    OUTCOME_UNKNOWN = "outcome-unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class AlarmOperationSnapshot:
+    """One bounded, session-local operation; terminal uncertainty is not a lock."""
+
+    operation_id: int
+    target: AlarmMode
+    status: AlarmOperationStatus
+    code: str | None = None
+
+    def __post_init__(self) -> None:
+        _validate_revision(self.operation_id, "operation_id")
+        if not isinstance(self.target, AlarmMode) or not isinstance(
+            self.status, AlarmOperationStatus
+        ):
+            raise ValueError("operation state must use Alarm enums")
+        if self.code is not None and (
+            not isinstance(self.code, str)
+            or len(self.code) > 128
+            or any(ord(character) < 32 for character in self.code)
+        ):
+            raise ValueError("operation code must be a bounded safe string")
+
+    @property
+    def active(self) -> bool:
+        return self.status in {AlarmOperationStatus.PREPARING, AlarmOperationStatus.WAITING}
+
+
+def alarm_monotonic_time() -> float:
+    """Elapsed time including Linux suspend, so sleep cannot extend an approval."""
+    clock = getattr(time, "CLOCK_BOOTTIME", None)
+    return time.clock_gettime(clock) if clock is not None else time.monotonic()
+
+
 def _validate_identity(value: str, field_name: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} must be a non-empty string")
@@ -196,6 +238,7 @@ class AlarmDeviceSnapshot:
     parent_zid: str | None = None
     capabilities: frozenset[AlarmCapability] = frozenset()
     connection: AlarmConnectionStatus = AlarmConnectionStatus.UNKNOWN
+    asset_connection: AlarmConnectionStatus = AlarmConnectionStatus.UNKNOWN
     stale: bool = False
     battery_level: int | None = None
     battery_low: TriState = TriState.UNKNOWN
@@ -211,6 +254,7 @@ class AlarmDeviceSnapshot:
     smoke: TriState = TriState.UNKNOWN
     carbon_monoxide: TriState = TriState.UNKNOWN
     ac_power: TriState = TriState.UNKNOWN
+    siren_on: TriState = TriState.UNKNOWN
     switch_on: TriState = TriState.UNKNOWN
     valve_open: TriState = TriState.UNKNOWN
     lock_state: AlarmLockState = AlarmLockState.UNKNOWN
@@ -264,6 +308,12 @@ class AlarmAssetSnapshot:
     connection: AlarmConnectionStatus = AlarmConnectionStatus.UNKNOWN
     inventory: AlarmInventoryStatus = AlarmInventoryStatus.EMPTY
     stale: bool = False
+    on_battery: TriState = TriState.UNKNOWN
+    power_observed_at: float | None = None
+    power_observed_monotonic: float | None = None
+    inventory_received_at: float | None = None
+    inventory_monotonic: float | None = None
+    inventory_revision: int = 0
     devices: tuple[AlarmDeviceSnapshot, ...] = ()
     revision: int = 0
     epoch: int = 0
@@ -274,6 +324,7 @@ class AlarmAssetSnapshot:
         _validate_identity(self.asset_id, "asset_id")
         _validate_revision(self.revision)
         _validate_revision(self.epoch, "epoch")
+        _validate_revision(self.inventory_revision, "inventory_revision")
         if not isinstance(self.kind, str):
             raise ValueError("kind must be a string")
         object.__setattr__(self, "devices", tuple(self.devices))
@@ -306,6 +357,9 @@ class AlarmLocationSnapshot:
     assets: tuple[AlarmAssetSnapshot, ...] = ()
     can_set_mode: bool = False
     command_unavailable_reason: str | None = None
+    operation: AlarmOperationSnapshot | None = None
+    inventory_received_at: float | None = None
+    inventory_monotonic: float | None = None
     revision: int = 0
     epoch: int = 0
     updated_at: float | None = None

@@ -219,8 +219,12 @@ def test_full_list_replaces_asset_and_delta_shallow_merges_by_zid():
     first = store.apply_message("location-1", initial, epoch)
     unchanged = store.apply_message("location-1", initial, epoch)
 
-    assert unchanged is first
-    assert unchanged.revision == first.revision
+    # A second authoritative full list refreshes receipt metadata even when
+    # its semantic device/location revisions are unchanged.
+    assert unchanged.revision > first.revision
+    assert unchanged.locations[0].revision == first.locations[0].revision
+    assert unchanged.locations[0].devices == first.locations[0].devices
+    assert unchanged.locations[0].assets[0].inventory_revision == 2
 
     updated = store.apply_message(
         "location-1",
@@ -505,7 +509,7 @@ def test_panel_transition_is_normalized_and_remains_technically_ready():
 
     assert location.mode is AlarmMode.HOME
     assert location.phase is AlarmPhase.EXIT_DELAY
-    assert location.transition_deadline == 1_700_000_123.0
+    assert location.transition_deadline is None  # Upstream does not establish timestamp units.
     assert location.triggered is TriState.INACTIVE
     assert location.can_set_mode is True
     assert location.command_unavailable_reason is None
@@ -1092,3 +1096,93 @@ def test_location_and_asset_keys_do_not_cross_contaminate():
     location_b = store.snapshot.find_location("location-b")
     assert location_a.find_device("shared-zid").faulted is TriState.ACTIVE
     assert location_b.find_device("shared-zid").faulted is TriState.INACTIVE
+
+
+def test_device_supervision_is_independent_and_patch_omission_retains_evidence():
+    store, epoch = _registered_store("base")
+    store.apply_message(
+        "location-1",
+        DeviceInfoDocList(
+            "base", (_device("sensor", "sensor.contact", faulted=False, commStatus="ok"),)
+        ),
+        epoch,
+    )
+    assert store.snapshot.locations[0].devices[0].connection is AlarmConnectionStatus.ONLINE
+    store.apply_message(
+        "location-1",
+        DeviceInfoDocUpdate(
+            "base", (DeviceDocument("sensor", {"zid": "sensor", "commStatus": "down"}),)
+        ),
+        epoch,
+    )
+    sensor = store.snapshot.locations[0].devices[0]
+    assert sensor.connection is AlarmConnectionStatus.OFFLINE
+    assert sensor.asset_connection is AlarmConnectionStatus.ONLINE
+    assert sensor.stale
+    assert sensor.contact is TriState.INACTIVE
+    store.apply_message(
+        "location-1",
+        DeviceInfoDocUpdate(
+            "base", (DeviceDocument("sensor", {"zid": "sensor", "batteryLevel": 80}),)
+        ),
+        epoch,
+    )
+    assert store.snapshot.locations[0].devices[0].connection is AlarmConnectionStatus.OFFLINE
+    store.apply_message(
+        "location-1",
+        DeviceInfoDocUpdate(
+            "base", (DeviceDocument("sensor", {"zid": "sensor", "commStatus": None}),)
+        ),
+        epoch,
+    )
+    assert store.snapshot.locations[0].devices[0].connection is AlarmConnectionStatus.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "reported, expected",
+    [
+        ({"state": "on"}, TriState.ACTIVE),
+        ({"state": "off"}, TriState.INACTIVE),
+        ({"state": "future"}, TriState.UNKNOWN),
+        (None, TriState.UNKNOWN),
+    ],
+)
+def test_read_only_siren_does_not_invent_alarm_state(reported, expected):
+    store, epoch = _registered_store("base")
+    store.apply_message(
+        "location-1",
+        DeviceInfoDocList(
+            "base", (_device("panel", "security-panel", mode="none", siren=reported),)
+        ),
+        epoch,
+    )
+    panel = store.snapshot.locations[0].devices[0]
+    assert panel.siren_on is expected
+    assert store.snapshot.locations[0].mode is AlarmMode.DISARMED
+
+
+def test_inventory_receipt_uses_monotonic_time_without_rewriting_semantic_age():
+    wall = [1000.0]
+    monotonic = [10.0]
+    store = AlarmStateStore(clock=lambda: wall[0], monotonic_clock=lambda: monotonic[0])
+    store.register_location("loc", expected_assets=("base",))
+    epoch = store.begin_epoch("loc")
+    store.apply_message(
+        "loc", SessionInfo((AssetSessionInfo("base", AlarmConnectionStatus.ONLINE),)), epoch
+    )
+    message = DeviceInfoDocList("base", (_device("sensor", "sensor.contact", faulted=False),))
+    store.apply_message("loc", message, epoch)
+    before = store.snapshot.locations[0].devices[0]
+    store.record_ticket_power("loc", "base", epoch, True)
+    wall[0] = 100.0
+    monotonic[0] = 20.0
+    store.apply_message("loc", message, epoch)
+    location = store.snapshot.locations[0]
+    assert location.inventory_monotonic == 20
+    assert location.inventory_received_at == 100
+    assert location.devices[0] == before
+    assert location.assets[0].on_battery is TriState.ACTIVE
+    assert location.assets[0].power_observed_monotonic == 10
+    store.begin_epoch("loc")
+    assert store.snapshot.locations[0].assets[0].inventory_monotonic is None
+    assert store.snapshot.locations[0].assets[0].power_observed_monotonic is None

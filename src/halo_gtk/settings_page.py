@@ -471,6 +471,33 @@ class SettingsPage(Gtk.Box):
             config_key="notify_alarm",
             indent=True,
         )
+        self._alarm_options = []
+        for title, subtitle, key in (
+            (
+                "Alarm Mode Changes",
+                "Notify when a live mode or transition change is observed.",
+                "notify_alarm_mode",
+            ),
+            (
+                "Alarm Sensor Activity",
+                "Contact and motion activity observed while Halo is running.",
+                "notify_alarm_sensor",
+            ),
+            (
+                "Alarm Device Health",
+                "Communication, power, battery, tamper and bypass changes.",
+                "notify_alarm_health",
+            ),
+            (
+                "Show Alarm Notification Details",
+                "Include location and device names on the desktop and lock screen.",
+                "alarm_notification_details",
+            ),
+        ):
+            row, switch = self._add_switch_row(
+                desktop_group, title, subtitle, config_key=key, indent=True
+            )
+            self._alarm_options.append((row, switch, key))
 
         content_group = Adw.PreferencesGroup(title="Notification Content")
         page.add(content_group)
@@ -506,6 +533,9 @@ class SettingsPage(Gtk.Box):
             content_group,
             "Alarm",
             "custom_alarm_message",
+        )
+        self._custom_alarm_message_row.set_tooltip_text(
+            "Included only when Alarm notification details are enabled."
         )
 
     def _build_advanced_page(self) -> Gtk.Widget:
@@ -762,6 +792,9 @@ class SettingsPage(Gtk.Box):
         self._doorbell_notifications_row.set_visible(notifications_enabled)
         self._motion_notifications_row.set_visible(notifications_enabled)
         self._alarm_notifications_row.set_visible(notifications_enabled)
+        for row, switch, key in getattr(self, "_alarm_options", ()):
+            row.set_visible(notifications_enabled and cfg.get("notify_alarm", True))
+            self._set_switch_active(switch, cfg.get(key, False))
         self._set_switch_active(
             self._doorbell_notifications_switch,
             cfg.get("notify_doorbell", True),

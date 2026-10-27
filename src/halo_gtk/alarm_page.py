@@ -393,6 +393,10 @@ class AlarmPage(Gtk.Box):
         self._location_ids: tuple[str, ...] = ()
         self._updating_location_selector = False
         self._command_nonce = 0
+        self._approval_ids = {}
+        self._prepare_future = None
+        self._refresh_future = None
+        self._view_active = True
         self._command_pending = False
         self._pending_location_id: str | None = None
         self._countdown_source_id: int | None = None
@@ -458,6 +462,16 @@ class AlarmPage(Gtk.Box):
         )
         self._location_selector.connect("notify::selected", self._on_location_selected)
         location_row.append(self._location_selector)
+        toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._refresh_button = Gtk.Button(label="Refresh Alarm", icon_name="view-refresh-symbolic")
+        self._refresh_button.connect("clicked", self._on_refresh_clicked)
+        toolbar.append(self._refresh_button)
+        history_button = Gtk.Button(
+            label="Alarm History", icon_name="document-open-recent-symbolic"
+        )
+        history_button.connect("clicked", self._on_history_clicked)
+        toolbar.append(history_button)
+        location_row.append(toolbar)
         content.append(location_row)
 
         overview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
@@ -546,6 +560,7 @@ class AlarmPage(Gtk.Box):
         """Bind the active Ring client and render its latest immutable snapshot."""
         if self._closed:
             return
+        self._view_active = True
         client = get_client()
         if client is None or not client.is_authenticated:
             self._bind_alarm_client(None)
@@ -555,6 +570,95 @@ class AlarmPage(Gtk.Box):
         if client is not self._alarm_client:
             self._bind_alarm_client(client)
         self._accept_snapshot(client.get_alarm_snapshot())
+
+    def open_location(self, location_id=None, *, asset_id=None, zid=None, event_id=None):
+        if location_id != self._selected_location_id:
+            self._invalidate_command_state()
+        self._selected_location_id = location_id
+        self.refresh()
+        location = self._selected_location()
+        if location is not None and zid is not None:
+            asset = location.find_asset(asset_id) if asset_id else None
+            device = asset.find_device(zid) if asset else location.find_device(zid)
+            if device is not None:
+                self._present_device_details(device)
+
+    def on_page_hidden(self):
+        self._view_active = False
+        self._command_nonce += 1
+        self._approval_ids.clear()
+        if self._prepare_future is not None:
+            self._prepare_future.cancel()
+            self._prepare_future = None
+        # A submitted command may have reached Ring. Only its page callback is
+        # retired; the service continues to track the operation and outcome.
+        self._clear_command_pending()
+        self._stop_countdown()
+
+    def _on_refresh_clicked(self, *_args):
+        client = self._alarm_client
+        location_id = self._selected_location_id
+        if client is None or (self._refresh_future is not None and not self._refresh_future.done()):
+            return
+        self._refresh_button.set_sensitive(False)
+        try:
+            future = client.refresh_alarm(location_id)
+            self._refresh_future = future
+            future.add_done_callback(
+                lambda done: GLib.idle_add(self._finish_refresh, client, location_id, done)
+            )
+        except Exception:
+            self._refresh_button.set_sensitive(True)
+            self._add_toast("Alarm refresh is unavailable.")
+
+    def _finish_refresh(self, client, location_id, future):
+        if self._closed or client is not self._alarm_client or future is not self._refresh_future:
+            return False
+        self._refresh_button.set_sensitive(True)
+        if not self._view_active or location_id != self._selected_location_id:
+            return False
+        try:
+            result = future.result()
+            message = {
+                "refreshed": "Alarm inventory refreshed.",
+                "incomplete": "Alarm inventory is incomplete.",
+                "unavailable": "Alarm refresh is unavailable.",
+                "timed-out": "Alarm refresh timed out. Status may be out of date.",
+                "cooldown": "Alarm was refreshed recently.",
+            }.get(result.status.value, "Alarm refresh is unavailable.")
+        except Exception:
+            message = "Alarm refresh is unavailable."
+        self.refresh()
+        self._add_toast(message)
+        return False
+
+    def _on_history_clicked(self, *_args):
+        root = self.get_root()
+        if root is not None and hasattr(root, "open_alarm_history"):
+            root.open_alarm_history(self._selected_location_id)
+
+    def _present_device_details(self, device):
+        lines = [_device_subtitle(device), f"Communication: {_connection_label(device.connection)}"]
+        if device.room:
+            lines.append(f"Room: {device.room}")
+        location = self._selected_location()
+        asset = location.find_asset(device.asset_id) if location is not None else None
+        received = getattr(asset, "inventory_received_at", None)
+        if received is not None:
+            from datetime import datetime
+
+            lines.append(
+                "Inventory received: " + f"{datetime.fromtimestamp(received).astimezone():%x %X %Z}"
+            )
+        siren = getattr(device, "siren_on", TriState.UNKNOWN)
+        if siren is not TriState.UNKNOWN:
+            lines.append(f"Reported siren: {'On' if siren is TriState.ACTIVE else 'Off'}")
+        dialog = Adw.AlertDialog(
+            heading=device.name or _device_kind_label(device), body="\n".join(lines)
+        )
+        dialog.add_response("close", "Close")
+        dialog.set_close_response("close")
+        dialog.present(self)
 
     def _bind_alarm_client(self, client) -> None:
         if client is self._alarm_client:
@@ -578,12 +682,21 @@ class AlarmPage(Gtk.Box):
 
     def _invalidate_command_state(self) -> None:
         self._command_nonce += 1
+        if hasattr(self, "_approval_ids"):
+            self._approval_ids.clear()
+        prepare = getattr(self, "_prepare_future", None)
+        if prepare is not None:
+            prepare.cancel()
+            self._prepare_future = None
         self._command_pending = False
         self._pending_location_id = None
         if hasattr(self, "_command_spinner"):
             self._command_spinner.stop()
 
     def _on_alarm_snapshot(self, snapshot: AlarmAccountSnapshot) -> None:
+        if not self._view_active:
+            self._snapshot = snapshot
+            return
         self._accept_snapshot(snapshot)
 
     def _accept_snapshot(self, snapshot: AlarmAccountSnapshot) -> None:
@@ -729,7 +842,10 @@ class AlarmPage(Gtk.Box):
         index = dropdown.get_selected()
         if index >= len(self._location_ids):
             return
-        self._selected_location_id = self._location_ids[index]
+        selected = self._location_ids[index]
+        if selected != self._selected_location_id:
+            self._invalidate_command_state()
+        self._selected_location_id = selected
         location = self._selected_location()
         if location is not None:
             self._render_location(location)
@@ -750,11 +866,32 @@ class AlarmPage(Gtk.Box):
             or _location_has_active_signal(location)
         ):
             health += " · Use the Ring app or keypad for critical response"
+        received = getattr(location, "inventory_received_at", None)
+        if received is not None:
+            from datetime import datetime
+
+            health += f" · Inventory received {datetime.fromtimestamp(received).astimezone():%X %Z}"
+        panel = location.security_panel
+        if panel is not None:
+            asset = location.find_asset(panel.asset_id)
+            if (
+                asset is not None
+                and getattr(asset, "on_battery", TriState.UNKNOWN) is TriState.ACTIVE
+            ):
+                health += " · Last ticket reported hub battery power"
+        client = self._alarm_client
+        gap_count = (
+            getattr(client, "get_alarm_notification_gap_count", lambda: 0)() if client else 0
+        )
+        if gap_count:
+            health += " · Some activity notifications were omitted during a burst"
         self._state_detail.set_label(health)
         self._set_state_symbol(location)
         self._update_countdown(location)
         self._refresh_mode_controls(location)
-        self._rebuild_device_groups(location.devices)
+        if getattr(self, "_rendered_devices", None) != location.devices:
+            self._rebuild_device_groups(location.devices)
+            self._rendered_devices = location.devices
 
     def _set_state_symbol(self, location: AlarmLocationSnapshot) -> None:
         critical = (
@@ -818,8 +955,12 @@ class AlarmPage(Gtk.Box):
             GLib.source_remove(source_id)
 
     def _refresh_mode_controls(self, location: AlarmLocationSnapshot) -> None:
-        busy = self._command_pending
-        selected_busy = busy and self._pending_location_id == location.location_id
+        operation = getattr(location, "operation", None)
+        service_busy = operation is not None and operation.active
+        busy = self._command_pending or service_busy
+        selected_busy = (
+            self._command_pending and self._pending_location_id == location.location_id
+        ) or service_busy
         self._location_selector.set_sensitive(len(self._location_ids) > 1 and not busy)
         for mode, button in self._mode_buttons.items():
             available = location.can_set_mode and not busy and mode is not location.mode
@@ -832,7 +973,21 @@ class AlarmPage(Gtk.Box):
             self._command_status.set_label("Waiting for Ring to confirm the mode change…")
         else:
             self._command_spinner.stop()
-            if location.can_set_mode:
+            if operation is not None and operation.status.value == "outcome-unknown":
+                self._command_status.set_label(
+                    "The previous request outcome is unknown. "
+                    "Refresh and review before another request."
+                )
+            elif operation is not None and operation.status.value == "reported-target":
+                self._command_status.set_label(
+                    f"Ring reports {_mode_label(location.mode)} mode"
+                    + (
+                        "; exit delay is in progress."
+                        if location.phase is AlarmPhase.EXIT_DELAY
+                        else "."
+                    )
+                )
+            elif location.can_set_mode:
                 self._command_status.set_label(
                     f"Current mode: {_mode_label(location.mode)}. Changes require confirmation."
                 )
@@ -896,6 +1051,8 @@ class AlarmPage(Gtk.Box):
         state_label.set_max_width_chars(20)
         self._set_semantic_class(state_label, severity)
         row.add_suffix(state_label)
+        row.set_activatable(True)
+        row.connect("activated", lambda *_args: self._present_device_details(device))
         return row
 
     @staticmethod
@@ -917,6 +1074,58 @@ class AlarmPage(Gtk.Box):
         ):
             return
 
+        self._command_pending = True
+        self._pending_location_id = location.location_id
+        self._command_nonce += 1
+        nonce = self._command_nonce
+        self._refresh_mode_controls(location)
+        try:
+            future = client.prepare_alarm_mode(location.location_id)
+            self._prepare_future = future
+            future.add_done_callback(
+                lambda done: GLib.idle_add(
+                    self._finish_prepare_mode, client, location.location_id, target, nonce, done
+                )
+            )
+        except Exception:
+            self._clear_command_pending()
+            self._add_toast("Alarm control preparation is unavailable.")
+
+    def _finish_prepare_mode(self, client, location_id, target, nonce, future):
+        if (
+            self._closed
+            or not self._view_active
+            or client is not self._alarm_client
+            or nonce != self._command_nonce
+            or location_id != self._selected_location_id
+        ):
+            return False
+        self._prepare_future = None
+        self._clear_command_pending()
+        try:
+            preparation = future.result()
+        except Exception:
+            self._add_toast("Could not obtain fresh Alarm status. Refresh before trying again.")
+            return False
+        self.refresh()
+        location = preparation.location
+        current = self._selected_location()
+        if (
+            location is None
+            or not preparation.approval_id
+            or current is None
+            or current.revision != location.revision
+            or not current.can_set_mode
+        ):
+            self._add_toast(
+                "Alarm control is unavailable until fresh status and permission are confirmed."
+            )
+            return False
+        self._approval_ids[location_id] = preparation.approval_id
+        self._present_mode_confirmation(client, location, target)
+        return False
+
+    def _present_mode_confirmation(self, client, location, target):
         location_name = location.name.strip() or "this Alarm location"
         headings = {
             AlarmMode.DISARMED: f"Disarm {location_name}?",
@@ -955,6 +1164,7 @@ class AlarmPage(Gtk.Box):
             location.location_id,
             location.revision,
             target,
+            self._approval_ids.get(location.location_id),
         )
         dialog.present(self)
 
@@ -966,11 +1176,26 @@ class AlarmPage(Gtk.Box):
         location_id: str,
         revision: int,
         target: AlarmMode,
+        approval_id: str | None = None,
     ) -> None:
-        if response != "confirm" or client is not self._alarm_client:
+        if (
+            response != "confirm"
+            or client is not self._alarm_client
+            or not getattr(self, "_view_active", True)
+        ):
+            return
+        if hasattr(self, "_approval_ids") and (
+            not approval_id or self._approval_ids.get(location_id) != approval_id
+        ):
+            self._add_toast("Alarm approval expired. Review the current status again.")
             return
         location = self._snapshot.find_location(location_id)
-        if location is None or location.revision != revision or not location.can_set_mode:
+        if (
+            location_id != self._selected_location_id
+            or location is None
+            or location.revision != revision
+            or not location.can_set_mode
+        ):
             self._add_toast("Alarm status changed. Review it before trying again.")
             return
         self._submit_mode(client, location, target, ())
@@ -991,12 +1216,11 @@ class AlarmPage(Gtk.Box):
         self._pending_location_id = location.location_id
         self._refresh_mode_controls(location)
         try:
-            future = client.request_alarm_mode(
-                location.location_id,
-                target,
-                expected_revision=location.revision,
-                bypass_ids=bypass_ids,
-            )
+            kwargs = {"expected_revision": location.revision, "bypass_ids": bypass_ids}
+            approval_id = getattr(self, "_approval_ids", {}).get(location.location_id)
+            if approval_id is not None:
+                kwargs["approval_id"] = approval_id
+            future = client.request_alarm_mode(location.location_id, target, **kwargs)
         except Exception:
             self._finish_command_exception(client, nonce)
             return
@@ -1043,7 +1267,7 @@ class AlarmPage(Gtk.Box):
 
         if result.status is AlarmCommandStatus.CONFIRMED:
             self.refresh()
-            self._add_toast(f"Ring confirmed {_mode_label(result.confirmed_mode)} mode.")
+            self._add_toast(f"Ring reports {_mode_label(result.confirmed_mode)} mode.")
         elif result.status is AlarmCommandStatus.NEEDS_BYPASS:
             self._handle_bypass_required(
                 client,
@@ -1171,6 +1395,7 @@ class AlarmPage(Gtk.Box):
             location.revision,
             target,
             bypass_ids,
+            self._approval_ids.get(location.location_id),
         )
         dialog.present(self)
 
@@ -1183,8 +1408,15 @@ class AlarmPage(Gtk.Box):
         revision: int,
         target: AlarmMode,
         bypass_ids: tuple[str, ...],
+        approval_id: str | None = None,
     ) -> None:
-        if client is not self._alarm_client:
+        if client is not self._alarm_client or not getattr(self, "_view_active", True):
+            return
+        if hasattr(self, "_approval_ids") and (
+            not approval_id or self._approval_ids.get(location_id) != approval_id
+        ):
+            self._clear_command_pending()
+            self._add_toast("Alarm approval expired. Review the current status again.")
             return
         if response != "bypass":
             self._clear_command_pending()
@@ -1226,6 +1458,7 @@ class AlarmPage(Gtk.Box):
         """Release callbacks without cancelling possibly-sent Alarm commands."""
         if self._closed:
             return
+        self.on_page_hidden()
         self._closed = True
         self._stop_countdown()
         self._disconnect_alarm_client()

@@ -778,6 +778,7 @@ class HistoryPage(Gtk.Box):
         self._history_exhausted = False
         self._history_request_generation = 0
         self._playback_request_generation = 0
+        self._alarm_history_active = False
         self._build_ui()
 
     @property
@@ -786,6 +787,7 @@ class HistoryPage(Gtk.Box):
         return self._nav_split
 
     def do_unroot(self) -> None:
+        self._alarm_history.deactivate(clear=True)
         self._history_request_generation += 1
         self._playback_request_generation += 1
         self._history_loading = False
@@ -802,7 +804,9 @@ class HistoryPage(Gtk.Box):
             vexpand=True,
             sidebar_width_fraction=0.3,
         )
-        self.append(self._nav_split)
+        self._mode_stack = Gtk.Stack(hexpand=True, vexpand=True)
+        self._mode_stack.add_named(self._nav_split, "camera")
+        self.append(self._mode_stack)
 
         # --- Sidebar navigation page ---
         self._sidebar_page = Adw.NavigationPage(title="Event History")
@@ -988,6 +992,42 @@ class HistoryPage(Gtk.Box):
         actions_box.append(_action_btn("edit-delete-symbolic", "Delete event", self._on_delete))
         self._clear_event_details()
 
+        from halo_gtk.alarm_history import AlarmHistoryView
+
+        self._alarm_history = AlarmHistoryView(
+            on_camera_history=self._show_camera_history,
+            on_open_alarm=self._open_alarm_history_event,
+        )
+        self._mode_stack.add_named(self._alarm_history, "alarm")
+
+    def _show_camera_history(self) -> None:
+        self._alarm_history.deactivate(clear=True)
+        self._alarm_history_active = False
+        self._selected_device_index = 0
+        self._update_device_filter_label()
+        self._mode_stack.set_visible_child_name("camera")
+        self.refresh()
+
+    def show_alarm_history(self, location_id: str | None = None) -> None:
+        """Open cloud Alarm rows without starting any camera history/media work."""
+        self._history_request_generation += 1
+        self._history_loading = False
+        self._alarm_history_active = True
+        self._selected_device_index = len(self._device_options) + 1
+        self._reset_current_event()
+        if callback := getattr(self, "_on_title_change", None):
+            callback(None)
+        self._mode_stack.set_visible_child_name("alarm")
+        self._alarm_history.refresh(location_id)
+
+    def _open_alarm_history_event(self, event) -> None:
+        root = self.get_root()
+        open_alarm = getattr(root, "open_alarm_location", None)
+        if callable(open_alarm):
+            open_alarm(
+                event.location_id, asset_id=event.asset_id, zid=event.zid, event_id=event.event_id
+            )
+
     def _sync_content_header(self, split_view: Adw.NavigationSplitView, _pspec) -> None:
         self._content_header.set_visible(split_view.get_collapsed())
 
@@ -1079,6 +1119,8 @@ class HistoryPage(Gtk.Box):
         self._playback_request_generation += 1
         self._history_loading = False
         self._pending_event_id = None
+        if view := getattr(self, "_alarm_history", None):
+            view.deactivate(clear=True)
         self._player.deactivate()
         self._nav_split.set_show_content(False)
 
@@ -1092,6 +1134,14 @@ class HistoryPage(Gtk.Box):
         client = get_client()
         if client is None or not client.is_authenticated:
             self._show_signed_out_state()
+            return
+
+        if filter_device_id is not None and getattr(self, "_alarm_history_active", False):
+            self._alarm_history.deactivate(clear=True)
+            self._alarm_history_active = False
+            self._mode_stack.set_visible_child_name("camera")
+        if getattr(self, "_alarm_history_active", False):
+            self._alarm_history.refresh()
             return
 
         self._reset_current_event()
@@ -1110,6 +1160,10 @@ class HistoryPage(Gtk.Box):
         self._start_history_fetch(append=False)
 
     def _show_signed_out_state(self) -> None:
+        if view := getattr(self, "_alarm_history", None):
+            view.deactivate(clear=True)
+            self._alarm_history_active = False
+            self._mode_stack.set_visible_child_name("camera")
         self._history_request_generation += 1
         self._playback_request_generation += 1
         self._history_loading = False
@@ -1145,6 +1199,9 @@ class HistoryPage(Gtk.Box):
     # ------------------------------------------------------------------
 
     def _start_history_fetch(self, *, append: bool) -> None:
+        if getattr(self, "_alarm_history_active", False):
+            self._alarm_history.refresh()
+            return
         if append:
             if self._history_loading or self._history_exhausted:
                 return
@@ -1221,7 +1278,9 @@ class HistoryPage(Gtk.Box):
         requested_device_ids: set[int] | None,
         generation: int,
     ) -> bool:
-        if generation != self._history_request_generation:
+        if generation != self._history_request_generation or getattr(
+            self, "_alarm_history_active", False
+        ):
             return GLib.SOURCE_REMOVE
         self._history_loading = False
         if not append:
@@ -1292,15 +1351,12 @@ class HistoryPage(Gtk.Box):
         return GLib.SOURCE_REMOVE
 
     def _fill_event_rows(self) -> None:
+        if getattr(self, "_alarm_history_active", False):
+            return
         self._clear_event_list()
         visible_events = self._visible_events()
         if not visible_events:
-            if self._selected_device_index == len(self._device_options) + 1:
-                self._list_placeholder.set_title("Alarm and Sensors")
-                self._list_placeholder.set_description(
-                    "Alarm and sensor event history is not available in Halo yet."
-                )
-            elif self._active_filter_keys:
+            if self._active_filter_keys:
                 self._list_placeholder.set_title("No matching events")
                 self._list_placeholder.set_description("No events match the current filters.")
             else:
@@ -1428,6 +1484,8 @@ class HistoryPage(Gtk.Box):
     # ------------------------------------------------------------------
 
     def _on_event_selected(self, list_box: Gtk.ListBox, row) -> None:
+        if getattr(self, "_alarm_history_active", False):
+            return
         if row is None:
             return
         event = getattr(row, "_event_data", None)
@@ -1807,6 +1865,8 @@ class HistoryPage(Gtk.Box):
         self._start_media_save(ev, "download")
 
     def _on_screenshot(self, *_) -> None:
+        if getattr(self, "_alarm_history_active", False):
+            return
         png = self._player.get_current_frame_png()
         if png is None:
             self._show_save_toast("No video frame is available to save")
@@ -2007,8 +2067,11 @@ class HistoryPage(Gtk.Box):
         self._rebuild_device_filter()
         self._reset_current_event()
         if self._selected_device_index == len(self._device_options) + 1:
-            self._fill_event_rows()
+            self.show_alarm_history()
             return
+        self._alarm_history_active = False
+        self._alarm_history.deactivate(clear=True)
+        self._mode_stack.set_visible_child_name("camera")
         self._reload_history()
 
     def _update_device_filter_label(self) -> None:
