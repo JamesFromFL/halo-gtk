@@ -67,16 +67,26 @@ Factory discovery found gtk4paintablesink, playbin, appsrc/appsink,
 PulseAudio source/sink, H.264/AAC decoders and Opus decoder.
 
 The completed build was installed only in the task-local installation and run
-against **Platform**, not the build SDK. All application modules imported,
+against **Platform**, not the build SDK. All 93 application modules imported,
 version metadata reported 0.1.0, the schema was available, and all 43 selected
 Python distributions (runtime plus build tools) were verified under `/app`.
 The packaged command also passed its `--help` smoke check.
 
-Six runtime tests passed: generated H.264/AAC playback through the actual GTK
-paintable, pause/resume, frame capture, end of stream and cleanup, plus synthetic
-WebRTC media/renewal/talkback compatibility. Qualification used an isolated
-Broadway display, fake audio and no desktop session bus. The local packaging,
-startup and settings checks passed as well.
+The expanded runtime suite passed 198 checks: generated H.264/AAC playback
+through the actual GTK paintable, pause/resume, frame capture, end of stream and
+cleanup; synthetic WebRTC media/renewal/talkback; narrow/wide native layouts;
+qualified device controls; Intercom lifecycle; and local-history account/storage
+behavior. The local packaging, startup and settings checks passed as well.
+
+Qualification uses an isolated Broadway display, fake audio and no Ring network
+access. GNOME's image loader needs `org.freedesktop.portal.Flatpak` to launch its
+own sandbox. The expanded run enables the filtered session bus for that broker,
+retains the sandbox's normal `XDG_RUNTIME_DIR`, and explicitly denies Secret
+Service and the separate host-command `org.freedesktop.Flatpak` service. Other
+HOME/XDG locations use temporary directories. Normal layout tests require a real
+decoded packaged logo. An additional run with no session bus passed the
+failure-injection startup/navigation check: a failed logo decoder produces a
+symbolic icon without preventing Halo from opening.
 
 These checks do not prove real Ring sessions, microphone/speaker quality, portal
 directory grants, credential prompts, notifications, tray behavior or support

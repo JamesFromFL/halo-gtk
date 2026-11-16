@@ -109,13 +109,24 @@ and Off requests, and fresh report verification. Group controls are experimental
 an aggregate report does not establish every lamp's physical state. Intercom Audio
 and Video devices have reported status, incoming call/unlock observations and
 explicit entrance release with an expiring confirmation. Acceptance never proves
-a physical door opened or relocked. Calling remains in the Ring app; see
+a physical door opened or relocked. Qualified Intercom Video devices also offer
+an explicit experimental live session with listening and hold-to-talk; audio-only
+Intercom calling remains in the Ring app. See
 [Intercom support and limits](doc/intercom-support.md).
+
+Recognized Beams lights offer finite On and return-to-automatic controls,
+including bridge-only locations. Keypads offer qualified brightness controls,
+a local brightness lock and observed proximity. Camera lights distinguish
+pending requests from fresh reported outcomes. Read the [Beams](doc/beams-support.md),
+[keypad](doc/keypad-support.md) and [camera lighting](doc/camera-lighting.md) guides
+for device requirements and hardware acceptance limits.
 
 Volume changes require Apply and a fresh Ring report before Halo confirms them.
 After a sound request, confirm **The sound has stopped** before changing another
 setting. Request acceptance cannot establish that the device played a sound.
 See [Chime support and limits](doc/chime-support.md).
+
+Qualified Chimes also expose snooze/resume and automatic-nightlight settings.
 
 Light Groups offers 1-, 5- and 15-minute On requests, with a one-minute default.
 These are Halo duration choices; actual shutoff behavior requires hardware
@@ -148,7 +159,10 @@ actions, and diagnostics from an adaptive Adwaita layout.
   header's Appearance menu. Halo saves the choice locally for future launches.
 - **Desktop event awareness.** Optional notifications can include Ring-provided
   descriptions and preview images, with actions that return to the relevant
-  camera or event.
+  camera or event. Quiet hours, timed snooze and per-device rules let you choose
+  when routine notifications appear.
+- **Current Ring privacy.** Camera live media and previews honor fresh settings
+  from Ring, with clear feedback when permission is unknown, stale or disabled.
 - **Thoughtful stream ownership.** The monitoring wall and focused view reuse
   compatible live sessions while keeping audio and talkback state explicit.
 - **Local media tools.** Screenshots, downloaded recordings, Favorites, cache,
@@ -192,6 +206,11 @@ The installer creates `.venv` with access to system GObject libraries, installs
 the locked production dependencies, and adds the launcher, desktop entry,
 icons, and settings schema under your user directories. The launcher points to
 this checkout, so keep it at the same path while Halo is installed.
+
+For staged releases and local rollback, use the optional
+[managed installer](doc/staged-install-design.md). An experimental x86_64
+[GNOME 50 Flatpak](doc/flatpak-packaging.md) provides a bundled runtime candidate
+with its own qualification and desktop-integration limits.
 
 If `halo-gtk` is not found after installation, add `$HOME/.local/bin` to your
 `PATH` or start it with `$HOME/.local/bin/halo-gtk`.
@@ -298,10 +317,12 @@ does not cancel a request that may have reached Ring. Pending and terminal
 outcomes are retained by the service while the application runs.
 
 Activity has a separate **experimental Alarm cloud history** view.
-It uses a bounded session cache and labels unsupported fields and uncertain
-coverage. It does not provide a guaranteed complete archive, persist an Alarm
-journal, or treat historical events as current state. Unique server event IDs,
-account-specific schemas, pagination and live history coverage remain unverified.
+It labels unsupported fields and uncertain coverage. Optional local copies are
+off by default, with 7- or 30-day retention after retrieval and an explicit clear
+action. Saved copies are scoped to the signed-in account and require recent
+location permission verification; they are not a complete archive or current
+Alarm state. See [local history](doc/local-history-design.md) and
+[cloud coverage](doc/alarm-history-coverage.md).
 
 Recognized current Alarm signals can produce desktop alerts. Routine mode,
 sensor and health notifications are opt-in. Alarm notification details are off
@@ -316,8 +337,9 @@ active alarm/life-safety conditions, cellular backup and incomplete status remai
 read-only. Current shared-role permissions are not guessed from camera access.
 
 Halo is not an emergency-monitoring service. Panic/dispatch, Alarm siren,
-lock/switch/valve controls, schedules, access codes and device configuration
-remain outside this scope. Keep the official Ring app or keypad available for
+generic lock/switch/valve controls beyond the qualified Beams actions, schedules,
+access codes and other device configuration remain outside this scope. Keep the
+official Ring app or keypad available for
 setup, mode control and critical response. See [Alarm implementation notes](doc/alarm-implementation-2026-10-26.md)
 for architecture, bounds and the live validation checklist.
 
@@ -330,13 +352,10 @@ private and evolving, and availability varies by device, account permissions,
 region, subscription, and Ring service behavior. Keep the official Ring app
 available for setup, account management, and critical security workflows.
 
-### Planned work
-
-- Expand support for non-camera Ring devices.
-- Validate and expand experimental Alarm history, notifications and controls against live hardware.
-- Add broader Linux packaging, including AUR and Flatpak options.
-- Build a dedicated browser for locally saved Favorites and media.
-- Add more advanced per-device notification behavior.
+The [implementation report](doc/backlog-completion-2026-11-16.md) records the
+latest development and verification. Remaining hardware/protocol acceptance is
+tracked in the [improvement backlog](doc/improvement-backlog.md) and
+[integration research notes](doc/backlog-research-gates-2026-11-16.md).
 
 <details>
 <summary><strong>Development</strong></summary>

@@ -2,6 +2,8 @@
 
 Saved recommendations from 16 November 2026. The native GNOME interface redesign
 is committed as `c9475b2`; the items below preserve the separate feature work.
+The [completion report](backlog-completion-2026-11-16.md) records the delivered
+slices, verification and remaining acceptance gates.
 
 ## Progress
 
