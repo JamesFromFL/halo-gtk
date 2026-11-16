@@ -9,6 +9,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 This section tracks the work toward Halo GTK's first tagged release.
 
 ### Added
+- An opt-in native playback qualification using generated H.264/AAC media,
+  with pause/resume, frame capture, end-of-stream and cleanup checks.
 - Follow system, Light, and Dark appearance choices, saved locally across launches.
 - Experimental Intercom status, bounded live call/unlock observations and notifications,
   and single-use confirmed entrance release with honest RPC/uncertain outcomes.
@@ -45,6 +47,9 @@ This section tracks the work toward Halo GTK's first tagged release.
 - Automated lint, test, dependency-audit, schema, desktop-file, and installed-wheel checks.
 
 ### Changed
+- Dependency auditing retains the full scanner report and checks exact package
+  coverage. Reviewed OAuthlib authorization-server exceptions are scoped to the
+  locked package/version; new findings, incomplete scans and unknown aliases fail.
 - Camera and group light actions share a client-owned no-queue reservation with
   bounded deadlines. Camera results are recorded before releasing the guard, so
   delayed GTK callbacks cannot revive overrides cleared by a newer group action.
@@ -78,6 +83,8 @@ This section tracks the work toward Halo GTK's first tagged release.
   compatibility contracts.
 
 ### Fixed
+- Updated dnspython to 2.9.2 and added a security floor for camera connection
+  setup, with offline mDNS compatibility and malformed-input regression checks.
 - Live video backlog is bounded, source frame intervals and audio gaps are
   retained, and stale microphone results cannot change a newer talkback request.
 - Microphone startup and late capture failures reset the control and show a

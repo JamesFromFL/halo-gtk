@@ -43,15 +43,21 @@ jobs:
             --no-emit-project \
             --output-file /tmp/halo-requirements.txt
       - name: Audit locked production dependencies
-        # OAuthlib's PKCE authorization-server advisory does not affect Halo's
-        # password-grant client. Ring currently requires oauthlib<4; see SECURITY.md.
+        # Review exact package/version/advisory exceptions without filtering the
+        # raw report. All other findings and incomplete results fail closed.
         run: |
-          uv run --frozen --only-group audit pip-audit \
-            --require-hashes \
-            --disable-pip \
-            --progress-spinner off \
-            --ignore-vuln CVE-2026-49265 \
-            --requirement /tmp/halo-requirements.txt
+          uv run --frozen --only-group audit python scripts/audit_dependencies.py \
+            --requirements /tmp/halo-requirements.txt \
+            --report dependency-audit.json
+      - name: Preserve raw dependency audit
+        # This exact report contains the public PyPI dependencies exported above;
+        # the local project is excluded. Retain it with this repository's CI run.
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dependency-audit
+          path: dependency-audit.json
+          retention-days: 14
 
   test:
     runs-on: ubuntu-latest

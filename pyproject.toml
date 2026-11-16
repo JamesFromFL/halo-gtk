@@ -29,6 +29,8 @@ dependencies = [
     "requests>=2.32",
     # Halo patches aiortc 1.15.0 internals; validate any upgrade before widening.
     "aiortc==1.15.0",
+    # aioice parses untrusted mDNS packets; require the DNS parser security fixes.
+    "dnspython>=2.9.2,<3",
     # Live stream frame conversion/padding via PyAV VideoFrame.to_ndarray().
     "numpy>=1.26",
     "Pillow>=13.0.0",
