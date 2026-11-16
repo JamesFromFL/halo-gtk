@@ -441,6 +441,13 @@ class SettingsPage(Gtk.Box):
     def _add_notification_groups(self, page: Adw.PreferencesPage) -> None:
         desktop_group = Adw.PreferencesGroup(title="Desktop Notifications")
         page.add(desktop_group)
+        self._add_button_row(
+            desktop_group,
+            "Notification Rules",
+            "Quiet hours, snooze, and preferences for each device.",
+            "Configure",
+            self._open_notification_rules,
+        )
 
         self._notifications_switch = self._add_switch_row(
             desktop_group,
@@ -537,6 +544,11 @@ class SettingsPage(Gtk.Box):
         self._custom_alarm_message_row.set_tooltip_text(
             "Included only when Alarm notification details are enabled."
         )
+
+    def _open_notification_rules(self, *_args) -> None:
+        from halo_gtk.notification_preferences import NotificationPreferences
+
+        NotificationPreferences().present(self)
 
     def _build_advanced_page(self) -> Gtk.Widget:
         scrolled = Gtk.ScrolledWindow(

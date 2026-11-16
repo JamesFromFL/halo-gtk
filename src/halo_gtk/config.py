@@ -11,6 +11,7 @@ from typing import Any
 
 from halo_gtk import APP_ID, storage_paths
 from halo_gtk.atomic_io import atomic_write_json
+from halo_gtk.notification_rules import normalize as normalize_notification_rules
 
 _log = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ _DEFAULTS: dict[str, Any] = {
     "alarm_notification_details": False,
     "notification_preview_images": True,
     "notification_summaries": True,
+    "notification_rules": {},
     "custom_notification_messages": False,
     "custom_doorbell_message": "",
     "custom_motion_message": "",
@@ -189,6 +191,7 @@ def _read_json_file(path: Path | None = None) -> dict[str, Any] | None:
 
 def _normalise_config(config: dict[str, Any]) -> dict[str, Any]:
     data = {key: config.get(key, default) for key, default in _DEFAULTS.items()}
+    data["notification_rules"] = normalize_notification_rules(data["notification_rules"])
     if data["appearance"] not in ("system", "light", "dark"):
         data["appearance"] = "system"
     data["show_notifications"] = _coerce_bool(

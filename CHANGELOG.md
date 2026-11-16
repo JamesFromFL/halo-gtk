@@ -9,6 +9,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 This section tracks the work toward Halo GTK's first tagged release.
 
 ### Added
+- Local notification quiet hours, timed snooze and per-device rules, with native
+  preferences and delivery-time checks. Enabled critical Alarm alerts bypass
+  these routine-notification rules.
 - An opt-in native playback qualification using generated H.264/AAC media,
   with pause/resume, frame capture, end-of-stream and cleanup checks.
 - Follow system, Light, and Dark appearance choices, saved locally across launches.

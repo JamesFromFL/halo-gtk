@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from math import isfinite
 
 from halo_gtk import config as _config
-from halo_gtk import device_names
+from halo_gtk import device_names, notification_rules
 from halo_gtk.alarm.events import AlarmEvent
 from halo_gtk.ring_events import normalized_event_kind
 
@@ -159,6 +159,20 @@ def withdraw_alarm_notifications(*, generation=None, location_id=None) -> None:
 def alarm_event_enabled(event: AlarmEvent, cfg: dict) -> bool:
     if not _notifications_enabled(cfg) or not cfg.get("notify_alarm", True):
         return False
+    if not notification_rules.allowed(
+        cfg,
+        notification_rules.device_key("alarm", event.location_id),
+        event.category,
+        critical=event.critical,
+    ):
+        return False
+    if not notification_rules.allowed(
+        cfg,
+        notification_rules.alarm_device_key(event.location_id, event.asset_id, event.zid),
+        event.category,
+        critical=event.critical,
+    ):
+        return False
     return event.category == "alarm" or (
         event.category in {"mode", "sensor", "health"}
         and bool(cfg.get(f"notify_alarm_{event.category}", False))
@@ -291,9 +305,20 @@ def send_ring_notification(event) -> None:
     # the dedicated normalized CLAP observation stream.
     if _is_alarm_kind(kind):
         return
-    if not _notifications_enabled(cfg) or not _event_type_enabled(kind, cfg):
+    if not _ring_event_enabled(event, cfg):
         return
     _enqueue_notification(event, cfg)
+
+
+def _ring_event_enabled(event, cfg: dict) -> bool:
+    kind = _event_kind(event)
+    return (
+        _notifications_enabled(cfg)
+        and _event_type_enabled(kind, cfg)
+        and notification_rules.allowed(
+            cfg, notification_rules.device_key("camera", getattr(event, "doorbot_id", None)), kind
+        )
+    )
 
 
 def _enqueue_notification(event, cfg: dict) -> None:
@@ -336,11 +361,12 @@ def _prepare_ring_notification(
     *,
     allow_enrichment: bool = True,
 ) -> None:
-    cfg = cfg or _config.load()
+    # Re-read queued work: a newly enabled snooze must stop enrichment as well.
+    cfg = _config.load()
     kind = _event_kind(event)
     if _is_alarm_kind(kind):
         return
-    if not _notifications_enabled(cfg) or not _event_type_enabled(kind, cfg):
+    if not _ring_event_enabled(event, cfg):
         return
 
     context = {}
@@ -376,8 +402,8 @@ def _prepare_ring_notification(
         gi.require_version("GLib", "2.0")
         from gi.repository import GLib
 
-        GLib.idle_add(
-            lambda: (
+        def deliver():
+            if _ring_event_enabled(event, _config.load()):
                 send_notification(
                     summary,
                     body,
@@ -386,9 +412,9 @@ def _prepare_ring_notification(
                     target=target,
                     urgency=urgency,
                 )
-                or False
-            )
-        )
+            return False
+
+        GLib.idle_add(deliver)
     except Exception as exc:
         _log.debug("Failed to schedule Ring notification: %s", exc)
 

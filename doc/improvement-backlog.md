@@ -3,9 +3,19 @@
 Saved recommendations from 16 November 2026. The native GNOME interface redesign
 is committed as `c9475b2`; the items below preserve the separate feature work.
 
+## Progress
+
+- Maintenance and isolated desktop qualification: complete in `3d310cb`;
+  live-device acceptance remains separate.
+- Device-write replay prevention prerequisite: complete in `8972a06`.
+- Local notification rules, snooze and quiet hours: complete; see
+  [notification rules](notification-rules.md). Critical Alarm preferences retain
+  their existing master controls.
+- Camera privacy, receive-path recovery and device controls: in progress.
+
 ## 1. Maintenance and desktop baseline
 
-Current work: resolve the locked dependency-audit failure, document advisory
+Completed: resolve the locked dependency-audit failure, document advisory
 applicability, retain raw audit evidence, and qualify a fresh isolated runtime and
 installable wheel. Keep the validated Ring, aiortc and PyAV compatibility pins
 unless a separate review justifies a change.

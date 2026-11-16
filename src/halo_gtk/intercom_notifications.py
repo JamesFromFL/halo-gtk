@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import suppress
 from html import escape
 
-from halo_gtk import config
+from halo_gtk import config, notification_rules
 from halo_gtk.light_groups import light_group_monotonic_time
 
 _active = []
@@ -51,6 +51,10 @@ def send_intercom_notification(device, observation, generation):
 
     cfg = config.load()
     if not cfg.get("show_notifications", True) or not cfg.get("notify_doorbell", True):
+        return
+    if not notification_rules.allowed(
+        cfg, notification_rules.device_key("intercom", device.api_id), observation.kind
+    ):
         return
     if not _ensure_notify():
         return
