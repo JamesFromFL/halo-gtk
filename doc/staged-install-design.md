@@ -1,142 +1,180 @@
-# Proposed staged installation and rollback
+# Managed installation, updates and rollback
 
-Status: design for review. No managed installer, migration or rollback command is
-implemented by this document. The existing checkout workflow remains supported.
+Halo supports an optional managed profile that validates a new release before
+changing the desktop launcher. The existing checkout installer remains the default.
+Managed installation never pulls, resets, stashes or changes a Git checkout, and
+never stops an application or sends commands to Ring devices.
 
-## Problem and acceptance condition
+## Commands
 
-The current updater advances Git before dependency/runtime validation; a later
-failure can leave the launched environment unusable. Desktop publication can also
-succeed before a cache command fails. The proposed optional managed installation
-keeps an independently runnable last-good release until candidate validation and
-activation complete. A failed update must leave the launcher pointing at that
-release, with a clear recoverable status and no change to user media/credentials.
+Run these from a local Halo checkout. `uv 0.11.24`, Git, a compatible system Python,
+and Halo's native GTK/GStreamer dependencies must already be installed.
 
-The lab established atomic pointer replacement, final-path venv construction,
-four handled failure/rollback points and concurrent readers. It did not establish
-power-loss recovery, Halo runtime checks, asset transactions or data migration.
-Those require the acceptance tests below; the prototype is not an installer.
+```sh
+# Stage the committed HEAD and activate it after validation.
+scripts/install.sh --managed
 
-## Installation layout and ownership
+# Existing checkout installation: explicitly authorize replacing its launcher
+# and desktop entry. Close that app first. Exact original files are backed up.
+scripts/install.sh --managed --replace-checkout
 
-Use an opt-in managed profile separate from a developer checkout. Illustrative
-layout under the existing absolute XDG data directory:
+# Stage a local commit without activating it.
+python3 scripts/managed_install.py stage --ref HEAD
+
+# Review staged/active releases, then activate a reported release identifier.
+python3 scripts/managed_install.py status
+python3 scripts/managed_install.py activate RELEASE_ID
+
+# Build the checkout's current committed HEAD and activate it.
+scripts/update.sh --managed
+
+# Revalidate and switch to the previous release; repeating switches back.
+python3 scripts/managed_install.py rollback
+
+# Restore backed-up checkout integration, or remove managed integration.
+scripts/uninstall.sh --managed
+```
+
+`stage`, `install` and `update` accept `--repository PATH`, `--ref LOCAL_REF`,
+`--python PATH` and `--uv PATH`. References must resolve to existing local commits.
+A dirty checkout is left alone; uncommitted and untracked files are not packaged.
+Fetch or advance the checkout separately when a newer remote revision is wanted.
+No fetch occurs during staging, activation or rollback. The generated launcher
+uses the internal `launch -- ARGS...` command and forwards arguments literally.
+
+The default root is `$XDG_DATA_HOME/halo-gtk/managed`, falling back to
+`~/.local/share/halo-gtk/managed` when the XDG value is empty or relative. Direct
+commands also accept `--root ABSOLUTE_DATA_HOME/halo-gtk/managed` **before** the
+subcommand. The normal `~/.local/bin/halo-gtk` launcher remains the entry point,
+including for Halo's existing login-autostart preference.
+
+## Release layout and validation
 
 ```text
 halo-gtk/managed/
   install.lock
-  transaction.json
-  releases/<source-id>-<lock-id>-<runtime-id>/
-    source/
-    .venv/
-    release.json
-    assets/
-  current -> releases/<validated-release>
-  previous -> releases/<last-good-release>
+  installation.json             original and published desktop files
+  transaction.json              present only during an incomplete transaction
+  manager-<digest>.py            versioned launcher bootstrap
+  build-cache/                  private uv dependency cache
+  releases/<commit>-<lock>-<nonce>/
+    candidate.json              ownership marker, including failed candidates
+    source/                     archive of the selected committed revision
+    .venv/                      created here, never relocated
+    assets/schemas/              private compiled GSettings schema
+    assets/icon.png              release icon
+    release.json                successful qualification and format metadata
+    logs/                       build and health command output
+    use.lock                    running-release lease
+  current -> releases/<active>
+  previous -> releases/<last-good>
 ```
 
-Release IDs are installer generated, path-safe and collision resistant. Build
-each venv at its final absolute path, never rename or relocate a completed venv.
-Use a pinned uv version and a hash-checked frozen lock. Record source revision,
-lock digest, Python executable/version, system GI/GStreamer versions and health
-check results in `release.json`. A release is immutable after validation.
+The installer rejects unexpected symlinks, foreign-owned managed boundaries,
+unsafe release identifiers and malformed transaction metadata. The managed root
+is private. Source archives cannot contain links or paths escaping the release,
+and have a 256 MiB extraction limit. Each release records its commit, SHA-256 lock
+digest, uv version, Python and native runtime versions, validation result and
+local data-format compatibility marker. Activation verifies the lock digest.
 
-Config, Secret Service credentials, media, Favorites and caches retain their
-current locations. They are not copied into releases or included in rollback
-snapshots without a separate explicit policy. Relative/empty XDG variables use
-the application's current fallback; reject invalid managed paths, foreign-owned
-directories and unexpected symlinks in installer-owned staging/manifest paths.
-Retain the shell/Desktop Exec quoting and symlink-safe atomic publishing already
-present in the installer. File modes and fsync failures are part of the result.
+Staging checks the pinned uv version and lock consistency, creates the environment
+at its final absolute path with system site-packages, then performs a frozen,
+noneditable production install. It compiles the release-local schema with strict
+validation. Native qualification checks the required GI namespaces, libadwaita
+minimum, media plugins, all application imports and the installed CLI help path.
+Health checks use temporary HOME/XDG directories, an in-memory GSettings backend
+and an unavailable session bus. They do not log in, contact Ring, instantiate
+media capture elements or read the user's Secret Service credentials.
 
-The stable launcher resolves `current` once to a concrete validated release and
-executes that release's Python/module by absolute path. Do not perform separate
-pointer lookups for interpreter and source. Continue using the release's Python
-after activation changes; never garbage-collect releases while an instance or
-installer uses them. Prefer a per-release shared lease (`flock`) held across
-exec, with an exclusive nonblocking lease required for deletion.
+Build commands have deadlines up to ten minutes; native checks have 45/20-second
+deadlines. Output goes to files, avoiding a pipe held open by a descendant.
+Timeout cleanup signals only that subprocess's new process group. Logs are
+bounded by command time, **not by a byte quota**; release logs and failed candidates
+are retained for diagnosis. Staging needs enough disk space for source, a complete
+second environment and the dependency cache.
 
-## Transaction and activation
+## Activation and failure recovery
 
-1. Acquire an exclusive installer lock and validate owned paths. Recover any
-   recorded interrupted transaction before starting another update. Verify source
-   provenance and lock integrity. A developer checkout with local modifications
-   must never be reset or overwritten by managed update.
-2. Create a uniquely named candidate at its final release path. Persist an atomic
-   transaction manifest identifying prior current/previous releases, candidate
-   and every installer-owned temporary path. Build dependencies and stage assets
-   without altering active release files or user data.
-3. Run no-account checks in isolated XDG paths: imports/GI, plugin capabilities,
-   schema validation, launcher quoting and a bounded offline application smoke
-   test. No Ring login, camera/Alarm command or live microphone is a health check.
-   A checked subprocess must have a deadline and its children must be reaped.
-4. Request graceful shutdown of the existing owned app and wait for its jobs and
-   configuration writes to resolve. If it cannot stop within the stated limit,
-   leave the active pointer unchanged and report that activation is deferred;
-   do not broadly match or forcibly kill unrelated Python processes.
-5. Prepare stable launcher/desktop entries and versioned assets, validate them,
-   then activate using same-directory temporary symlinks and `os.replace`.
-   Fsync the relevant files/directories and journal each completed phase. Only
-   `current` is the launch selector; `previous` and the manifest are recovery
-   metadata, not a second independently authoritative activation switch.
-6. Run a bounded post-activation offline health check. On handled failure restore
-   the old pointer and any owned asset manifest, retain diagnostics, and return
-   failure. On success mark committed and retain the previous release. Starting
-   the UI is a separate explicit final action, not an unbounded health check.
+The installer serializes operations with a file lock. A managed launch resolves
+`current` once, validates that release, acquires its shared lease and then executes
+its concrete Python and package. Activation and uninstall require exclusive
+leases. If Halo is running from an affected release, activation is deferred; the
+candidate remains staged and the launcher still selects the old release. Close
+Halo normally and retry `activate`. No process is stopped by the installer.
 
-Atomic rename alone does not make the whole installation transactional or
-power-loss durable. On restart inspect the journal and validated release
-manifests; choose the last committed healthy release, reconcile incomplete
-asset publication and retain the candidate for diagnosis until cleanup is safe.
-Define and test each interruption point before claiming crash recovery.
+Explicit checkout migration also checks literal owned launcher/executable process
+arguments and defers when a known checkout instance is running. Custom launchers
+may not expose that executable, and a checkout has no managed lease: close all
+checkout instances before migration and do not start another during it. No broad
+process-name matching or forced shutdown is performed.
 
-## Assets, data compatibility and rollback
+The activation journal records the old pointers and exact desktop-file content
+and modes before publication. The launcher and desktop entry are atomically
+replaced, then `previous` and `current` are switched. A second isolated health
+check must succeed before the journal is committed. Handled failures restore the
+old selection and original published files. Existing files require explicit
+`--replace-checkout` on first installation; later outside edits are preserved and
+cause a clear failure instead of being silently overwritten.
 
-One pointer cannot atomically replace several desktop files, schemas, icons and
-cache databases. Keep the stable launcher/desktop interface backward compatible;
-prefer immutable versioned asset directories and a journaled, idempotent asset
-publisher. Cache regeneration failure should have an explicit warning/recovery
-policy instead of falsely claiming the entire release is unusable. Document which
-asset changes require session refresh. Verify rollback after each asset failure.
+`status`, staging and other modifying commands first recover an interrupted
+transaction. An uncommitted transaction restores its prior state; a committed
+transaction retains the new release. Recovery is idempotent. A partial uninstall
+keeps its journal until owned-release cleanup finishes. If a desktop file was
+changed outside the transaction, recovery stops without overwriting that change.
+Malformed journals also fail closed. The launcher refuses an unresolved journal
+and explains how to run recovery.
 
-Rollback must verify that the prior release's recorded runtime and data format
-remain supported before switching. No application schema migration is included
-in this proposal's first implementation. Future data migrations need explicit
-versioning, compatibility windows, backups and a separately reviewed rollback
-policy; restoring code cannot undo an irreversible shared-data migration.
-User recordings/Favorites and credentials must never be deleted by a rollback.
+Atomic replacement and fsync are used for publication, but this is not a claim of
+power-loss durability across every filesystem. Process interruption at each
+publication phase is tested; power-cut/VM filesystem testing remains a separate
+qualification. Both releases still rely on system Python, GTK, GStreamer and
+shared OS services. An OS upgrade can break both, and rollback reports a failed
+native check instead of promising to undo OS changes.
 
-Both releases depend on system Python/GI/GStreamer and shared OS services. An OS
-upgrade can break both; report that limitation and the exact failed health check.
-Do not claim this design is a container or a complete system rollback.
+## Assets, data and uninstall
 
-Uninstall removes only manifest-owned managed releases/assets after releasing
-owned app jobs, preserving media/config unless the user explicitly requests their
-removal. Reuse literal process matching. Never follow a replaced launcher or
-desktop symlink to delete its target. Clean stale candidates only after acquiring
-the installer lock, checking ownership and excluding active/leased releases.
+Schemas and icons stay inside each immutable release. The launcher sets
+`GSETTINGS_SCHEMA_DIR`; the desktop icon follows `current`. No shared icon/schema
+cache or other application's desktop assets are rewritten. A desktop shell may
+need to refresh an already displayed icon after activation.
 
-## Required tests and rollout gates
+Settings, Secret Service credentials, recordings, Favorites and caches remain in
+their existing locations. They are not copied into releases, changed by staging,
+or restored by rollback. This first format performs **no data migration**. Future
+incompatible data migrations require a separately versioned rollback policy;
+restoring code cannot undo a shared-data migration.
 
-- Existing and new installation paths with spaces, quotes, percent signs,
-  backslashes, relative/empty XDG values and malicious symlinks.
-- Fail dependency resolution/sync, health checks, disk writes/fsync, full disk,
-  every desktop publication/cache step and post-activation validation; verify the
-  old launcher still runs and settings/media hashes remain unchanged.
-- Kill the installer before/after each journal or pointer fsync, restart recovery,
-  repeat recovery, and inject competing update/uninstall attempts. Power-loss
-  durability requires a filesystem/VM test, not only process kill tests.
-- Readers and already running releases during repeated activation; release-lease
-  protection against cleanup; blocked graceful stop and unresponsive subprocess
-  termination/reaping; no unrelated process affected.
-- First managed installation and explicit migration from a checkout, rollback
-  through at least two versions, missing/broken system dependencies, compatible
-  desktop assets, autostart and complete uninstall ownership verification.
+Uninstall refuses active leases or externally modified desktop files. It restores
+exact original checkout launcher/desktop files when migration saved them;
+otherwise it removes managed integration. A newly created autostart file is
+removed only when it exactly matches Halo's generated entry for this launcher,
+did not predate managed installation, and no original launcher is being restored.
+Custom or pre-existing autostart entries are preserved. Only release directories
+with installer ownership markers are deleted. User data and credentials remain.
+The private lock, versioned bootstraps and dependency cache remain to preserve
+concurrent-operation safety and allow a later reinstall; there is no automatic
+release garbage collection while installed.
 
-Approval requested after reviewing this design: implement the optional managed
-profile, its migration/asset/recovery policy and test suite in a separate change.
-Keep production scripts unchanged until that implementation is validated. The
-current UI/runtime upgrades do not depend on approval of this installation model.
+## Qualification
+
+Synthetic tests use temporary Git repositories and fake runtimes: committed-ref
+selection, normal/failed staging, exact migration backups, special-path argument
+quoting, two-way rollback, managed/check-out running-process deferral, concurrent
+locks, malformed journal rejection, disk/fsync failure, post-activation failure,
+changed-file protection, source/path symlinks, autostart ownership and interrupted
+uninstall cleanup. Actual subprocess exit at every publication checkpoint proves
+that subsequent recovery is idempotent. A timeout test verifies the command's
+process group stops while an unrelated synthetic process remains alive.
+
+The first real qualification used committed `15fe841` in an isolated temporary
+HOME, system Python, pinned uv and the already verified dependency cache. Frozen
+installation, native capability discovery, offline entry-point smoke, two
+activations and rollback passed. Real uninstall also removed the managed
+integration, then a second migration/uninstall restored exact synthetic checkout
+launcher and desktop contents and modes while preserving settings. This
+demonstrates the local Arch runtime; it is not an assertion that all Linux
+distributions or future system upgrades are qualified. No real desktop
+installation, active app, Ring account or device was changed.
 
 References: [venv path constraints](https://docs.python.org/3.14/library/venv.html),
 [atomic same-filesystem replacement](https://docs.python.org/3.14/library/os.html#os.replace).

@@ -23,6 +23,9 @@ is committed as `c9475b2`; the items below preserve the separate feature work.
   [history coverage](alarm-history-coverage.md). Persistent history is separate.
 - Qualified keypad brightness, local control lock and observed proximity:
   complete; see [keypad support](keypad-support.md).
+- Optional staged installer, rollback and interruption recovery: complete; see
+  [managed installation](staged-install-design.md). System runtime dependencies
+  remain shared; this does not establish broader distribution compatibility.
 
 ## 1. Maintenance and desktop baseline
 

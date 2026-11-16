@@ -4,6 +4,10 @@ set -euo pipefail
 APP_ID="io.github.JamesFromFL.HaloGtk"
 APP_NAME="halo-gtk"
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${1:-}" == "--managed" ]]; then
+  shift
+  exec python3 "$REPO_ROOT/scripts/managed_install.py" install --repository "$REPO_ROOT" "$@"
+fi
 DATA_HOME="${XDG_DATA_HOME:-}"
 [[ "$DATA_HOME" = /* ]] || DATA_HOME="$HOME/.local/share"
 BIN_DIR="$HOME/.local/bin"

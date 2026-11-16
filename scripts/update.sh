@@ -2,6 +2,10 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${1:-}" == "--managed" ]]; then
+  shift
+  exec python3 "$REPO_ROOT/scripts/managed_install.py" update --repository "$REPO_ROOT" "$@"
+fi
 
 if [ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]; then
   printf '%s\n' "Refusing to update because the working tree has local changes." >&2
