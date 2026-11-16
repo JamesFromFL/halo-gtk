@@ -9,6 +9,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 This section tracks the work toward Halo GTK's first tagged release.
 
 ### Added
+- Optional account-bound local Alarm history with Off/7-day/30-day retention,
+  explicit clear, separate saved/cloud sources and current-access checks.
+  Storage workers preserve media responsiveness and reject stale account work.
 - Explicit experimental Intercom Video sessions for the qualified Video model,
   with Start/End, muted listening, hold-to-talk and account-aware cleanup.
   Audio-only Intercom calling still requires a verified protocol and hardware.
@@ -111,8 +114,9 @@ This section tracks the work toward Halo GTK's first tagged release.
   partial fields remain partial across multi-page reads.
 - H.264 receive recovery now rejects incomplete fragments, releases complete
   pictures promptly and requests a clean keyframe after bounded packet loss.
-- Device writes now prevent aiohttp or session middleware from replaying a
-  submitted request after a connection failure; ambiguous outcomes remain visible.
+- Device writes through the fixed Ring JSON transport prevent aiohttp or session
+  middleware from replaying a submitted request after a connection failure;
+  ambiguous outcomes remain visible.
 - Updated dnspython to 2.9.2 and added a security floor for camera connection
   setup, with offline mDNS compatibility and malformed-input regression checks.
 - Live video backlog is bounded, source frame intervals and audio gaps are

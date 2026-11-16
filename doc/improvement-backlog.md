@@ -16,7 +16,8 @@ is committed as `c9475b2`; the items below preserve the separate feature work.
 - Camera privacy and live-preview coordination: complete; see
   [camera privacy](camera-privacy.md). Ring receipt delays and live-device
   acceptance remain explicit limitations.
-- Remaining device controls: in progress.
+- Qualified device controls: complete for the scope below; further model and
+  protocol support remains subject to the recorded evidence gates.
 - Individual Beams discovery and qualified finite/automatic controls: complete;
   see [Beams support](beams-support.md). Physical-device acceptance is separate.
 - Camera light outcome reporting and read-only motion-timer information:
@@ -25,7 +26,11 @@ is committed as `c9475b2`; the items below preserve the separate feature work.
 - Chime snooze/resume and qualified automatic nightlight: complete; see
   [Chime support](chime-support.md). Physical-device acceptance remains separate.
 - Alarm history pagination guard and coverage reporting: complete; see
-  [history coverage](alarm-history-coverage.md). Persistent history is separate.
+  [history coverage](alarm-history-coverage.md).
+- Optional persistent local Alarm history: complete, off by default with
+  account-bound 7/30-day copies and explicit clear; see
+  [local history](local-history-design.md). Saved copies retain coverage limits
+  and require current account/location permission verification.
 - Qualified keypad brightness, local control lock and observed proximity:
   complete; see [keypad support](keypad-support.md).
 - Optional staged installer, rollback and interruption recovery: complete; see
@@ -77,16 +82,16 @@ compatibility.
 - Research and validate a durable manual floodlight hold. Neither project
   currently guarantees indefinite On; it is not a completed server feature to port.
 
-## Later work
+## Remaining qualification and deferred work
 
-- Per-device notification rules, snooze and quiet hours.
-- Safer staged installation/update with known-good rollback, then broader Linux
-  packaging.
-- Intercom answering with audio/video; observation and confirmed release already
-  exist.
-- Group configuration, membership and schedules only where Ring interfaces and
-  permissions are verified.
-- Alarm history pagination/coverage and optional persistent local history.
+- Owner-operated acceptance of the qualified controls, camera privacy and media.
+- Intercom Video hardware calling and audio acceptance; audio-only calling needs
+  its own verified protocol.
+- Permanent manual camera-light hold and native Ring group configuration,
+  membership and schedules require the evidence described in
+  [research gates](backlog-research-gates-2026-11-16.md).
+- Flatpak desktop portals, credential prompts, audio hardware and distribution
+  acceptance; sandbox host-startup integration remains future work.
 - Optional Halo Server connection mode, as a separately reviewed architecture
   change. The owner chose to keep GTK direct-to-Ring on 16 November 2026; this
   item is deferred by that decision. See [research gates](backlog-research-gates-2026-11-16.md).

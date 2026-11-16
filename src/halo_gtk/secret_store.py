@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -30,11 +32,78 @@ _EVENT_CREDENTIAL_ATTRIBUTES = {
 _LABEL = "Halo Ring OAuth token"
 _EMAIL_LABEL = "Halo Ring account email"
 _EVENT_CREDENTIAL_LABEL = "Halo Ring event listener credentials"
+_PROFILE_ATTRIBUTES = {"service": "ring", "account": "history-profiles"}
+_PROFILE_LABEL = "Halo local Alarm history account profiles"
+_HISTORY_METADATA_KEY = "_halo_local_history"
+_MAX_HISTORY_PROFILES = 16
 _MAX_JSON_NESTING = 64
 
 
 class SecretStoreError(RuntimeError):
     """Raised when Secret Service storage cannot be used."""
+
+
+class BoundRingToken(dict):
+    """OAuth keys only; optional ownership metadata never enters the SDK token."""
+
+    def __init__(self, token: dict, history_profile: str | None):
+        super().__init__(token)
+        self.history_profile = history_profile
+
+
+def valid_history_profile(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value) is not None
+
+
+def history_profile_for_account(username: str) -> str:
+    """Called only after successful fresh authentication, never from cached email."""
+    if (
+        not isinstance(username, str)
+        or not username.strip()
+        or len(username) > 256
+        or any(ord(char) < 32 or ord(char) == 127 for char in username)
+    ):
+        raise SecretStoreError("Account identity is unavailable for local history")
+    account = username.strip().casefold()
+    Secret = _secret_module()
+    raw = Secret.password_lookup_sync(_schema(), dict(_PROFILE_ATTRIBUTES), None)
+    if raw and (not isinstance(raw, str) or len(raw) > 32768):
+        raise SecretStoreError("Stored local history profiles exceed their size limit")
+    try:
+        profiles = json.loads(raw) if raw else {}
+    except (ValueError, TypeError) as exc:
+        raise SecretStoreError("Stored local history profiles are invalid") from exc
+    if (
+        not isinstance(profiles, dict)
+        or len(profiles) > _MAX_HISTORY_PROFILES
+        or any(
+            not isinstance(key, str)
+            or not key
+            or len(key) > 256
+            or key != key.strip().casefold()
+            or any(ord(char) < 32 or ord(char) == 127 for char in key)
+            or not valid_history_profile(value)
+            for key, value in profiles.items()
+        )
+        or len(set(profiles.values())) != len(profiles)
+    ):
+        raise SecretStoreError("Stored local history profiles are invalid")
+    if account in profiles:
+        return profiles[account]
+    if len(profiles) >= _MAX_HISTORY_PROFILES:
+        raise SecretStoreError("Local history account profile limit reached")
+    profile = uuid.uuid4().hex
+    profiles[account] = profile
+    if not Secret.password_store_sync(
+        _schema(),
+        dict(_PROFILE_ATTRIBUTES),
+        Secret.COLLECTION_DEFAULT,
+        _PROFILE_LABEL,
+        json.dumps(profiles, sort_keys=True),
+        None,
+    ):
+        raise SecretStoreError("Secret Service refused to store the local history profile")
+    return profile
 
 
 def _secret_module():
@@ -77,15 +146,34 @@ def load_ring_token() -> dict[str, Any] | None:
         if not isinstance(token, dict):
             clear_ring_token()
             raise SecretStoreError("Stored Ring token has an invalid format")
+        if _HISTORY_METADATA_KEY in token:
+            # Atomic metadata keeps OAuth fields at top level for older Halo
+            # builds. New builds remove the reserved field before SDK use.
+            metadata = token.pop(_HISTORY_METADATA_KEY)
+            profile = metadata.get("profile") if isinstance(metadata, dict) else None
+            bound = (
+                isinstance(metadata, dict)
+                and type(metadata.get("version")) is int
+                and metadata["version"] == 1
+                and set(metadata) == {"version", "profile"}
+                and valid_history_profile(profile)
+            )
+            return BoundRingToken(token, profile if bound else None)
         return token
 
     return _migrate_legacy_token_cache()
 
 
-def save_ring_token(token: dict[str, Any]) -> None:
+def save_ring_token(token: dict[str, Any], *, history_profile: str | None = None) -> None:
     """Store the Ring OAuth token in Secret Service."""
     Secret = _secret_module()
-    raw_token = json.dumps(token, separators=(",", ":"), sort_keys=True)
+    if history_profile is not None and not valid_history_profile(history_profile):
+        raise SecretStoreError("Local history profile identifier is invalid")
+    value = dict(token)
+    value.pop(_HISTORY_METADATA_KEY, None)
+    if history_profile is not None:
+        value[_HISTORY_METADATA_KEY] = {"version": 1, "profile": history_profile}
+    raw_token = json.dumps(value, separators=(",", ":"), sort_keys=True)
     stored = Secret.password_store_sync(
         _schema(),
         dict(_ATTRIBUTES),

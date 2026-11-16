@@ -51,6 +51,7 @@ from typing import Any
 from halo_gtk.alarm.events import MAX_PENDING_EVENTS, AlarmEventBuffer, AlarmEventReducer
 from halo_gtk.alarm.models import (
     AlarmAccountSnapshot,
+    AlarmConnectionStatus,
     AlarmMode,
     AlarmServiceStatus,
     alarm_monotonic_time,
@@ -78,17 +79,20 @@ from halo_gtk.chime_client import ChimeClientState
 from halo_gtk.intercom_client import IntercomClientState
 from halo_gtk.light_groups_client import LightGroupsClientState
 from halo_gtk.lighting_actions import LightingActions
+from halo_gtk.local_alarm_history import LocalAlarmHistory, LocalHistoryError
 from halo_gtk.preview import PreviewManager
 from halo_gtk.secret_store import (
     clear_ring_account_email,
     clear_ring_event_credentials,
     clear_ring_token,
+    history_profile_for_account,
     load_ring_account_email,
     load_ring_event_credentials,
     load_ring_token,
     save_ring_account_email,
     save_ring_event_credentials,
     save_ring_token,
+    valid_history_profile,
     validate_ring_event_credentials,
 )
 from halo_gtk.snapshot_http import authenticated_snapshot_url
@@ -122,6 +126,8 @@ _ALARM_LOCATION_DISCOVERY_TIMEOUT = 10
 _ALARM_DISCOVERY_RECORD_LIMIT = 1_024
 _ALARM_DISCOVERY_LOCATION_LIMIT = 128
 _ALARM_DISCOVERY_IDENTIFIER_LIMIT = 512
+_LOCAL_HISTORY_ACCESS_TTL = 300
+_LOCAL_HISTORY_WORKERS = threading.BoundedSemaphore(2)
 _PREVIEW_CALL_SLOTS = threading.BoundedSemaphore(2)
 _CAMERA_PREVIEW_LEASE = ContextVar("camera_preview_lease", default=None)
 
@@ -308,7 +314,11 @@ def _save_token_for_client(client: RingClient, generation: int, token: dict) -> 
     with _session_lock:
         if generation != _session_generation and _client is not client:
             raise SessionSupersededError("Ring session was superseded")
-        _save_token(token)
+        profile = getattr(client, "_history_profile", None)
+        if valid_history_profile(profile):
+            save_ring_token(token, history_profile=profile)
+        else:
+            _save_token(token)
 
 
 def _publish_session_candidate(
@@ -320,6 +330,9 @@ def _publish_session_candidate(
         if generation != _session_generation:
             return False, None
 
+        bind_history = getattr(client, "_bind_history_account", None)
+        if callable(bind_history):
+            bind_history()
         activate_persistence = getattr(client, "_activate_auth_token_persistence", None)
         if callable(activate_persistence):
             activate_persistence(lambda token: _save_token_for_client(client, generation, token))
@@ -558,6 +571,9 @@ def init_client(
     client = _new_session_candidate()
     try:
         client.authenticate(username, password, otp_code)
+        prepare_history = getattr(client, "_prepare_history_identity", None)
+        if callable(prepare_history):
+            prepare_history(username=username)
         published, previous = _publish_session_candidate(client, generation)
     except BaseException:
         _stop_client_quietly(client)
@@ -584,7 +600,10 @@ def init_client_from_cache() -> RingClient | None:
         if token is None:
             return None
         client = _new_session_candidate()
-        client.authenticate_from_token(token)
+        prepare_history = getattr(client, "_prepare_history_identity", None)
+        if callable(prepare_history):
+            prepare_history(profile=getattr(token, "history_profile", None))
+        client.authenticate_from_token(dict(token))
         published, previous = _publish_session_candidate(client, generation)
         if not published:
             _stop_client_quietly(client)
@@ -633,6 +652,16 @@ class RingClient:
         self._authenticated = False
         self._token_updater = token_updater or _save_token
         self._pending_auth_token: dict | None = None
+        self._history_profile: str | None = None
+        self._history_username: str | None = None
+        self._local_alarm_history = None
+        self._history_denied_locations: set[str] = set()
+        self._history_access_suspended = False
+        self._history_access_receipts: dict[str, float] = {}
+        self._history_reconciled_locations: frozenset[str] | None = None
+        self._history_reconcile_pending = False
+        self._history_result_revisions: dict[str, int] = {}
+        self._history_result_serial = 0
         self._defer_token_persistence = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_start_error: BaseException | None = None
@@ -987,6 +1016,270 @@ class RingClient:
             self._alarm_history_service = AlarmHistoryService(self._get_alarm_gateway())
         return self._alarm_history_service
 
+    def _prepare_history_identity(self, *, username=None, profile=None):
+        self._history_username = username
+        self._history_profile = profile if valid_history_profile(profile) else None
+
+    def _bind_history_account(self):
+        # Called under the session publication fence after fresh authentication.
+        # An email cached for a different login is never an ownership credential.
+        username, self._history_username = self._history_username, None
+        if username is not None:
+            try:
+                self._history_profile = history_profile_for_account(username)
+            except Exception:
+                self._history_profile = None
+                _log.warning("Optional local Alarm history account binding is unavailable")
+        if self._history_profile is not None:
+            self._local_alarm_history = LocalAlarmHistory(self._history_profile)
+
+    def _require_history_account(self):
+        if not _is_active_client_generation(self, self._published_generation):
+            raise SessionSupersededError("Ring account changed. Reopen local history settings.")
+        if self._local_alarm_history is None:
+            raise LocalHistoryError(
+                "Saved history requires an account-bound sign-in. Sign out and sign in "
+                "again when convenient, with Secret Service available. Live Alarm still works."
+            )
+        return self._local_alarm_history
+
+    def local_history_preferences(self):
+        try:
+            store, guard = self._history_operation()
+            value = store.preferences(guard=guard)
+            with guard():
+                return value
+        except LocalHistoryError as exc:
+            return {"available": False, "days": 0, "reason": str(exc)}
+
+    def set_local_history_retention(self, days):
+        store, guard = self._history_operation()
+        store.set_retention(days, guard=guard)
+        with guard():
+            return None
+
+    def clear_local_alarm_history(self):
+        store, guard = self._history_operation()
+        store.clear(guard=guard)
+        with guard():
+            return None
+
+    def _history_operation(self, **requirements):
+        with _session_lock:
+            store = self._require_history_account()
+            guard = partial(
+                self._history_commit_guard, store, self._published_generation, **requirements
+            )
+        with guard():
+            return store, guard
+
+    @contextlib.contextmanager
+    def _history_commit_guard(
+        self, store, generation, *, location=None, membership=None, revision=None
+    ):
+        # Bulk I/O is prepared under the private file lock. Only replace/unlink
+        # and result admission need this brief session/state fence; no fsync here.
+        with _session_lock, self._alarm_snapshot_lock:
+            if (
+                not _is_active_client_generation(self, generation)
+                or self._local_alarm_history is not store
+            ):
+                raise SessionSupersededError("Ring session changed")
+            if location is not None and not self._history_location_allowed(location):
+                raise LocalHistoryError(
+                    "Saved history needs recent permission verification for this location. "
+                    "Choose Ring cloud and Refresh, then return to Saved locally."
+                )
+            if membership is not None and membership != self._history_membership():
+                raise LocalHistoryError("Alarm location access changed during local cleanup")
+            if (
+                revision is not None
+                and self._history_result_revisions.get(revision[0]) != revision[1]
+            ):
+                raise LocalHistoryError("A newer history response replaced this local operation")
+            yield
+
+    def _history_membership(self):
+        snapshot = self._alarm_snapshot
+        if snapshot.generation != self._published_generation or snapshot.status not in {
+            AlarmServiceStatus.ONLINE,
+            AlarmServiceStatus.DEGRADED,
+            AlarmServiceStatus.NO_SYSTEM,
+        }:
+            return None
+        return (
+            frozenset(location.location_id for location in snapshot.locations)
+            - self._history_denied_locations
+        )
+
+    def _history_location_allowed(self, location_id):
+        snapshot = self._alarm_snapshot
+        location = snapshot.find_location(location_id)
+        received = self._history_access_receipts.get(location_id)
+        return (
+            snapshot.generation == self._published_generation
+            and not self._history_access_suspended
+            and snapshot.status in {AlarmServiceStatus.ONLINE, AlarmServiceStatus.DEGRADED}
+            and location is not None
+            and location.connection is AlarmConnectionStatus.ONLINE
+            and received is not None
+            and 0 <= alarm_monotonic_time() - received < _LOCAL_HISTORY_ACCESS_TTL
+            and location_id not in self._history_denied_locations
+        )
+
+    def saved_alarm_history(self, location_id):
+        store, guard = self._history_operation(location=location_id)
+        result = store.load(location_id, guard=guard)
+        with guard():
+            return result
+
+    def saved_alarm_history_available(self, location_id):
+        """Cheap presentation fence; never reads storage or sends a Ring request."""
+        with _session_lock, self._alarm_snapshot_lock:
+            return (
+                _is_active_client_generation(self, self._published_generation)
+                and self._local_alarm_history is not None
+                and self._history_location_allowed(location_id)
+            )
+
+    def alarm_history_result_available(self, location_id):
+        """Fence queued cloud rows after a newer denial, without requiring opt-in storage."""
+        with _session_lock, self._alarm_snapshot_lock:
+            return _is_active_client_generation(
+                self, self._published_generation
+            ) and self._history_location_allowed(location_id)
+
+    def _admit_local_history_result(self, result, generation):
+        from halo_gtk.alarm.history import AlarmHistoryPage, AlarmHistoryStatus
+
+        if not isinstance(result, AlarmHistoryPage):
+            return None
+        with _session_lock, self._alarm_snapshot_lock:
+            if not _is_active_client_generation(self, generation):
+                raise SessionSupersededError("Ring session changed")
+            store = self._local_alarm_history
+            self._history_result_serial += 1
+            version = self._history_result_serial
+            self._history_result_revisions[result.location_id] = version
+            if result.status is AlarmHistoryStatus.AUTHENTICATION_REQUIRED:
+                self._history_access_suspended = True
+                self._history_access_receipts.clear()
+                return None
+            if result.status is AlarmHistoryStatus.PERMISSION_DENIED:
+                self._history_denied_locations.add(result.location_id)
+                self._history_access_receipts.pop(result.location_id, None)
+                self._history_reconciled_locations = None
+                return (store, True, (result.location_id, version)) if store is not None else None
+            if not result.from_cache and result.status in {
+                AlarmHistoryStatus.READY,
+                AlarmHistoryStatus.PARTIAL,
+                AlarmHistoryStatus.EMPTY,
+            }:
+                self._history_access_suspended = False
+                self._history_denied_locations.discard(result.location_id)
+                self._history_access_receipts[result.location_id] = alarm_monotonic_time()
+            if store is not None and self._history_location_allowed(result.location_id):
+                return store, False, (result.location_id, version)
+            return None
+
+    def _save_local_history_result(self, result, generation, *, admitted=None):
+        action = (
+            admitted
+            if admitted is not None
+            else self._admit_local_history_result(result, generation)
+        )
+        if action is None:
+            return result
+        store, denied, revision = action
+        guard = partial(
+            self._history_commit_guard,
+            store,
+            generation,
+            revision=revision,
+            location=None if denied else result.location_id,
+        )
+        if denied:
+            try:
+                store.clear(result.location_id, guard=guard)
+            except (OSError, ValueError, LocalHistoryError):
+                _log.warning("Revoked local Alarm history could not be removed")
+            return result
+        return store.annotate_save(result, guard=guard)
+
+    def _queue_history_reconciliation(self, snapshot, generation):
+        with _session_lock, self._alarm_snapshot_lock:
+            membership = self._history_membership()
+            if (
+                not _is_active_client_generation(self, generation)
+                or self._local_alarm_history is None
+                or membership is None
+                or membership == self._history_reconciled_locations
+                or self._history_reconcile_pending
+            ):
+                return
+            if not _LOCAL_HISTORY_WORKERS.acquire(blocking=False):
+                return
+            self._history_reconcile_pending = True
+
+        def worker():
+            try:
+                self._reconcile_local_history(snapshot, generation)
+            finally:
+                _LOCAL_HISTORY_WORKERS.release()
+                with _session_lock, self._alarm_snapshot_lock:
+                    self._history_reconcile_pending = False
+                    latest = self._alarm_snapshot
+                    changed = self._history_membership() != membership
+                if changed:
+                    self._queue_history_reconciliation(latest, generation)
+
+        try:
+            threading.Thread(target=worker, daemon=True, name="local-history-cleanup").start()
+        except Exception:
+            _LOCAL_HISTORY_WORKERS.release()
+            with self._alarm_snapshot_lock:
+                self._history_reconcile_pending = False
+
+    def _reconcile_local_history(self, snapshot, generation):
+        if snapshot.status not in {
+            AlarmServiceStatus.ONLINE,
+            AlarmServiceStatus.DEGRADED,
+            AlarmServiceStatus.NO_SYSTEM,
+        }:
+            return
+        with _session_lock, self._alarm_snapshot_lock:
+            if (
+                not _is_active_client_generation(self, generation)
+                or {location.location_id for location in self._alarm_snapshot.locations}
+                != {location.location_id for location in snapshot.locations}
+                or self._local_alarm_history is None
+            ):
+                return
+            locations = {location.location_id for location in snapshot.locations}
+            self._history_denied_locations.intersection_update(locations)
+            self._history_access_receipts = {
+                identity: received
+                for identity, received in self._history_access_receipts.items()
+                if identity in locations
+            }
+            self._history_result_revisions = {
+                identity: revision
+                for identity, revision in self._history_result_revisions.items()
+                if identity in locations
+            }
+            allowed = frozenset(locations - self._history_denied_locations)
+            if allowed == self._history_reconciled_locations:
+                return
+            store = self._local_alarm_history
+            guard = partial(self._history_commit_guard, store, generation, membership=allowed)
+        try:
+            if store.path.exists():
+                store.retain_locations(allowed, guard=guard)
+            with guard():
+                self._history_reconciled_locations = allowed
+        except (OSError, ValueError, LocalHistoryError, SessionSupersededError):
+            _log.warning("Local Alarm history location reconciliation is unavailable")
+
     def alarm_history(self, location_id, *, offset=0, limit=50, cancel_event=None, force=False):
         """Bounded worker-thread history API; cancellation reaches the coroutine."""
         coro = self._async_alarm_history(location_id, offset=offset, limit=limit, force=force)
@@ -1012,7 +1305,53 @@ class RingClient:
             location_id, offset=offset, limit=limit, force=force
         )
         self._require_alarm_location(location_id, generation)
-        return result
+        action = self._admit_local_history_result(result, generation)
+
+        def publish(value):
+            self._require_alarm_location(location_id, generation)
+            if action is None:
+                return value
+            store, denied, revision = action
+            with self._history_commit_guard(
+                store,
+                generation,
+                revision=revision,
+                location=None if denied else location_id,
+            ):
+                return value
+
+        if action is None:
+            return publish(result)
+        if not _LOCAL_HISTORY_WORKERS.acquire(blocking=False):
+            return publish(
+                replace(
+                    result,
+                    message=result.message + " Local history is busy; this response was not saved.",
+                )
+            )
+
+        future = concurrent.futures.Future()
+
+        def persist():
+            try:
+                value = self._save_local_history_result(result, generation, admitted=action)
+                with contextlib.suppress(concurrent.futures.InvalidStateError):
+                    future.set_result(value)
+            except Exception as exc:
+                with contextlib.suppress(concurrent.futures.InvalidStateError):
+                    future.set_exception(exc)
+            finally:
+                _LOCAL_HISTORY_WORKERS.release()
+
+        try:
+            threading.Thread(target=persist, daemon=True, name="local-history-save").start()
+        except Exception:
+            _LOCAL_HISTORY_WORKERS.release()
+            return publish(
+                replace(result, message=result.message + " Local history could not be saved.")
+            )
+        result = await asyncio.wrap_future(future)
+        return publish(result)
 
     def _require_alarm_location(self, location_id, generation):
         if not _is_active_client_generation(self, generation):
@@ -2328,6 +2667,19 @@ class RingClient:
                 AlarmServiceStatus.DEGRADED,
                 AlarmServiceStatus.NO_SYSTEM,
             }:
+                # Revoke memory authority immediately, even when every disk worker
+                # is busy. Regrant needs a fresh cloud receipt and a new serial.
+                present = {location.location_id for location in snapshot.locations}
+                self._history_access_receipts = {
+                    identity: received
+                    for identity, received in self._history_access_receipts.items()
+                    if identity in present
+                }
+                self._history_result_revisions = {
+                    identity: revision
+                    for identity, revision in self._history_result_revisions.items()
+                    if identity in present
+                }
                 for location_id in removed:
                     self._alarm_event_buffer.revoke(location_id)
                     if not self._alarm_withdraw_all:
@@ -2339,6 +2691,7 @@ class RingClient:
                         self._alarm_history_service.revoke_location(location_id)
             schedule = not self._alarm_dispatch_pending
             self._alarm_dispatch_pending = True
+        self._queue_history_reconciliation(snapshot, generation)
         if schedule:
             GLib.idle_add(self._dispatch_alarm_snapshot, snapshot, generation)
 

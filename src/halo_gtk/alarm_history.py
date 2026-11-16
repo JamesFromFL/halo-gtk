@@ -1,4 +1,4 @@
-"""Alarm-only History presenter; no camera/media actions or durable storage."""
+"""Alarm history presenter with explicitly selected cloud or saved-local sources."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from halo_gtk.alarm.history import (  # noqa: E402
     coverage_summary,
     pagination_overlap,
 )
+from halo_gtk.local_alarm_history import SAVED_COVERAGE, LocalHistoryError  # noqa: E402
 from halo_gtk.ring_client import get_client  # noqa: E402
 
 # No unbounded thread/executor queue when selection changes rapidly.
@@ -54,6 +55,7 @@ class AlarmHistoryView(Gtk.Box):
         self._snapshot_idle = False
         self._watch_id = None
         self._account_generation = None
+        self._saved_mode = False
         header = Gtk.Box(spacing=8)
         back = Gtk.Button(label="Camera history")
         back.connect("clicked", lambda *_: on_camera_history() if on_camera_history else None)
@@ -61,9 +63,20 @@ class AlarmHistoryView(Gtk.Box):
         self._refresh_button = Gtk.Button(label="Refresh", halign=Gtk.Align.END, hexpand=True)
         self._refresh_button.connect("clicked", lambda *_: self.refresh(force=True))
         header.append(self._refresh_button)
+        settings = Gtk.Button(
+            icon_name="preferences-system-symbolic", tooltip_text="Local history settings"
+        )
+        settings.connect("clicked", self._open_local_settings)
+        header.append(settings)
         self.append(header)
-        self.append(Gtk.Label(label="Alarm cloud history", xalign=0, css_classes=["title-2"]))
-        self.append(Gtk.Label(label=COVERAGE, wrap=True, xalign=0, css_classes=["dim-label"]))
+        self.append(Gtk.Label(label="Alarm history", xalign=0, css_classes=["title-2"]))
+        self._source = Gtk.DropDown.new_from_strings(["Ring cloud", "Saved locally"])
+        self._source.set_tooltip_text("Alarm history source")
+        self._source.update_property([Gtk.AccessibleProperty.LABEL], ["Alarm history source"])
+        self._source.connect("notify::selected", self._source_changed)
+        self.append(self._source)
+        self._coverage = Gtk.Label(label=COVERAGE, wrap=True, xalign=0, css_classes=["dim-label"])
+        self.append(self._coverage)
         self._location = Gtk.DropDown(model=Gtk.StringList.new([]))
         self._location.set_tooltip_text("Alarm location")
         self._location.update_property([Gtk.AccessibleProperty.LABEL], ["Alarm location"])
@@ -98,6 +111,25 @@ class AlarmHistoryView(Gtk.Box):
         self._older.connect("clicked", lambda *_: self._fetch(append=True))
         self._older.set_visible(False)
         self.append(self._older)
+
+    def _source_changed(self, *_):
+        self._saved_mode = self._source.get_selected() == 1
+        self._coverage.set_label(SAVED_COVERAGE if self._saved_mode else COVERAGE)
+        self._fetch(append=False)
+
+    def _open_local_settings(self, *_):
+        from halo_gtk.local_history_preferences import LocalHistoryPreferences
+
+        client = get_client()
+        if client is None or not client.is_authenticated:
+            self._message.set_label("Sign in to manage local Alarm history.")
+            return
+        LocalHistoryPreferences(client, on_changed=self._local_settings_changed).present(self)
+
+    def _local_settings_changed(self):
+        # Saving preferences must not start an implicit cloud-history request.
+        if self._active and self._saved_mode:
+            self._fetch(append=False)
 
     def refresh(self, location_id: str | None = None, *, force: bool = False) -> None:
         selected = location_id or self._location_id
@@ -152,6 +184,22 @@ class AlarmHistoryView(Gtk.Box):
             and client is not None
             and (client.get_alarm_snapshot().generation == self._account_generation)
         ):
+            if self._events and not (
+                client.saved_alarm_history_available(self._location_id)
+                if getattr(self, "_saved_mode", False)
+                else client.alarm_history_result_available(self._location_id)
+            ):
+                self._cancel.set()
+                self._generation += 1
+                self._events.clear()
+                self._next_offset = None
+                self._loading = False
+                self._refresh_button.set_sensitive(True)
+                self._message.set_label(
+                    "History access verification expired or changed. "
+                    "Choose Ring cloud and Refresh to verify access."
+                )
+                self._render()
             return GLib.SOURCE_CONTINUE
         self._watch_id = None
         self.deactivate(clear=True)
@@ -270,18 +318,26 @@ class AlarmHistoryView(Gtk.Box):
         self._refresh_button.set_sensitive(False)
         self._older.set_sensitive(False)
         self._empty.set_title("Loading Alarm history…")
-        self._message.set_label("Reading Ring cloud history…")
+        saved = getattr(self, "_saved_mode", False)
+        self._message.set_label(
+            "Reading saved local history…" if saved else "Reading Ring cloud history…"
+        )
         location_id = self._location_id
         offset = self._next_offset if append else 0
         view_ref = weakref.ref(self)
 
         def worker():
             try:
-                page = client.alarm_history(
-                    location_id, offset=offset, limit=50, cancel_event=cancel, force=force
-                )
+                if saved:
+                    page = client.saved_alarm_history(location_id)
+                else:
+                    page = client.alarm_history(
+                        location_id, offset=offset, limit=50, cancel_event=cancel, force=force
+                    )
                 if not isinstance(page, AlarmHistoryPage):
                     page = AlarmHistoryPage(location_id)
+            except LocalHistoryError as exc:
+                page = AlarmHistoryPage(location_id, message=str(exc), coverage=SAVED_COVERAGE)
             except Exception:
                 page = AlarmHistoryPage(location_id)
             finally:
@@ -323,6 +379,14 @@ class AlarmHistoryView(Gtk.Box):
             snapshot is None
             or snapshot.generation != self._account_generation
             or not any(location.location_id == page.location_id for location in snapshot.locations)
+            or (
+                page.events
+                and not (
+                    client.saved_alarm_history_available(page.location_id)
+                    if getattr(self, "_saved_mode", False)
+                    else client.alarm_history_result_available(page.location_id)
+                )
+            )
         ):
             self.deactivate(clear=True)
             self._message.set_label("Alarm access or account changed. Refresh to continue.")
@@ -365,7 +429,7 @@ class AlarmHistoryView(Gtk.Box):
         self._events = self._events[:1000]
         self._next_offset = page.next_offset if len(self._events) < 1000 else None
         text = page.message
-        if page.retrieved_at is not None:
+        if page.retrieved_at is not None and not getattr(self, "_saved_mode", False):
             text += " " + coverage_summary(page)
         if page.from_cache:
             text += " Cached results." if not page.stale else " Cached results may be stale."
@@ -405,6 +469,10 @@ class AlarmHistoryView(Gtk.Box):
                 else "Ring timestamp unavailable"
             )
             detail = f"{when} · {event.provenance}"
+            if getattr(self, "_saved_mode", False):
+                detail += " · Retrieved " + event.retrieved_at.astimezone().strftime(
+                    "%Y-%m-%d %H:%M:%S %Z"
+                )
             if event.actor:
                 detail += f" · {event.actor}"
             row = Adw.ActionRow(

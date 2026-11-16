@@ -60,6 +60,9 @@ class View(SimpleNamespace):
 
 
 class Client:
+    def alarm_history_result_available(self, _location):
+        return True
+
     def get_alarm_snapshot(self):
         return SimpleNamespace(generation=1, locations=(SimpleNamespace(location_id="loc"),))
 
