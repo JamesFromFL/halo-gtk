@@ -10,9 +10,10 @@ import numpy as np
 import pytest
 from aiortc import RTCConfiguration, RTCPeerConnection, RTCRtpSender, VideoStreamTrack
 from aiortc.codecs import CODECS
-from aiortc.codecs.h264 import H264Decoder
+from aiortc.codecs.h264 import H264Decoder, H264PayloadDescriptor
 from aiortc.jitterbuffer import JitterFrame
 from aiortc.mediastreams import AudioStreamTrack
+from aiortc.rtcrtpparameters import RTCRtpCodecParameters
 from aiortc.rtp import RtpPacket
 
 from halo_gtk import ring_media
@@ -28,13 +29,19 @@ async def test_all_private_patches_install_and_large_idr_fits():
         assert video.receiver._RTCRtpReceiver__jitter_buffer.capacity == 512
         assert audio.receiver._RTCRtpReceiver__jitter_buffer.capacity == 16
         jitter = video.receiver._RTCRtpReceiver__jitter_buffer
+        video.receiver._RTCRtpReceiver__codecs[96] = RTCRtpCodecParameters(
+            mimeType="video/H264", clockRate=90000, payloadType=96
+        )
         output = None
-        for i in range(160):
-            packet = RtpPacket(sequence_number=i, timestamp=0 if i < 159 else 3000)
-            packet._data = b"x" * 1172
+        for i in range(159):
+            packet = RtpPacket(payload_type=96, sequence_number=i, timestamp=0)
+            packet.marker = i == 158
+            header = 0x85 if i == 0 else 0x45 if i == 158 else 0x05
+            packet.payload = bytes([0x7C, header, 0x80]) + b"x" * 1169
+            packet._data = H264PayloadDescriptor.parse(packet.payload)[1]
             _, frame = jitter.add(packet)
             output = frame or output
-        assert output is not None and len(output.data) == 159 * 1172
+        assert output is not None and len(output.data) == 5 + 159 * 1170
         variants = [
             (c.parameters.get("packetization-mode"), c.parameters.get("profile-level-id"))
             for c in CODECS["video"]

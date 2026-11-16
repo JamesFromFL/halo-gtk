@@ -86,6 +86,8 @@ This section tracks the work toward Halo GTK's first tagged release.
   compatibility contracts.
 
 ### Fixed
+- H.264 receive recovery now rejects incomplete fragments, releases complete
+  pictures promptly and requests a clean keyframe after bounded packet loss.
 - Device writes now prevent aiohttp or session middleware from replaying a
   submitted request after a connection failure; ambiguous outcomes remain visible.
 - Updated dnspython to 2.9.2 and added a security floor for camera connection

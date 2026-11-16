@@ -178,10 +178,10 @@ def patch_ring_doorbell_webrtc_close() -> bool:
 def patch_aiortc_h264() -> None:
     """Monkey-patch aiortc for H264 and RTP receiver compatibility with Ring cameras.
 
-    Three patches are applied at module import time so they take effect before
+    Four patches are applied at module import time so they take effect before
     any RTCPeerConnection or H264Decoder is created.
 
-    Patch 1 — JitterBuffer capacity (128 → 512)
+    Patch 1 — Bounded H.264 assembly and keyframe recovery
         The stickup_cam_mini_v3 sends each IDR keyframe as 159 RTP packets:
         1 SPS + 1 PPS + 157 FU-A fragments at 1172 bytes each (~184 KB total).
         aiortc's video JitterBuffer has capacity=128.  When packet #128 arrives
@@ -189,8 +189,11 @@ def patch_aiortc_h264() -> None:
         which removes packets until the timestamp changes — but SPS, PPS, and
         all 157 IDR fragments share the same RTP timestamp, so smart_remove
         wipes the ENTIRE keyframe.  The decoder never receives SPS+PPS+IDR and
-        every subsequent P-frame fails with AVERROR_INVALIDDATA.  Capacity 512
-        (power-of-2 requirement) comfortably fits the largest Ring IDR.
+        every subsequent P-frame fails with AVERROR_INVALIDDATA. Keep 512 slots,
+        but also bound bytes, reordering time and pending frames. Accept complete
+        marker-ended pictures immediately, reject incomplete fragments and
+        request a clean keyframe after loss. Other video codecs retain aiortc's
+        generic 512-slot buffer; audio is untouched.
 
     Patch 2 — SDP offer H264 codec variants
         Two additions to the CODECS["video"] list:
@@ -221,27 +224,13 @@ def patch_aiortc_h264() -> None:
         from aiortc.codecs import CODECS
         from aiortc.codecs import h264 as aiortc_h264
         from aiortc.codecs.h264 import H264Decoder
-        from aiortc.jitterbuffer import JitterBuffer
         from aiortc.rtcrtpparameters import RTCRtcpFeedback, RTCRtpCodecParameters
-        from aiortc.rtcrtpreceiver import RTCRtpReceiver
 
-        # --- Patch 1: increase video JitterBuffer capacity 128 → 512 ---
-        if not getattr(RTCRtpReceiver, "_halo_jitter_buffer_patch_applied", False):
-            _orig_receiver_init = RTCRtpReceiver.__init__
+        from halo_gtk.receive_video import install_video_receiver_patch
 
-            def _patched_receiver_init(self, kind: str, transport) -> None:
-                _orig_receiver_init(self, kind, transport)
-                if kind == "video":
-                    # Replace the 128-slot buffer created by __init__ with a 512-slot
-                    # one.  Name mangling: __jitter_buffer → _RTCRtpReceiver__jitter_buffer.
-                    self._RTCRtpReceiver__jitter_buffer = JitterBuffer(
-                        capacity=512,
-                        is_video=True,
-                    )
-
-            RTCRtpReceiver.__init__ = _patched_receiver_init
-            RTCRtpReceiver._halo_jitter_buffer_patch_applied = True
-            _log.debug("Patched RTCRtpReceiver video JitterBuffer capacity: 128 → 512")
+        # Validate the private contract before changing any of these patches.
+        if not install_video_receiver_patch():
+            return
 
         # --- Patch 2: add H264 codec variants to the SDP offer ---
         existing_h264 = {

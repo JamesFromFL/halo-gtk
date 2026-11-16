@@ -8,6 +8,8 @@ is committed as `c9475b2`; the items below preserve the separate feature work.
 - Maintenance and isolated desktop qualification: complete in `3d310cb`;
   live-device acceptance remains separate.
 - Device-write replay prevention prerequisite: complete in `8972a06`.
+- Measured H.264 receive recovery repair: complete; see the
+  [receive-path comparison](receive-path-review-2026-11-16.md).
 - Local notification rules, snooze and quiet hours: complete; see
   [notification rules](notification-rules.md). Critical Alarm preferences retain
   their existing master controls.
