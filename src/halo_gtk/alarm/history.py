@@ -82,6 +82,8 @@ class AlarmHistoryPage:
     unsupported_rows: int = 0
     message: str = "Alarm history is unavailable."
     coverage: str = COVERAGE
+    source_rows: int = 0
+    retrieved_at: datetime | None = None
 
 
 def _text(value: object, limit: int = 256) -> str | None:
@@ -206,22 +208,45 @@ def parse_history(
     elif not events:
         status = AlarmHistoryStatus.UNSUPPORTED
     next_offset = offset + len(rows) if len(rows) == limit else None
+    offset_limited = next_offset is not None and next_offset > 10000
+    if offset_limited:
+        next_offset = None
     message = {
         AlarmHistoryStatus.READY: "Ring cloud events returned; coverage is unverified.",
         AlarmHistoryStatus.EMPTY: "Ring returned no Alarm events for this page.",
         AlarmHistoryStatus.PARTIAL: "Some Alarm event fields or types are unsupported.",
         AlarmHistoryStatus.UNSUPPORTED: "Unsupported Alarm history response.",
     }[status]
+    if offset_limited:
+        message += " Local pagination limit reached; coverage is incomplete."
     return AlarmHistoryPage(
         location_id,
         tuple(events),
         status,
         offset,
         next_offset,
-        next_offset is not None or bool(unsupported),
+        next_offset is not None or bool(unsupported) or offset_limited,
         unsupported_rows=unsupported,
         message=message,
+        source_rows=len(rows),
+        retrieved_at=retrieved_at,
     )
+
+
+def pagination_overlap(page: AlarmHistoryPage, seen: set[str]) -> bool:
+    """Detect ambiguous overlap without calling fingerprints server identities."""
+    return any(event.key.rsplit(":", 1)[0] in seen for event in page.events)
+
+
+def coverage_summary(page: AlarmHistoryPage) -> str:
+    text = f"Read {page.source_rows} source rows; displayed {len(page.events)} events."
+    if page.unsupported_rows:
+        text += f" {page.unsupported_rows} rows have unsupported fields or types."
+    if page.retrieved_at is not None:
+        text += (
+            " Retrieved " + page.retrieved_at.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z") + "."
+        )
+    return text
 
 
 @dataclass(slots=True)
@@ -495,7 +520,8 @@ class AlarmHistoryService:
         if isinstance(max_pages, bool) or not isinstance(max_pages, int) or not 1 <= max_pages <= 5:
             raise ValueError("Invalid history page count")
         start_offset = offset
-        events, fingerprints = [], set()
+        events, fingerprints, seen = [], set(), set()
+        source_rows = unsupported_rows = 0
         last = AlarmHistoryPage(location_id, offset=offset)
         try:
             async with asyncio.timeout(self.timeout):
@@ -517,10 +543,26 @@ class AlarmHistoryService:
                             truncated=True,
                             status=AlarmHistoryStatus.PARTIAL,
                             message="Ring repeated a history page; pagination stopped.",
+                            source_rows=source_rows + page.source_rows,
+                            unsupported_rows=unsupported_rows + page.unsupported_rows,
                         )
+                    overlap = pagination_overlap(page, seen)
                     fingerprints.add(fingerprint)
+                    seen.update(fingerprint)
                     events.extend(page.events)
+                    source_rows += page.source_rows
+                    unsupported_rows += page.unsupported_rows
                     last = page
+                    if overlap or (not page.events and page.next_offset is not None):
+                        last = replace(
+                            page,
+                            next_offset=None,
+                            truncated=True,
+                            status=AlarmHistoryStatus.PARTIAL,
+                            message="History pages overlap or make no observable progress; "
+                            "pagination stopped. Distinct occurrences cannot be verified.",
+                        )
+                        break
                     if page.next_offset is None or page.status not in {
                         AlarmHistoryStatus.READY,
                         AlarmHistoryStatus.PARTIAL,
@@ -540,6 +582,14 @@ class AlarmHistoryService:
         return replace(
             last,
             events=tuple(events),
-            truncated=last.truncated or (last.next_offset is not None),
+            truncated=last.truncated or (last.next_offset is not None) or bool(unsupported_rows),
+            status=(
+                AlarmHistoryStatus.PARTIAL
+                if unsupported_rows
+                and last.status in {AlarmHistoryStatus.READY, AlarmHistoryStatus.EMPTY}
+                else last.status
+            ),
             offset=start_offset,
+            source_rows=source_rows,
+            unsupported_rows=unsupported_rows,
         )

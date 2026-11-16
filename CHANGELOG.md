@@ -88,6 +88,9 @@ This section tracks the work toward Halo GTK's first tagged release.
   compatibility contracts.
 
 ### Fixed
+- Alarm history stops on ambiguous overlapping pages and at the supported offset
+  bound. Coverage shows source-row counts, unsupported rows and retrieval time;
+  partial fields remain partial across multi-page reads.
 - H.264 receive recovery now rejects incomplete fragments, releases complete
   pictures promptly and requests a clean keyframe after bounded packet loss.
 - Device writes now prevent aiohttp or session middleware from replaying a

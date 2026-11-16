@@ -11,6 +11,7 @@ from halo_gtk.alarm.history import (
     COVERAGE,
     AlarmHistoryService,
     AlarmHistoryStatus,
+    coverage_summary,
     parse_history,
 )
 from halo_gtk.alarm.provider import AlarmRequestError
@@ -368,3 +369,50 @@ async def test_invalid_query_never_reaches_gateway(kwargs):
     with pytest.raises(ValueError):
         await AlarmHistoryService(gateway).fetch_page("loc", **kwargs)
     assert not gateway.calls
+
+
+def test_coverage_reports_source_rows_without_equating_them_to_events():
+    page = parsed([row(), {"msg": "Unknown"}])
+    assert page.source_rows == 2 and page.unsupported_rows == 1
+    assert page.retrieved_at == NOW
+    assert "Read 2 source rows; displayed 1 events" in coverage_summary(page)
+
+
+async def test_shifted_offset_overlap_preserves_rows_and_stops_ambiguous_pagination():
+    a, b, c = (row(timestamp=1792972800000 - i) for i in range(3))
+    gateway = Gateway({0: [a, b], 2: [b, c], 4: [c, c]})
+    page = await AlarmHistoryService(gateway).load("loc", limit=2)
+    assert len(gateway.calls) == 2
+    assert len(page.events) == 4  # No verified event identity: do not silently deduplicate.
+    assert page.source_rows == 4 and page.next_offset is None and page.truncated
+    assert page.status is AlarmHistoryStatus.PARTIAL and "overlap" in page.message
+
+
+async def test_empty_partial_page_with_next_offset_stops_without_extra_reads(monkeypatch):
+    from dataclasses import replace
+
+    service = AlarmHistoryService(Gateway())
+    calls = []
+
+    async def fetch(*args, **kwargs):
+        calls.append(kwargs)
+        return replace(parsed([]), status=AlarmHistoryStatus.PARTIAL, next_offset=50)
+
+    monkeypatch.setattr(service, "fetch_page", fetch)
+    page = await service.load("loc")
+    assert len(calls) == 1 and page.next_offset is None and page.truncated
+
+
+async def test_last_allowed_offset_never_offers_an_invalid_next_page():
+    gateway = Gateway({10000: [row()]})
+    page = await AlarmHistoryService(gateway).load("loc", offset=10000, limit=1)
+    assert len(gateway.calls) == 1 and page.next_offset is None and page.truncated
+    assert "pagination limit" in page.message
+
+
+async def test_aggregate_coverage_counts_partial_rows_across_pages():
+    gateway = Gateway({0: [row(), {"msg": "Unknown"}], 2: [row(timestamp=1792972700000)]})
+    page = await AlarmHistoryService(gateway).load("loc", limit=2)
+    assert page.source_rows == 3 and page.unsupported_rows == 1
+    assert len(page.events) == 2
+    assert page.status is AlarmHistoryStatus.PARTIAL and page.truncated

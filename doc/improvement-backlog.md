@@ -16,6 +16,8 @@ is committed as `c9475b2`; the items below preserve the separate feature work.
 - Camera privacy, receive-path recovery and device controls: in progress.
 - Chime snooze/resume and qualified automatic nightlight: complete; see
   [Chime support](chime-support.md). Physical-device acceptance remains separate.
+- Alarm history pagination guard and coverage reporting: complete; see
+  [history coverage](alarm-history-coverage.md). Persistent history is separate.
 
 ## 1. Maintenance and desktop baseline
 

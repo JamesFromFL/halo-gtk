@@ -18,6 +18,8 @@ from halo_gtk.alarm.history import (  # noqa: E402
     AlarmHistoryEvent,
     AlarmHistoryPage,
     AlarmHistoryStatus,
+    coverage_summary,
+    pagination_overlap,
 )
 from halo_gtk.ring_client import get_client  # noqa: E402
 
@@ -330,15 +332,18 @@ class AlarmHistoryView(Gtk.Box):
         self._refresh_button.set_sensitive(True)
         signature = tuple(event.key.rsplit(":", 1)[0] for event in page.events)
         repeated = append and signature and signature in self._page_signatures
+        overlap = append and pagination_overlap(
+            page, {key for previous in self._page_signatures for key in previous}
+        )
         no_progress = append and not page.events and page.next_offset is not None
-        if repeated or no_progress:
+        if repeated or overlap or no_progress:
             page = replace(
                 page,
                 next_offset=None,
                 truncated=True,
                 status=AlarmHistoryStatus.PARTIAL,
-                message="Ring history pagination made no observable progress; stopped. "
-                "Coverage is uncertain.",
+                message="Ring history pages overlap or made no observable progress; stopped. "
+                "Distinct occurrences and coverage are uncertain.",
             )
         if signature:
             self._page_signatures.add(signature)
@@ -360,6 +365,8 @@ class AlarmHistoryView(Gtk.Box):
         self._events = self._events[:1000]
         self._next_offset = page.next_offset if len(self._events) < 1000 else None
         text = page.message
+        if page.retrieved_at is not None:
+            text += " " + coverage_summary(page)
         if page.from_cache:
             text += " Cached results." if not page.stale else " Cached results may be stale."
         if len(self._events) >= 1000:

@@ -67,6 +67,30 @@ class Client:
         pass
 
 
+def test_shifted_page_overlap_retains_occurrences_and_stops_load_older(monkeypatch):
+    client = Client()
+    obj = view(client)
+    monkeypatch.setattr(alarm_history, "get_client", lambda: client)
+    first = AlarmHistoryPage(
+        "loc",
+        (replace(event(), key="a:0"), replace(event(), key="b:1")),
+        AlarmHistoryStatus.READY,
+        next_offset=2,
+        source_rows=2,
+        retrieved_at=datetime.now(UTC),
+    )
+    obj._finish(first, client, 1, obj._cancel, False)
+    second = replace(
+        first,
+        events=(replace(event(), key="b:2"), replace(event(), key="c:3")),
+        offset=2,
+        next_offset=4,
+    )
+    obj._finish(second, client, 1, obj._cancel, True)
+    assert len(obj._events) == 4 and obj._next_offset is None
+    assert "overlap" in obj._message.text and "Read 2 source rows" in obj._message.text
+
+
 def view(client=None):
     obj = View(
         _active=True,
