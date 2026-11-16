@@ -102,12 +102,24 @@ def _operation_text(operation) -> str:
     if operation is None:
         return "No request made."
     if operation.status is ChimeOperationStatus.REPORTED:
+        if operation.kind == "snooze":
+            return (
+                "Ring reports snooze cleared."
+                if operation.requested_value == 0
+                else "Ring reports the requested snooze."
+            )
+        if operation.kind == "nightlight":
+            return (
+                "Ring reports automatic nightlight enabled."
+                if operation.requested_value
+                else "Ring reports automatic nightlight disabled."
+            )
         return f"Ring now reports legacy level {operation.requested_volume}."
     if operation.status is ChimeOperationStatus.ACCEPTED:
         return (
             "Sound request accepted. Halo cannot confirm that it played or finished."
             if operation.kind == "test-sound"
-            else "Request accepted. Waiting for Ring to report the volume."
+            else "Request accepted. Waiting for Ring to report the setting."
         )
     return {
         ChimeOperationStatus.PREPARING: "Checking current Chime status; not sent yet.",
@@ -230,6 +242,30 @@ class ChimeDetails(Adw.Dialog):
         content.append(controls)
         self._reason = _label(css_classes=["dim-label"])
         content.append(self._reason)
+        extras = Adw.PreferencesGroup(
+            title="Snooze and nightlight",
+            description="Snooze pauses this household Chime. Automatic nightlight uses its "
+            "ambient-light sensor; it is not an instant lamp switch.",
+        )
+        content.append(extras)
+        self._snooze_choice = Adw.ComboRow(
+            title="Snooze duration",
+            model=Gtk.StringList.new(["15 minutes", "30 minutes", "1 hour", "4 hours", "24 hours"]),
+        )
+        extras.add(self._snooze_choice)
+        buttons = Gtk.Box(spacing=8, homogeneous=True)
+        self._snooze_apply = Gtk.Button(label="Snooze Chime")
+        self._snooze_apply.connect("clicked", self._apply_snooze)
+        self._snooze_clear = Gtk.Button(label="Resume Chime")
+        self._snooze_clear.connect("clicked", lambda *_: self._command(setting="snooze", value=0))
+        buttons.append(self._snooze_apply)
+        buttons.append(self._snooze_clear)
+        extras.add(buttons)
+        self._nightlight_row = _info_row("Automatic nightlight")
+        self._nightlight_toggle = Gtk.Button(label="Enable", valign=Gtk.Align.CENTER)
+        self._nightlight_toggle.connect("clicked", self._toggle_nightlight)
+        self._nightlight_row.add_suffix(self._nightlight_toggle)
+        extras.add(self._nightlight_row)
         content.append(
             _label(
                 "Play a sound on this physical Chime using its current tone and volume. "
@@ -374,6 +410,16 @@ class ChimeDetails(Adw.Dialog):
             self._volume.set_value(self._draft)
         self._updating = False
         self._operation.set_label(_operation_text(device.operation))
+        if hasattr(self, "_nightlight_row"):
+            night = device.automatic_nightlight
+            self._nightlight_row.set_subtitle(
+                "Not reported by this Chime"
+                if night is None
+                else "Reported enabled"
+                if night
+                else "Reported disabled"
+            )
+            self._nightlight_toggle.set_label("Disable" if night else "Enable")
         self._update_actions()
 
     def _update_actions(self):
@@ -382,6 +428,14 @@ class ChimeDetails(Adw.Dialog):
             return
         reason = _write_reason(device)
         busy = self._session.pending("command") or self._session.pending("ack")
+        if hasattr(self, "_snooze_apply"):
+            snooze_allowed = reason is None and not busy and device.snooze_seconds_left is not None
+            self._snooze_apply.set_sensitive(snooze_allowed)
+            self._snooze_choice.set_sensitive(snooze_allowed)
+            self._snooze_clear.set_sensitive(snooze_allowed and device.snooze_seconds_left > 0)
+            self._nightlight_toggle.set_sensitive(
+                reason is None and not busy and device.automatic_nightlight is not None
+            )
         draft_stale = self._draft_revision != device.revision
         self._reason.set_label(
             reason
@@ -422,7 +476,7 @@ class ChimeDetails(Adw.Dialog):
         )
         self._update_actions()
 
-    def _command(self, *, value=None, kind=None):
+    def _command(self, *, value=None, kind=None, setting=None):
         device = self._selected()
         if (
             device is None
@@ -431,13 +485,25 @@ class ChimeDetails(Adw.Dialog):
             or self._session.pending("ack")
         ):
             return
-        if value is not None and self._draft_revision != device.revision:
+        if setting is None and value is not None and self._draft_revision != device.revision:
             return
         intent = ChimeIntent(
             self._session.generation, device.api_id, device.revision, device.identity_epoch
         )
         client = self._session.client
-        if kind is None:
+        if setting is not None:
+            if setting not in {"snooze", "nightlight"}:
+                return
+
+            def invoke():
+                return client.request_chime_setting(
+                    device.api_id,
+                    setting,
+                    value,
+                    expected_revision=device.revision,
+                    intent_id=intent,
+                )
+        elif kind is None:
 
             def invoke():
                 return client.request_chime_volume(
@@ -461,6 +527,17 @@ class ChimeDetails(Adw.Dialog):
             and self._draft != self._device.volume
         ):
             self._command(value=self._draft)
+
+    def _apply_snooze(self, *_):
+        values = (15, 30, 60, 240, 1440)
+        index = self._snooze_choice.get_selected()
+        if index < len(values):
+            self._command(setting="snooze", value=values[index])
+
+    def _toggle_nightlight(self, *_):
+        device = self._selected()
+        if device is not None and device.automatic_nightlight is not None:
+            self._command(setting="nightlight", value=not device.automatic_nightlight)
 
     def _test_sound(self, _button, kind):
         if kind in {"ding", "motion"}:

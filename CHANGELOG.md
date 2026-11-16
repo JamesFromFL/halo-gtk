@@ -9,6 +9,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 This section tracks the work toward Halo GTK's first tagged release.
 
 ### Added
+- Qualified Chime snooze/resume and automatic-nightlight settings, with explicit
+  actions, bounded fresh readback and separate accepted/unconfirmed outcomes.
 - Local notification quiet hours, timed snooze and per-device rules, with native
   preferences and delivery-time checks. Enabled critical Alarm alerts bypass
   these routine-notification rules.

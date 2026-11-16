@@ -14,6 +14,8 @@ is committed as `c9475b2`; the items below preserve the separate feature work.
   [notification rules](notification-rules.md). Critical Alarm preferences retain
   their existing master controls.
 - Camera privacy, receive-path recovery and device controls: in progress.
+- Chime snooze/resume and qualified automatic nightlight: complete; see
+  [Chime support](chime-support.md). Physical-device acceptance remains separate.
 
 ## 1. Maintenance and desktop baseline
 

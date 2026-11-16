@@ -76,6 +76,36 @@ class RingChimeRestGateway:
             on_admitted=on_admitted,
         )
 
+    async def set_snooze(
+        self, api_id, minutes, *, timeout=None, admission=None, on_admitted=None
+    ) -> RingWriteReceipt:
+        url = _device_url(api_id) + "do_not_disturb"
+        if type(minutes) is not int or not 0 <= minutes <= 1440:
+            raise ChimeRestError("invalid-request")
+        return await self._write(
+            url,
+            "POST",
+            {"time": minutes} if minutes else None,
+            timeout=timeout,
+            admission=admission,
+            on_admitted=on_admitted,
+        )
+
+    async def set_nightlight(
+        self, api_id, enabled, *, timeout=None, admission=None, on_admitted=None
+    ) -> RingWriteReceipt:
+        _device_url(api_id)
+        if type(enabled) is not bool:
+            raise ChimeRestError("invalid-request")
+        return await self._write(
+            API_ORIGIN + f"/devices/v1/devices/{api_id}/settings",
+            "PATCH",
+            {"night_light_settings": {"light_sensor_enabled": enabled}},
+            timeout=timeout,
+            admission=admission,
+            on_admitted=on_admitted,
+        )
+
     def _check_open(self):
         if self._closed:
             raise ChimeRestError("closed")

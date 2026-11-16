@@ -1302,6 +1302,17 @@ class RingClient:
     def acknowledge_chime_sound_finished(self, api_id, operation_id):
         return self.submit(self._chimes.acknowledge(api_id, operation_id))
 
+    def request_chime_setting(self, api_id, setting, value, *, expected_revision, intent_id):
+        return self.submit(
+            self._chimes.command(
+                api_id,
+                value,
+                expected_revision=expected_revision,
+                intent=intent_id,
+                setting=setting,
+            )
+        )
+
     @staticmethod
     def cancel_chime_intent(intent_id):
         ChimeClientState.cancel_intent(intent_id)

@@ -99,6 +99,7 @@ class ChimeOperationSnapshot:
     requested_volume: int | None = None
     test_kind: str | None = None
     code: str | None = None
+    requested_value: int | bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +124,7 @@ class ChimeSnapshot:
     location_id: str | None = None
     firmware: str | None = None
     snooze_seconds_left: int | None = None
+    automatic_nightlight: bool | None = None
     _hardware_id: str | None = field(default=None, repr=False)
 
 
@@ -161,6 +163,22 @@ class ChimeSchemaError(ValueError):
     """A sanitized schema failure; malformed inventory never implies removal."""
 
 
+def _setting_reported(device, operation):
+    if operation.kind == "volume":
+        return device.volume == operation.requested_volume
+    if operation.kind == "nightlight":
+        return device.automatic_nightlight is operation.requested_value
+    if operation.kind == "snooze":
+        seconds = device.snooze_seconds_left
+        minutes = operation.requested_value
+        return (
+            seconds == 0
+            if minutes == 0
+            else (seconds is not None and max(1, minutes * 60 - 30) <= seconds <= minutes * 60)
+        )
+    return False
+
+
 def _text(value: object, *, limit: int = 160) -> str | None:
     if not isinstance(value, str):
         return None
@@ -194,6 +212,10 @@ def parse_chime_inventory(payload: object) -> tuple[ChimeSnapshot, ...]:
         ids.add(api_id)
         kind = _text(row.get("kind"), limit=80) or "unknown"
         settings = row.get("settings")
+        nightlight = settings.get("night_light_settings") if isinstance(settings, Mapping) else None
+        nightlight = (
+            nightlight.get("light_sensor_enabled") if isinstance(nightlight, Mapping) else None
+        )
         volume = _integer(settings.get("volume"), 0, 11) if isinstance(settings, Mapping) else None
         alerts = row.get("alerts")
         connection = alerts.get("connection") if isinstance(alerts, Mapping) else None
@@ -226,6 +248,7 @@ def parse_chime_inventory(payload: object) -> tuple[ChimeSnapshot, ...]:
                 location_id=_text(location),
                 firmware=_text(row.get("firmware_version"), limit=80),
                 snooze_seconds_left=seconds,
+                automatic_nightlight=nightlight if type(nightlight) is bool else None,
                 _hardware_id=_text(row.get("device_id"), limit=128),
             )
         )
@@ -520,6 +543,7 @@ class ChimeService:
             device.location_id,
             device.firmware,
             device.snooze_seconds_left,
+            device.automatic_nightlight,
             device._hardware_id,
         )
 
@@ -609,6 +633,16 @@ class ChimeService:
             return ChimeResult(ChimeOperationStatus.REJECTED, api_id, code="invalid-test-kind")
         return await self._request(api_id, "test-sound", expected_revision, intent, test_kind=kind)
 
+    async def request_snooze(self, api_id, minutes, *, expected_revision, intent):
+        if type(minutes) is not int or not 0 <= minutes <= 1440:
+            return ChimeResult(ChimeOperationStatus.REJECTED, api_id, code="invalid-snooze")
+        return await self._request(api_id, "snooze", expected_revision, intent, value=minutes)
+
+    async def request_nightlight(self, api_id, enabled, *, expected_revision, intent):
+        if type(enabled) is not bool:
+            return ChimeResult(ChimeOperationStatus.REJECTED, api_id, code="invalid-nightlight")
+        return await self._request(api_id, "nightlight", expected_revision, intent, value=enabled)
+
     def _intent_reason(
         self, api_id: int, expected_revision: int, intent: ChimeIntent
     ) -> str | None:
@@ -647,8 +681,9 @@ class ChimeService:
             kind,
             ChimeOperationStatus.PREPARING,
             True,
-            requested_volume=value,
+            requested_volume=value if kind == "volume" else None,
             test_kind=test_kind,
+            requested_value=value if kind in {"snooze", "nightlight"} else None,
         )
         self._replace_device(replace(device, operation=operation))
         task = asyncio.create_task(
@@ -695,6 +730,18 @@ class ChimeService:
                 # This operation's own pending state is not a Busy conflict.
                 candidate = replace(device, operation=None)
                 reason = self._reason(candidate, allow_pending=True)
+                if (
+                    reason is None
+                    and operation.kind == "snooze"
+                    and device.snooze_seconds_left is None
+                ):
+                    reason = "snooze-unknown"
+                if (
+                    reason is None
+                    and operation.kind == "nightlight"
+                    and device.automatic_nightlight is None
+                ):
+                    reason = "nightlight-unsupported"
             if reason is not None:
                 raise ChimeRestError(reason)
 
@@ -709,7 +756,7 @@ class ChimeService:
             )
 
         try:
-            async with asyncio.timeout(30.0 if operation.kind == "volume" else 15.0):
+            async with asyncio.timeout(15.0 if operation.kind == "test-sound" else 30.0):
                 device = self._snapshot.find_device(api_id)
                 if self._reason(device, allow_pending=True) == "refresh-required":
                     await self.refresh(force=True)
@@ -718,6 +765,19 @@ class ChimeService:
                     receipt = await self._gateway.set_legacy_volume(
                         api_id,
                         operation.requested_volume,
+                        timeout=10.0,
+                        admission=admission,
+                        on_admitted=on_admitted,
+                    )
+                elif operation.kind in {"snooze", "nightlight"}:
+                    setter = (
+                        self._gateway.set_snooze
+                        if operation.kind == "snooze"
+                        else self._gateway.set_nightlight
+                    )
+                    receipt = await setter(
+                        api_id,
+                        operation.requested_value,
                         timeout=10.0,
                         admission=admission,
                         on_admitted=on_admitted,
@@ -781,7 +841,7 @@ class ChimeService:
                         if (
                             self._snapshot.complete
                             and not device.stale
-                            and device.volume == operation.requested_volume
+                            and _setting_reported(device, operation)
                         ):
                             operation = replace(
                                 operation, status=ChimeOperationStatus.REPORTED, active=False
@@ -832,7 +892,7 @@ class ChimeService:
         self._set_operation(api_id, intent.identity_epoch, operation)
         device = self._snapshot.find_device(api_id)
         if (
-            operation.kind == "volume"
+            operation.kind != "test-sound"
             and operation.status == ChimeOperationStatus.UNKNOWN
             and device is not None
             and device.identity_epoch == intent.identity_epoch

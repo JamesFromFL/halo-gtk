@@ -19,6 +19,17 @@ polling, and these reads do not start camera streams.
 - **Read-only details:** account-reported model, connection, volume and available
   firmware/health values remain distinct from missing or stale data. Missing
   volume does not mean muted. Unknown models and ownership remain read-only.
+- **Snooze:** explicitly pause Chime sounds for 15 minutes, 30 minutes, one hour,
+  four hours or one day, or resume them. This requires a reported snooze state.
+- **Automatic nightlight:** enable or disable the ambient-light setting when
+  Ring explicitly reports it for the device. This is an automatic setting, not
+  an immediate lamp On/Off command. Missing capability data disables the control.
+
+Snooze and nightlight requests use the same ownership, freshness and admission
+checks as volume. Halo reads fresh inventory after acceptance and distinguishes
+Ring's reported setting from an accepted but unconfirmed request. A snooze
+readback allows the countdown to have advanced during the operation. This does
+not prove that a particular command caused the report or that hardware changed.
 
 Controls are experimental and have been tested with synthetic HTTP responses,
 not a physical Chime. The recognized API kinds are `chime`, `chime_v2`,
@@ -50,12 +61,12 @@ Chime, reserving recovery priority and allowing one non-recovery request at a
 time. Camera SDK calls, media and OAuth token requests have separate budgets.
 Reads are bounded to 1 MiB, JSON depth 32 and 50,000 nodes; write replies are
 bounded to 64 KiB. Chime HTTP requests have a ten-second total budget, with
-30 seconds for a complete volume operation and 15 seconds for a sound request.
+30 seconds for a complete settings operation and 15 seconds for a sound request.
 Alarm history retains its existing 30-second page budget.
 
 ## Not implemented
 
-Linked-camera editing, snooze changes, tone catalog selection, nightlight,
+Linked-camera editing, tone catalog selection,
 network setup, provisioning, rename and newer hardware-specific controls are
 outside this feature. Linked-camera data has no verified response schema, so
 Halo does not infer that an empty or unparsed response means no linked cameras.
@@ -66,3 +77,14 @@ The adapter uses the existing authenticated Ring session and fixed Chime
 routes. It does not replace the backend, introduce another login flow or add
 Node/MQTT dependencies. Real account reads, writes and audible tests require a
 separate supervised validation before declaring live support.
+
+## Protocol reference and qualification
+
+The fixed snooze POST and automatic-nightlight PATCH routes follow
+[ring-client-api's Chime adapter](https://github.com/dgreif/ring/blob/main/packages/ring-client-api/ring-chime.ts)
+(reviewed source blob `1f89ac323da576f0304396e5fee8b27cf32874b9`). Resume sends an
+empty POST body. No submitted write is retried. Fixtures cover exact payloads,
+unsupported data, ownership revocation, stale revisions, rejected values and
+unconfirmed readback. Native isolated GTK qualification covers the settings
+dialog and cancellation when it closes. No audible or real-device commands were
+sent during this work.

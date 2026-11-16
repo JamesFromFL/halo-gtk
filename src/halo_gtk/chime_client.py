@@ -142,9 +142,16 @@ class ChimeClientState:
             raise RuntimeError("Ring session was superseded")
         return result
 
-    async def command(self, api_id, value, *, expected_revision, intent, sound=False):
+    async def command(self, api_id, value, *, expected_revision, intent, sound=False, setting=None):
         service = self._get_service()
-        method = service.request_test_sound if sound else service.request_volume
+        methods = {"snooze": service.request_snooze, "nightlight": service.request_nightlight}
+        if setting is not None and (setting not in methods or sound):
+            raise ValueError("Unsupported Chime setting")
+        method = (
+            methods[setting]
+            if setting
+            else (service.request_test_sound if sound else service.request_volume)
+        )
         result = await method(api_id, value, expected_revision=expected_revision, intent=intent)
         if not self.current(intent.generation):
             raise RuntimeError("Ring session was superseded")

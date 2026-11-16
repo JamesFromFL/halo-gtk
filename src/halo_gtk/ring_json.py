@@ -126,20 +126,22 @@ class RingJsonTransport:
         url,
         *,
         method,
-        json: Mapping,
+        json: Mapping | None,
         timeout=10,
         admission: Callable[[], None] | None = None,
         on_admitted: Callable[[], None] | None = None,
         read_json: bool = False,
     ) -> RingWriteReceipt:
         if (
-            method not in {"PUT", "POST"}
-            or not isinstance(json, Mapping)
+            method not in {"PUT", "POST", "PATCH"}
+            or (json is not None and not isinstance(json, Mapping))
             or not isinstance(read_json, bool)
         ):
             raise RingJsonError("operation-not-allowed")
         try:
-            encoded = json_module.dumps(dict(json), allow_nan=False, ensure_ascii=True).encode()
+            encoded = json_module.dumps(
+                dict(json) if json is not None else None, allow_nan=False, ensure_ascii=True
+            ).encode()
             if len(encoded) > 4096:
                 raise ValueError
             payload = _decode_json(encoded, MAX_JSON_DEPTH, MAX_JSON_NODES)
@@ -245,7 +247,7 @@ class RingJsonTransport:
                             "Accept": "application/json",
                             "Accept-Encoding": "identity",
                         }
-                        if write:
+                        if write and payload is not None:
                             headers["Content-Type"] = "application/json"
                         try:
                             prepared, headers, body = self._auth._oauth_client.add_token(
