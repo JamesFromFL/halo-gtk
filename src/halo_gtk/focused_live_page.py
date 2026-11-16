@@ -15,8 +15,8 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: E402
 
+from halo_gtk import camera_lighting, device_commands, device_names, media_paths  # noqa: E402
 from halo_gtk import config as _cfg  # noqa: E402
-from halo_gtk import device_commands, device_names, media_paths  # noqa: E402
 from halo_gtk.camera_settings import CameraSettingsWindow  # noqa: E402
 from halo_gtk.live_sessions import (  # noqa: E402
     FOCUSED_OWNER,
@@ -86,6 +86,10 @@ class FocusedLivePage(Gtk.Box):
         title_copy.append(self._model_label)
         self._privacy_label = Gtk.Label(xalign=0, wrap=True, css_classes=["caption"])
         title_copy.append(self._privacy_label)
+        self._lighting_label = Gtk.Label(
+            xalign=0, wrap=True, css_classes=["caption", "dim-label"], visible=False
+        )
+        title_copy.append(self._lighting_label)
         top_bar.append(title_copy)
 
         self._settings_btn = Gtk.Button(
@@ -387,6 +391,7 @@ class FocusedLivePage(Gtk.Box):
     def _refresh_privacy(self) -> None:
         if self._device is None:
             return
+        self._refresh_lighting()
         view = camera_privacy.current_view(self._device)
         self._privacy_label.set_label(view.message)
         self._privacy_label.set_visible(view.reason != "allowed")
@@ -541,7 +546,7 @@ class FocusedLivePage(Gtk.Box):
         if has_light:
             self._light_btn.handler_block_by_func(self._on_light_toggled)
             self._light_btn.set_active(
-                device_commands.command_state.light_enabled(_ring_client(), self._device)
+                camera_lighting.view_for(_ring_client(), self._device).button_active
             )
             self._light_btn.handler_unblock_by_func(self._on_light_toggled)
             self._refresh_light_icon()
@@ -680,12 +685,20 @@ class FocusedLivePage(Gtk.Box):
         if self._device is device:
             self._light_btn.set_sensitive(True)
             self._light_btn.handler_block_by_func(self._on_light_toggled)
-            self._light_btn.set_active(device_commands.command_state.light_enabled(client, device))
+            self._light_btn.set_active(
+                camera_lighting.view_for(client or _ring_client(), device).button_active
+            )
             self._light_btn.handler_unblock_by_func(self._on_light_toggled)
             self._refresh_light_icon()
         if error is not None and self._device is device:
             action = "turn on" if requested_active else "turn off"
-            self._present_device_command_error(f"Could not {action} light", device, error)
+            self._present_device_command_error(
+                "Light request uncertain"
+                if getattr(error, "possibly_sent", False)
+                else f"Could not {action} light",
+                device,
+                error,
+            )
         return GLib.SOURCE_REMOVE
 
     def _on_siren_clicked(self, *_args) -> None:
@@ -841,12 +854,34 @@ class FocusedLivePage(Gtk.Box):
                 _log.debug("Failed to stop focused talkback: %s", exc)
         self._reset_microphone_control()
 
+    def _refresh_lighting(self) -> None:
+        supported = device_commands.has_capability(self._device, "light")
+        label = getattr(self, "_lighting_label", None)
+        if label is not None:
+            label.set_visible(supported)
+        if not supported:
+            return
+        view = camera_lighting.view_for(_ring_client(), self._device)
+        if label is not None:
+            label.set_label(view.message)
+        self._light_btn.handler_block_by_func(self._on_light_toggled)
+        self._light_btn.set_active(view.button_active)
+        self._light_btn.handler_unblock_by_func(self._on_light_toggled)
+        self._light_btn.set_sensitive(view.phase not in {"pending", "accepted"})
+        self._refresh_light_icon()
+
     def _refresh_light_icon(self) -> None:
         if not hasattr(self, "_light_icon"):
             return
         self._light_icon.set_from_icon_name("display-brightness-symbolic")
         self._light_btn.set_tooltip_text(
-            "Turn camera light off" if self._light_btn.get_active() else "Turn camera light on"
+            (
+                "Request camera light Off"
+                if self._light_btn.get_active()
+                else "Request camera light On"
+            )
+            + " · "
+            + camera_lighting.view_for(_ring_client(), self._device).message
         )
 
 

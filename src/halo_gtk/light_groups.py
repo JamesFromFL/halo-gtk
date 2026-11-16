@@ -783,6 +783,8 @@ class LightGroupsService:
         def on_admitted():
             nonlocal admitted, operation
             admission()
+            if not self._lighting_actions.mark_sent(token):
+                raise LightGroupsRestError("session-changed")
             admitted = True
             operation = replace(
                 operation, status=LightGroupOperationStatus.POSSIBLY_SENT, possibly_sent=True
@@ -836,6 +838,7 @@ class LightGroupsService:
                         code="http-rejected",
                     )
                 else:
+                    self._lighting_actions.acknowledge(token)
                     operation = replace(operation, status=LightGroupOperationStatus.ACCEPTED)
                     self._set_operation(target, operation)
                     # Join and retire any report GET already admitted before the

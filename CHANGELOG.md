@@ -58,6 +58,8 @@ This section tracks the work toward Halo GTK's first tagged release.
 - Automated lint, test, dependency-audit, schema, desktop-file, and installed-wheel checks.
 
 ### Changed
+- Camera lighting displays pending, accepted, reported and unconfirmed outcomes
+  from fresh Ring observations, with available native motion-timer information.
 - Dependency auditing retains the full scanner report and checks exact package
   coverage. Reviewed OAuthlib authorization-server exceptions are scoped to the
   locked package/version; new findings, incomplete scans and unknown aliases fail.

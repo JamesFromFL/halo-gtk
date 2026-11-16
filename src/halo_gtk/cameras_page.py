@@ -16,8 +16,8 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Adw, Gdk, GdkPixbuf, GLib, Gtk, Pango  # noqa: E402
 
+from halo_gtk import camera_lighting, device_commands, device_names, live_layouts  # noqa: E402
 from halo_gtk import config as _cfg  # noqa: E402
-from halo_gtk import device_commands, device_names, live_layouts  # noqa: E402
 from halo_gtk.camera_settings import CameraSettingsWindow  # noqa: E402
 from halo_gtk.live_sessions import (  # noqa: E402
     LIVE_MONITORING_OWNER,
@@ -474,6 +474,13 @@ class CameraTile(Gtk.Frame):
             self._next_icon = Gtk.Image.new_from_icon_name("go-next-symbolic")
             title_row.append(self._next_icon)
         footer.append(title_row)
+        self._lighting_label = Gtk.Label(
+            xalign=0,
+            wrap=True,
+            css_classes=["caption", "dim-label"],
+            visible=device_commands.has_capability(device, "light"),
+        )
+        footer.append(self._lighting_label)
 
         self._network_icon = Gtk.Image(pixel_size=16, valign=Gtk.Align.CENTER)
         self._power_icon = Gtk.Image(pixel_size=16, valign=Gtk.Align.CENTER)
@@ -595,6 +602,7 @@ class CameraTile(Gtk.Frame):
         self._timer_label.set_visible(False)
 
     def refresh_privacy(self) -> None:
+        self._refresh_lighting()
         view = camera_privacy.current_view(self.device)
         self._privacy_label.set_label(view.message)
         self._privacy_label.set_visible(view.reason != "allowed")
@@ -742,7 +750,7 @@ class CameraTile(Gtk.Frame):
             self._light_btn.add_css_class("command-button")
             self._light_btn.set_hexpand(True)
             self._light_btn.set_active(
-                device_commands.command_state.light_enabled(get_client(), self.device)
+                camera_lighting.view_for(get_client(), self.device).button_active
             )
             self._light_btn.connect("toggled", self._on_light_toggled)
             self._refresh_light_icon()
@@ -928,12 +936,33 @@ class CameraTile(Gtk.Frame):
         if self._on_siren_toggle is not None:
             self._on_siren_toggle(self.device)
 
+    def _refresh_lighting(self) -> None:
+        if not device_commands.has_capability(self.device, "light"):
+            return
+        view = camera_lighting.view_for(get_client(), self.device)
+        label = getattr(self, "_lighting_label", None)
+        if label is not None:
+            label.set_label(view.message)
+        button = getattr(self, "_light_btn", None)
+        if button is not None:
+            button.handler_block_by_func(self._on_light_toggled)
+            button.set_active(view.button_active)
+            button.handler_unblock_by_func(self._on_light_toggled)
+            button.set_sensitive(view.phase not in {"pending", "accepted"})
+            self._refresh_light_icon()
+
     def _refresh_light_icon(self) -> None:
         if not hasattr(self, "_light_icon"):
             return
         self._light_icon.set_from_icon_name("display-brightness-symbolic")
         self._light_btn.set_tooltip_text(
-            "Turn camera light off" if self._light_btn.get_active() else "Turn camera light on"
+            (
+                "Request camera light Off"
+                if self._light_btn.get_active()
+                else "Request camera light On"
+            )
+            + " · "
+            + camera_lighting.view_for(get_client(), self.device).message
         )
 
     def _set_stream_state(self, label: str, icon_name: str, style: str) -> None:
@@ -2612,13 +2641,19 @@ class CamerasPage(Gtk.Box):
         if tile is not None and tile._light_btn is not None:
             tile._light_btn.set_sensitive(True)
             tile._light_btn.handler_block_by_func(tile._on_light_toggled)
-            tile._light_btn.set_active(device_commands.command_state.light_enabled(client, device))
+            tile._light_btn.set_active(
+                camera_lighting.view_for(client or get_client(), device).button_active
+            )
             tile._light_btn.handler_unblock_by_func(tile._on_light_toggled)
             tile._refresh_light_icon()
         if error is not None and tile is not None:
             action = "turn on" if requested_active else "turn off"
             self._present_device_command_error(
-                f"Could not {action} light",
+                (
+                    "Light request uncertain"
+                    if getattr(error, "possibly_sent", False)
+                    else f"Could not {action} light"
+                ),
                 device,
                 error,
             )

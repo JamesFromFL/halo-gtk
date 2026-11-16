@@ -69,6 +69,14 @@ class Actions:
             error.code = "session-changed"
             raise error
 
+    def mark_sent(self, token):
+        self.admission(token)
+        return True
+
+    def acknowledge(self, token):
+        self.admission(token)
+        return 1
+
     def release(self, token):
         self.releases.append(token)
         if token is self.token:

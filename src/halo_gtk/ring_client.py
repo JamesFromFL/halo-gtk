@@ -837,9 +837,10 @@ class RingClient:
                 auth.get_hardware_id(),
                 _APP_USER_AGENT,
             )
+            lighting_revision = self._lighting_actions.revision
             await ring.async_update_data()
             self._finish_authentication(auth, ring)
-            self._record_camera_privacy_receipt()
+            self._record_camera_privacy_receipt(lighting_revision)
             _log.info(
                 "Ring authenticated — %d device(s) found",
                 len(ring.devices().all_devices),
@@ -866,9 +867,10 @@ class RingClient:
             # A cached token that expired (and whose refresh failed) raises
             # AuthenticationError here — let it propagate so init_client_from_cache()
             # can delete the stale secret.
+            lighting_revision = self._lighting_actions.revision
             await ring.async_update_data()
             self._finish_authentication(auth, ring)
-            self._record_camera_privacy_receipt()
+            self._record_camera_privacy_receipt(lighting_revision)
         except BaseException:
             self._pending_auth_token = None
             await self._close_auth(auth)
@@ -1511,8 +1513,9 @@ class RingClient:
     ) -> list:
         async with self._inventory_refresh_lock:
             if privacy_time() - self._last_device_update_at > max_age_seconds:
+                lighting_revision = self._lighting_actions.revision
                 await self._ring.async_update_data()
-                self._record_camera_privacy_receipt()
+                self._record_camera_privacy_receipt(lighting_revision)
                 await self._async_reconcile_alarm_discovery()
         devices = list(self._ring.devices().all_devices)
         if families is None:
@@ -1521,7 +1524,7 @@ class RingClient:
             device for device in devices if (getattr(device, "family", None) or "other") in families
         ]
 
-    def _record_camera_privacy_receipt(self) -> None:
+    def _record_camera_privacy_receipt(self, lighting_revision=None) -> None:
         # Called in the Ring loop immediately after a successful GET. A cached
         # inventory read must never extend the privacy freshness deadline.
         self._last_device_update_at = privacy_time()
@@ -1531,6 +1534,14 @@ class RingClient:
             if getattr(device, "family", None) in CAMERA_FAMILIES
         ]
         self.camera_privacy.observe(ring_privacy_receipt(cameras, self._last_device_update_at))
+        if type(lighting_revision) is int:
+            from halo_gtk.camera_lighting import camera_lighting_receipt
+
+            self._lighting_actions.observe(
+                camera_lighting_receipt(
+                    cameras, received_at=self._last_device_update_at, revision=lighting_revision
+                )
+            )
 
     async def _async_refresh_camera_privacy(self) -> None:
         while self._preview_is_current():
@@ -1558,8 +1569,9 @@ class RingClient:
                 self.camera_privacy.end_change(token)
             if self._preview_is_current():
                 try:
+                    lighting_revision = self._lighting_actions.revision
                     await self._ring.async_update_data()
-                    self._record_camera_privacy_receipt()
+                    self._record_camera_privacy_receipt(lighting_revision)
                 except Exception as exc:
                     raise CameraPrivacyReadbackError(
                         "Ring accepted the change, but privacy could not be verified."

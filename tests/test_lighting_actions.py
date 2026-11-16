@@ -9,7 +9,10 @@ from types import SimpleNamespace
 import pytest
 
 from halo_gtk import device_commands, lighting_actions
+from halo_gtk.camera_lighting import camera_lighting_receipt
+from halo_gtk.camera_privacy import privacy_time
 from halo_gtk.lighting_actions import LightingActionError, LightingActions
+from halo_gtk.ring_json import RingWriteReceipt
 
 
 def fixture():
@@ -20,13 +23,15 @@ def fixture():
 
     camera = SimpleNamespace(
         id=12,
+        device_api_id=12,
+        _attrs={"led_status": "off", "settings": {"floodlight_settings": {"duration": 60}}},
         kind="stickup_cam",
         location_id="home",
         family="stickup_cams",
         light=False,
         siren=0,
         has_capability=lambda kind: kind == "light",
-        async_set_light=setter,
+        async_set_light=lambda *_: pytest.fail("SDK setter must not be used"),
     )
     client = SimpleNamespace(
         _stopped=False,
@@ -37,7 +42,40 @@ def fixture():
     )
     actions = LightingActions(client, is_current=lambda c, generation: c.active and generation == 7)
     actions.initialize(7)
+    client._lighting_actions = actions
+
+    class Transport:
+        send = staticmethod(setter)
+        requested = False
+
+        async def request_write(self, url, *, method, json, timeout, admission, on_admitted):
+            assert method == "PUT" and json is None
+            assert url in {
+                "https://api.ring.com/clients_api/doorbots/12/floodlight_light_on",
+                "https://api.ring.com/clients_api/doorbots/12/floodlight_light_off",
+            }
+            admission()
+            on_admitted()
+            self.requested = url.endswith("_on")
+            await self.send(self.requested)
+            return RingWriteReceipt(200)
+
+    client._transport = Transport()
+    client._get_ring_json_transport = lambda: client._transport
+
+    async def refresh(*_args):
+        camera._attrs["led_status"] = "on" if client._transport.requested else "off"
+        observe(actions, client.all_devices)
+
+    client._async_refresh_devices = refresh
+    observe(actions, [camera])
     return client, camera, actions, calls
+
+
+def observe(actions, devices):
+    actions.observe(
+        camera_lighting_receipt(devices, received_at=privacy_time(), revision=actions.revision)
+    )
 
 
 def test_reservation_has_no_queue_and_old_token_cannot_release_new_action():
@@ -98,15 +136,16 @@ async def test_camera_commit_precedes_release_and_group_invalidates_exact_member
     state = device_commands.DeviceCommandState()
     monkeypatch.setattr(device_commands, "command_state", state)
     other = SimpleNamespace(**{**vars(camera), "id": 13})
-    other_location = SimpleNamespace(**{**vars(camera), "location_id": "other"})
+    other_location = SimpleNamespace(**{**vars(camera), "id": 14, "location_id": "other"})
     client.all_devices += [other, other_location]
     state.record_light_success(client, other, True)
     state.record_light_success(client, other_location, True)
     state.record_siren_success(client, camera, 30)
     await actions.camera_light(camera, True)
     assert calls == [True] and actions._active is None
-    assert state.light_enabled(client, camera)
+    assert actions.view(camera).light is True
     token = actions.try_acquire()
+    assert actions.mark_sent(token)
     member = SimpleNamespace(api_id="12", kind="stickup_cam", location_id="home")
     actions.invalidate_group_members("home", [member])
     assert not state.light_enabled(client, camera)
@@ -125,7 +164,7 @@ async def test_presentation_cancel_after_entry_does_not_release_running_camera(m
         started.set()
         await release.wait()
 
-    camera.async_set_light = setter
+    client._transport.send = setter
     consumer = asyncio.create_task(actions.camera_light(camera, True))
     await started.wait()
     consumer.cancel()
@@ -142,7 +181,7 @@ async def test_presentation_cancel_after_entry_does_not_release_running_camera(m
 
 @pytest.mark.asyncio
 async def test_whole_camera_deadline_cancels_stalled_auth_and_releases_reservation(monkeypatch):
-    _client, camera, actions, _calls = fixture()
+    client, camera, actions, _calls = fixture()
     cleaned = asyncio.Event()
     monkeypatch.setattr(lighting_actions, "CAMERA_ACTION_TIMEOUT", 0.01)
 
@@ -152,7 +191,7 @@ async def test_whole_camera_deadline_cancels_stalled_auth_and_releases_reservati
         finally:
             cleaned.set()
 
-    camera.async_set_light = setter
+    client._transport.send = setter
     with pytest.raises(LightingActionError) as caught:
         await actions.camera_light(camera, True)
     assert caught.value.code == "outcome-unknown" and caught.value.possibly_sent
@@ -177,7 +216,7 @@ async def test_sdk_suppressed_timeout_cannot_publish_late_camera_success(monkeyp
         except asyncio.CancelledError:
             cancelled.set()
 
-    camera.async_set_light = setter
+    client._transport.send = setter
     with pytest.raises(LightingActionError) as caught:
         await actions.camera_light(camera, True)
     assert caught.value.code == "outcome-unknown" and caught.value.possibly_sent
@@ -197,7 +236,7 @@ async def test_suspend_or_synchronous_sdk_completion_cannot_publish_expired_succ
     async def setter(_value):
         clock[0] += 31  # No event-loop yield, like completion immediately after suspend.
 
-    camera.async_set_light = setter
+    client._transport.send = setter
     with pytest.raises(LightingActionError) as caught:
         await actions.camera_light(camera, True)
     assert caught.value.code == "outcome-unknown" and caught.value.possibly_sent
@@ -207,7 +246,7 @@ async def test_suspend_or_synchronous_sdk_completion_cannot_publish_expired_succ
 
 @pytest.mark.asyncio
 async def test_close_joins_camera_cancellation_and_preserves_unknown_outcome():
-    _client, camera, actions, _calls = fixture()
+    client, camera, actions, _calls = fixture()
     started, cleaned = asyncio.Event(), asyncio.Event()
 
     async def setter(_value):
@@ -217,7 +256,7 @@ async def test_close_joins_camera_cancellation_and_preserves_unknown_outcome():
         finally:
             cleaned.set()
 
-    camera.async_set_light = setter
+    client._transport.send = setter
     consumer = asyncio.create_task(actions.camera_light(camera, True))
     await started.wait()
     await asyncio.gather(actions.close(), actions.close())
@@ -243,8 +282,9 @@ async def test_delayed_camera_gtk_completion_cannot_revive_group_invalidated_ove
     monkeypatch.setattr(cameras_page, "get_client", lambda: client)
     monkeypatch.setattr(focused_live_page, "_ring_client", lambda: client)
     await actions.camera_light(camera, True)
-    assert state.light_enabled(client, camera)
+    assert actions.view(camera).light is True
     token = actions.try_acquire()
+    assert actions.mark_sent(token)
     actions.invalidate_group_members(
         "home", [SimpleNamespace(api_id="12", kind="stickup_cam", location_id="home")]
     )
@@ -277,6 +317,8 @@ def test_busy_callback_restores_current_light_state_instead_of_inverting_request
 
     client, camera, _actions, _calls = fixture()
     camera.light = True
+    camera._attrs["led_status"] = "on"
+    observe(_actions, [camera])
     monkeypatch.setattr(cameras_page, "get_client", lambda: client)
     button = _Button(active=True)
     tile = SimpleNamespace(

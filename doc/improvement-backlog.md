@@ -17,6 +17,9 @@ is committed as `c9475b2`; the items below preserve the separate feature work.
   [camera privacy](camera-privacy.md). Ring receipt delays and live-device
   acceptance remain explicit limitations.
 - Remaining device controls: in progress.
+- Camera light outcome reporting and read-only motion-timer information:
+  complete; see [camera lighting](camera-lighting.md). Indefinite manual On is
+  still an evidence gate, not an inferred capability.
 - Chime snooze/resume and qualified automatic nightlight: complete; see
   [Chime support](chime-support.md). Physical-device acceptance remains separate.
 - Alarm history pagination guard and coverage reporting: complete; see
