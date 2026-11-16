@@ -169,3 +169,55 @@ def test_refresh_failure_shows_safe_error_and_releases_button(page, harness):
     assert page._refresh_button.sensitive
     assert "unavailable" in page._chime_message.label
     assert "SECRET" not in page._chime_message.label
+
+
+def _filter_page(query="", family="all"):
+    class Row(Widget):
+        def get_title(self):
+            return self.title
+
+        def get_subtitle(self):
+            return self.subtitle
+
+    page = SimpleNamespace(
+        _selected_family=family,
+        _device_search=SimpleNamespace(get_text=lambda: query),
+        _search_empty=Widget(),
+        _chime_rows=[Row(title="Hall Chime", subtitle="Chime Pro · Reported online")],
+        _light_rows=[Row(title="Garden lights", subtitle="Group reports Off")],
+        _intercom_rows=[Row(title="Entrance", subtitle="Reported offline")],
+    )
+    page._device_sections = tuple(
+        (key, Widget(), Widget(), rows)
+        for key, rows in (
+            ("chimes", "_chime_rows"),
+            ("lighting", "_light_rows"),
+            ("intercoms", "_intercom_rows"),
+        )
+    )
+    return page
+
+
+def test_device_search_filters_cached_status_and_names_without_a_client():
+    page = _filter_page("  OFFLINE  ")
+    DevicesPage._apply_inventory_filter(page)
+    assert not page._chime_rows[0].visible
+    assert not page._light_rows[0].visible
+    assert page._intercom_rows[0].visible
+    assert not page._search_empty.visible
+    assert [group.visible for _, group, _, _ in page._device_sections] == [False, False, True]
+
+
+def test_device_category_keeps_empty_section_refresh_available():
+    page = _filter_page(family="lighting")
+    page._light_rows.clear()
+    DevicesPage._apply_inventory_filter(page)
+    assert [group.visible for _, group, _, _ in page._device_sections] == [False, True, False]
+    assert not page._search_empty.visible
+
+
+def test_device_search_respects_selected_family_and_reports_no_matches():
+    page = _filter_page("entrance", "chimes")
+    DevicesPage._apply_inventory_filter(page)
+    assert page._search_empty.visible
+    assert not any(group.visible for _, group, _, _ in page._device_sections)

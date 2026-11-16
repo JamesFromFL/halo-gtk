@@ -360,6 +360,7 @@ class CameraTile(Gtk.Frame):
 
         self.add_css_class("card")
         self.add_css_class("camera-tile")
+        self.add_css_class("halo-camera-card")
         self.set_overflow(Gtk.Overflow.HIDDEN)
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -372,12 +373,17 @@ class CameraTile(Gtk.Frame):
 
         # Timer badge floats over the aspect_box.
         self._timer_label = Gtk.Label(
-            css_classes=["caption", "numeric", "snapshot-timer"],
+            css_classes=["caption", "numeric", "snapshot-timer", "halo-preview-age"],
             halign=Gtk.Align.START,
-            valign=Gtk.Align.END,
-            margin_start=8,
-            margin_bottom=8,
+            valign=Gtk.Align.START,
+            margin_start=12,
+            margin_top=12,
+            ellipsize=Pango.EllipsizeMode.END,
             visible=False,
+        )
+        self._timer_label.set_tooltip_text(
+            "Time since this preview was loaded into Halo. "
+            "The image may have been captured earlier."
         )
         self._timer_label.get_style_context().add_provider(
             _get_timer_css_provider(), Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
@@ -393,8 +399,8 @@ class CameraTile(Gtk.Frame):
             spacing=5,
             halign=Gtk.Align.START,
             valign=Gtk.Align.START,
-            margin_top=8,
-            margin_start=8,
+            margin_top=12,
+            margin_start=12,
             visible=self._live_monitoring,
         )
         self._stream_state_box.add_css_class("camera-overlay")
@@ -410,6 +416,7 @@ class CameraTile(Gtk.Frame):
 
         footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9)
         footer.add_css_class("camera-footer")
+        footer.add_css_class("halo-camera-footer")
         title_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         title_copy = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1, hexpand=True)
         self._name_label = Gtk.Label(
@@ -424,6 +431,7 @@ class CameraTile(Gtk.Frame):
             ellipsize=Pango.EllipsizeMode.END,
         )
         self._model_label.add_css_class("dim-label")
+        self._model_label.add_css_class("caption")
         title_copy.append(self._name_label)
         title_copy.append(self._model_label)
         title_row.append(title_copy)
@@ -438,7 +446,7 @@ class CameraTile(Gtk.Frame):
             self._settings_btn.connect("clicked", self._on_settings_clicked)
             title_row.append(self._settings_btn)
             self._open_btn = Gtk.Button(
-                icon_name="view-fullscreen-symbolic",
+                icon_name="go-next-symbolic",
                 tooltip_text="Open live view",
                 css_classes=["flat"],
                 valign=Gtk.Align.CENTER,
@@ -569,6 +577,7 @@ class CameraTile(Gtk.Frame):
 
     def set_snapshot(self, png_bytes: bytes, *, motion_detection_off: bool = False) -> None:
         """Update the thumbnail from raw PNG bytes (GTK main thread)."""
+        loaded = False
         try:
             loader = GdkPixbuf.PixbufLoader()
             loader.write(png_bytes)
@@ -580,13 +589,14 @@ class CameraTile(Gtk.Frame):
                 self._native_w = pixbuf.get_width()
                 self._native_h = pixbuf.get_height()
                 self.aspect_box.set_paintable(Gdk.Texture.new_for_pixbuf(pixbuf))
+                loaded = True
         except Exception as exc:
             _log.debug("CameraTile.set_snapshot failed for %s: %s", self.device.name, exc)
 
         self._motion_detection_off = motion_detection_off
         if motion_detection_off or not self._show_snapshot_timer:
             self._timer_label.set_visible(False)
-        else:
+        elif loaded:
             self._snapshot_loaded_at = time.monotonic()
             self._timer_label.set_visible(True)
             self._update_timer()
@@ -611,7 +621,7 @@ class CameraTile(Gtk.Frame):
             text = f"{m}m {s}s"
         else:
             text = f"{s}s"
-        self._timer_label.set_label(text)
+        self._timer_label.set_label(f"Preview loaded {text} ago")
         return GLib.SOURCE_CONTINUE
 
     def cleanup(self) -> None:
@@ -973,6 +983,43 @@ class CameraTile(Gtk.Frame):
 # ---------------------------------------------------------------------------
 
 
+class _EmbeddedCameraStatus(Gtk.Box):
+    """A naturally sized empty state inside the overview's outer scroller."""
+
+    def __init__(self) -> None:
+        super().__init__(spacing=12, css_classes=["card"])
+        self.append(
+            Gtk.Image(
+                icon_name="camera-video-symbolic",
+                pixel_size=24,
+                margin_start=16,
+                css_classes=["dim-label"],
+            )
+        )
+        text = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=4,
+            margin_top=16,
+            margin_bottom=16,
+            margin_end=16,
+            hexpand=True,
+        )
+        self._title = Gtk.Label(xalign=0, wrap=True, css_classes=["heading"])
+        self._description = Gtk.Label(xalign=0, wrap=True, css_classes=["dim-label"])
+        text.append(self._title)
+        text.append(self._description)
+        self.append(text)
+        self.set_title("No cameras")
+        self.set_description("Sign in to see your Ring cameras.")
+
+    def set_title(self, title: str) -> None:
+        self._title.set_label(title)
+
+    def set_description(self, description: str) -> None:
+        self._description.set_label(description)
+        self._description.set_visible(bool(description))
+
+
 class CamerasPage(Gtk.Box):
     """Camera grid for the dashboard or multi-camera monitoring page."""
 
@@ -982,6 +1029,7 @@ class CamerasPage(Gtk.Box):
         *,
         on_open_history=None,
         show_monitoring_controls: bool = False,
+        embedded: bool = False,
         grid_size_config_key: str = "camera_grid_size",
         camera_order_config_key: str = "camera_order",
     ) -> None:
@@ -989,6 +1037,9 @@ class CamerasPage(Gtk.Box):
         self._on_open_live_focus = on_open_live_focus
         self._on_open_history = on_open_history
         self._show_monitoring_controls = show_monitoring_controls
+        self._embedded = embedded and not show_monitoring_controls
+        if self._embedded:
+            self.set_vexpand(False)
         self._grid_size_config_key = grid_size_config_key
         self._camera_order_config_key = camera_order_config_key
 
@@ -1016,7 +1067,9 @@ class CamerasPage(Gtk.Box):
         default_size = (
             live_layouts.DEFAULT_LAYOUT_SIZE if self._show_monitoring_controls else "medium"
         )
-        self._size_mode: str = cfg.get(self._grid_size_config_key, default_size)
+        self._size_mode: str = (
+            "medium" if self._embedded else cfg.get(self._grid_size_config_key, default_size)
+        )
         if self._size_mode not in _SIZE_MODES:
             self._size_mode = default_size
         self._order: list[int] = cfg.get(self._camera_order_config_key, [])
@@ -1041,29 +1094,33 @@ class CamerasPage(Gtk.Box):
             orientation=Gtk.Orientation.VERTICAL,
             spacing=14,
             hexpand=True,
-            vexpand=True,
+            vexpand=not self._embedded,
         )
         if self._show_monitoring_controls:
-            grid_box.add_css_class("monitor-canvas")
-            grid_box.set_margin_top(18)
-            grid_box.set_margin_bottom(18)
-            grid_box.set_margin_start(20)
-            grid_box.set_margin_end(20)
+            grid_box.set_margin_top(24)
+            grid_box.set_margin_bottom(24)
+            grid_box.set_margin_start(24)
+            grid_box.set_margin_end(24)
 
         if self._show_monitoring_controls:
             title_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            title_copy = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5, hexpand=True)
+            title = Gtk.Label(label="Cameras", xalign=0)
+            title.add_css_class("halo-page-heading")
+            title_copy.append(title)
             self._layout_status_label = Gtk.Label(
                 label="Default layout",
                 xalign=0,
                 hexpand=True,
+                ellipsize=Pango.EllipsizeMode.END,
             )
-            self._layout_status_label.add_css_class("heading")
-            self._layout_status_label.add_css_class("dim-label")
-            title_row.append(self._layout_status_label)
+            self._layout_status_label.add_css_class("halo-page-subtitle")
+            title_copy.append(self._layout_status_label)
+            title_row.append(title_copy)
             self._inspector_toggle = Gtk.ToggleButton(
                 icon_name="sidebar-show-right-symbolic",
                 tooltip_text="Show selected camera",
-                active=True,
+                active=False,
             )
             self._inspector_toggle.add_css_class("flat")
             self._inspector_toggle.connect("toggled", self._on_inspector_toggled)
@@ -1080,26 +1137,38 @@ class CamerasPage(Gtk.Box):
             toolbar.append(self._build_density_controls())
             self._layout_btn = self._build_reorder_button()
             toolbar.append(self._layout_btn)
-            grid_box.append(toolbar)
+            if not self._embedded:
+                grid_box.append(toolbar)
 
-        self._status_page = Adw.StatusPage(
-            icon_name="camera-video-symbolic",
-            title="No cameras",
-            description="Sign in to see your Ring cameras.",
-            vexpand=True,
+        self._status_page = (
+            _EmbeddedCameraStatus()
+            if self._embedded
+            else Adw.StatusPage(
+                icon_name="camera-video-symbolic",
+                title="No cameras",
+                description="Sign in to see your Ring cameras.",
+                vexpand=True,
+            )
         )
         self._status_page.set_visible(True)
         grid_box.append(self._status_page)
 
-        self._scroll = Gtk.ScrolledWindow(
-            vexpand=True,
-            visible=False,
-            hscrollbar_policy=Gtk.PolicyType.NEVER,
-            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
-        )
+        if self._embedded:
+            self._scroll = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, visible=False)
+        else:
+            self._scroll = Gtk.ScrolledWindow(
+                vexpand=True,
+                visible=False,
+                hscrollbar_policy=Gtk.PolicyType.NEVER,
+                vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            )
         grid_box.append(self._scroll)
 
-        self._grid = Gtk.Grid(
+        self._grid = Gtk.FlowBox(
+            selection_mode=Gtk.SelectionMode.NONE,
+            homogeneous=True,
+            min_children_per_line=1,
+            max_children_per_line=3 if self._embedded else _density_columns(self._size_mode),
             column_spacing=16,
             row_spacing=16,
             margin_top=2,
@@ -1113,7 +1182,10 @@ class CamerasPage(Gtk.Box):
         )
         self._grid.add_css_class("camera-grid")
         self._apply_size_mode_layout(self._size_mode)
-        self._scroll.set_child(self._grid)
+        if self._embedded:
+            self._scroll.append(self._grid)
+        else:
+            self._scroll.set_child(self._grid)
 
         if not self._show_monitoring_controls:
             self.append(grid_box)
@@ -1127,7 +1199,7 @@ class CamerasPage(Gtk.Box):
             max_sidebar_width=380,
             sidebar_width_fraction=0.31,
             collapsed=False,
-            show_sidebar=True,
+            show_sidebar=False,
         )
         self._monitor_split.set_content(grid_box)
         self._monitor_split.set_sidebar(self._build_monitoring_inspector())
@@ -1147,11 +1219,11 @@ class CamerasPage(Gtk.Box):
             noun = "camera" if columns == 1 else "cameras"
             btn = Gtk.ToggleButton(
                 label=label,
-                tooltip_text=f"{mode.title()} - {columns} {noun} per row",
+                tooltip_text=f"{mode.title()} - up to {columns} {noun} per row",
             )
             btn.update_property(
                 [Gtk.AccessibleProperty.LABEL],
-                [f"{mode.title()} density, {columns} {noun} per row"],
+                [f"{mode.title()} density, up to {columns} {noun} per row"],
             )
             if first_btn is None:
                 first_btn = btn
@@ -1167,10 +1239,10 @@ class CamerasPage(Gtk.Box):
         for mode, button in self._size_btns.items():
             columns = _density_columns(mode)
             noun = "camera" if columns == 1 else "cameras"
-            button.set_tooltip_text(f"{mode.title()} - {columns} {noun} per row")
+            button.set_tooltip_text(f"{mode.title()} - up to {columns} {noun} per row")
             button.update_property(
                 [Gtk.AccessibleProperty.LABEL],
-                [f"{mode.title()} density, {columns} {noun} per row"],
+                [f"{mode.title()} density, up to {columns} {noun} per row"],
             )
 
     def _build_reorder_button(self) -> Gtk.ToggleButton:
@@ -1184,7 +1256,7 @@ class CamerasPage(Gtk.Box):
 
     def _build_monitoring_toolbar(self) -> Gtk.Widget:
         controls = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        controls.add_css_class("monitor-controls")
+        controls.add_css_class("halo-camera-toolbar")
 
         layout_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
         layout_row.append(Gtk.Label(label="Layout", xalign=0))
@@ -1225,6 +1297,14 @@ class CamerasPage(Gtk.Box):
         layout_row.append(self._delete_layout_btn)
         controls.append(layout_row)
 
+        action_rows = Gtk.FlowBox(
+            selection_mode=Gtk.SelectionMode.NONE,
+            min_children_per_line=1,
+            max_children_per_line=2,
+            column_spacing=12,
+            row_spacing=8,
+            homogeneous=False,
+        )
         stream_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self._camera_filter_box = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
@@ -1237,7 +1317,6 @@ class CamerasPage(Gtk.Box):
         filter_popover = Gtk.Popover(child=self._camera_filter_box)
         self._camera_filter_btn = Gtk.MenuButton(
             label="Cameras",
-            icon_name="camera-video-symbolic",
             tooltip_text="Choose cameras to display",
             popover=filter_popover,
             hexpand=True,
@@ -1246,8 +1325,8 @@ class CamerasPage(Gtk.Box):
         stream_row.append(self._camera_filter_btn)
         self._play_btn = Gtk.Button(
             label="Start all",
-            icon_name="media-playback-start-symbolic",
             tooltip_text="Start live monitoring",
+            css_classes=["suggested-action"],
         )
         self._play_btn.connect("clicked", self._on_monitoring_play)
         stream_row.append(self._play_btn)
@@ -1258,7 +1337,7 @@ class CamerasPage(Gtk.Box):
         )
         self._stop_btn.connect("clicked", self._on_monitoring_stop)
         stream_row.append(self._stop_btn)
-        controls.append(stream_row)
+        action_rows.append(stream_row)
 
         display_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         display_row.set_halign(Gtk.Align.END)
@@ -1266,7 +1345,8 @@ class CamerasPage(Gtk.Box):
         display_row.append(self._build_density_controls())
         self._layout_btn = self._build_reorder_button()
         display_row.append(self._layout_btn)
-        controls.append(display_row)
+        action_rows.append(display_row)
+        controls.append(action_rows)
         return controls
 
     def _build_monitoring_inspector(self) -> Gtk.Widget:
@@ -1432,7 +1512,7 @@ class CamerasPage(Gtk.Box):
         self._talk_control_slot.set_visible(tile._mic_btn.get_visible())
         self._light_control_slot.set_visible(tile._light_btn is not None)
         self._siren_control_slot.set_visible(tile._siren_btn is not None)
-        if reveal and self._monitor_split.get_collapsed():
+        if reveal:
             self._monitor_split.set_show_sidebar(True)
 
     def _refresh_monitoring_inspector(self) -> None:
@@ -1969,6 +2049,8 @@ class CamerasPage(Gtk.Box):
         self._refresh_live_layout_state()
 
     def _visible_devices(self, devices: list) -> list:
+        if getattr(self, "_embedded", False):
+            return devices[:3]
         if not self._show_monitoring_controls:
             return devices
         return [device for device in devices if device.id not in self._hidden_camera_ids]
@@ -2005,8 +2087,7 @@ class CamerasPage(Gtk.Box):
             )
 
     def _apply_size_mode_layout(self, mode: str) -> None:
-        self._grid.set_column_homogeneous(_density_columns(mode) > 1)
-        self._grid.set_row_homogeneous(False)
+        self._grid.set_max_children_per_line(3 if self._embedded else _density_columns(mode))
         self._rebuild_grid()
 
     # ------------------------------------------------------------------
@@ -2019,6 +2100,8 @@ class CamerasPage(Gtk.Box):
         self._rebuild_grid()
 
     def _save_camera_order(self) -> None:
+        if getattr(self, "_embedded", False):
+            return
         cfg = _cfg.load()
         if self._show_monitoring_controls:
             cfg[self._camera_order_config_key] = self._complete_order()
@@ -2326,6 +2409,8 @@ class CamerasPage(Gtk.Box):
             tile.set_snapshot(png_bytes, motion_detection_off=motion_off)
             # Native dimensions are now known — update the AspectBox ratio.
             tile.update_ratio(self._size_mode)
+            if getattr(self, "_embedded", False):
+                tile._details_grid.set_visible(False)
         return GLib.SOURCE_REMOVE
 
     def _finish_snapshot_load(self, device_id: int, generation: int) -> bool:
@@ -2751,24 +2836,30 @@ class CamerasPage(Gtk.Box):
         while (child := self._grid.get_first_child()) is not None:
             self._grid.remove(child)
 
-        children_per_line = _density_columns(self._size_mode)
         ordered_ids = [did for did in self._order if did in self._cards]
 
-        for index, device_id in enumerate(ordered_ids):
+        for device_id in ordered_ids:
             tile = self._cards[device_id]
-            tile.update_ratio(self._size_mode)
-            self._grid.attach(tile, index % children_per_line, index // children_per_line, 1, 1)
-        self._update_tile_compactness(self._scroll.get_allocated_width())
-
-    def do_size_allocate(self, width: int, height: int, baseline: int) -> None:
-        Gtk.Box.do_size_allocate(self, width, height, baseline)
+            # FlowBox wraps naturally when the available width cannot support
+            # the selected density; it never squeezes camera controls away.
+            tile.set_size_request(180 if self._size_mode == "small" else 260, -1)
+            tile.update_ratio("medium" if self._embedded else self._size_mode)
+            tile.set_compact_presentation(self._size_mode == "small")
+            if self._embedded:
+                tile._details_grid.set_visible(False)
+            self._grid.append(tile)
+            self._grid.get_last_child().set_focusable(False)
         self._update_tile_compactness(self._scroll.get_allocated_width())
 
     def _update_tile_compactness(self, grid_width: int) -> None:
         if grid_width <= 0:
             return
-        columns = _density_columns(self._size_mode)
+        maximum = 3 if getattr(self, "_embedded", False) else _density_columns(self._size_mode)
+        minimum_width = 180 if self._size_mode == "small" else 260
+        columns = min(maximum, max(1, (grid_width + 16) // (minimum_width + 22)))
         available = max(1, grid_width - 4 - (16 * max(0, columns - 1)))
         compact = self._size_mode == "small" or available / columns < 180
         for tile in self._cards.values():
             tile.set_compact_presentation(compact)
+            if getattr(self, "_embedded", False):
+                tile._details_grid.set_visible(False)

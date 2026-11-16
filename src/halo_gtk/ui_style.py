@@ -10,43 +10,8 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gdk, Gtk  # noqa: E402
 
 _CSS = """
-.navigation-ribbon {
-  background: mix(@window_bg_color, @view_bg_color, 0.58);
-  border-right: 1px solid alpha(@borders, 0.48);
-}
-
-.ribbon-brand {
-  padding: 12px 16px 11px;
-}
-
-.navigation-ribbon list {
-  background: transparent;
-}
-
-.navigation-ribbon row {
-  margin: 3px 9px;
-  border-radius: 8px;
-}
-
-.navigation-ribbon row:selected {
-  background: alpha(@accent_bg_color, 0.15);
-}
-
-.navigation-ribbon row:selected image {
-  color: @accent_color;
-}
-
-.ribbon-row {
-  padding: 10px 12px;
-}
-
-.ribbon-settings {
-  margin: 5px 9px 11px;
-  padding: 9px 11px;
-}
-
 .page-scroll-content {
-  padding: 24px 28px 36px;
+  padding: 28px 20px 36px;
 }
 
 .section-heading {
@@ -59,7 +24,7 @@ _CSS = """
 
 .camera-tile {
   border: 1px solid alpha(@borders, 0.52);
-  border-radius: 8px;
+  border-radius: 14px;
   background: @card_bg_color;
   box-shadow: 0 1px 3px alpha(black, 0.12);
 }
@@ -89,7 +54,7 @@ _CSS = """
 }
 
 .state-snapshot {
-  color: #f2dc55;
+  color: white;
 }
 
 .state-offline {
@@ -97,9 +62,8 @@ _CSS = """
 }
 
 .camera-footer {
-  padding: 9px 11px;
-  border-top: 1px solid alpha(@borders, 0.45);
-  background: mix(@card_bg_color, @view_bg_color, 0.38);
+  padding: 14px 16px;
+  background: @card_bg_color;
 }
 
 .camera-name {
@@ -111,7 +75,7 @@ _CSS = """
 }
 
 .monitor-canvas {
-  background: mix(@window_bg_color, #101214, 0.30);
+  background: @window_bg_color;
 }
 
 .monitor-inspector {
@@ -125,12 +89,11 @@ _CSS = """
 
 .monitor-controls {
   padding: 8px 10px;
-  border-top: 1px solid alpha(@borders, 0.45);
-  background: mix(@card_bg_color, @view_bg_color, 0.38);
+  background: @card_bg_color;
 }
 
 .video-frame {
-  border-radius: 8px;
+  border-radius: 14px;
   background: #111315;
 }
 
@@ -144,7 +107,7 @@ _CSS = """
   min-width: 24px;
   min-height: 24px;
   padding: 8px;
-  border-radius: 8px;
+  border-radius: 14px;
   color: @accent_color;
   background: alpha(@accent_bg_color, 0.12);
 }
@@ -165,7 +128,7 @@ _CSS = """
 
 .alarm-overview {
   border: 1px solid alpha(@borders, 0.52);
-  border-radius: 8px;
+  border-radius: 14px;
   background: @card_bg_color;
   box-shadow: 0 1px 3px alpha(black, 0.10);
 }
@@ -178,7 +141,7 @@ _CSS = """
   min-width: 34px;
   min-height: 34px;
   padding: 10px;
-  border-radius: 8px;
+  border-radius: 14px;
   background: alpha(@accent_bg_color, 0.12);
 }
 
@@ -193,6 +156,54 @@ _CSS = """
 .alarm-state-symbol.error {
   background: alpha(@error_bg_color, 0.14);
 }
+
+.halo-page-heading {
+  font-size: 2em;
+  font-weight: 800;
+  letter-spacing: -0.6px;
+}
+.halo-page-subtitle { color: alpha(currentColor, 0.65); }
+.halo-section-heading { font-size: 1.12em; font-weight: 700; }
+.halo-card {
+  border-radius: 16px;
+  background: @card_bg_color;
+  box-shadow: 0 1px 3px alpha(black, 0.12);
+  border: 1px solid alpha(@borders, 0.36);
+}
+.halo-overview-summary { padding: 22px; }
+.halo-overview-icon, .halo-security-icon {
+  padding: 16px;
+  border-radius: 18px;
+  background: alpha(@accent_bg_color, 0.10);
+  color: @accent_color;
+}
+.halo-security-icon.success,
+.halo-overview-icon.success { color: @success_color; background: alpha(@success_bg_color, 0.12); }
+.halo-security-icon.warning,
+.halo-overview-icon.warning { color: @warning_color; background: alpha(@warning_bg_color, 0.12); }
+.halo-security-icon.error,
+.halo-overview-icon.error { color: @error_color; background: alpha(@error_bg_color, 0.12); }
+.halo-camera-card { border-radius: 16px; }
+.halo-camera-toolbar { padding: 16px 20px; }
+.halo-camera-footer { padding: 14px 16px; }
+.halo-preview-age { border-radius: 7px; padding: 4px 7px; }
+.halo-focus-canvas { background: #151719; border-radius: 14px; }
+.halo-focus-controls { padding: 10px; border-radius: 20px; background: @card_bg_color; }
+.halo-focus-health { padding: 12px 16px; }
+.halo-timeline-list { background: @card_bg_color; }
+.halo-timeline-date { padding: 14px 8px 8px; font-weight: 700; }
+.halo-device-group { margin-top: 6px; }
+.halo-event-icon {
+  padding: 8px;
+  border-radius: 12px;
+  color: @accent_color;
+  background: alpha(@accent_bg_color, 0.10);
+}
+.halo-security-state { font-size: 2em; font-weight: 800; }
+.halo-security-summary { padding: 20px; }
+.halo-mode-choice { padding: 14px 18px; min-height: 48px; border-radius: 12px; }
+.halo-mode-selected { color: @accent_color; background: alpha(@accent_bg_color, 0.13); }
+
 """
 
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from halo_gtk import window as window_module
 from halo_gtk.window import RingWindow
 
@@ -88,7 +90,7 @@ def test_runtime_shutdown_stops_history_playback(monkeypatch):
     ]
 
 
-def test_ribbon_navigation_from_focused_live_keeps_real_source_in_history():
+def test_primary_navigation_from_focused_live_keeps_real_source_in_history():
     calls = []
     page = SimpleNamespace(
         _active_page_name="focused_live",
@@ -196,17 +198,8 @@ def test_hidden_history_title_does_not_replace_active_page_title():
     assert titles == [("history", "Front Door")]
 
 
-def test_alarm_navigation_refreshes_and_closes_compact_sidebar():
+def test_security_navigation_retires_overview_and_refreshes_security():
     calls = []
-
-    class SplitView:
-        @staticmethod
-        def get_collapsed():
-            return True
-
-        @staticmethod
-        def set_show_sidebar(visible):
-            calls.append(("sidebar", visible))
 
     page = SimpleNamespace(
         _active_page_name="dashboard",
@@ -222,7 +215,9 @@ def test_alarm_navigation_refreshes_and_closes_compact_sidebar():
         _content_stack=SimpleNamespace(
             set_visible_child_name=lambda name: calls.append(("page", name))
         ),
-        _split_view=SplitView(),
+        _dashboard_page=SimpleNamespace(
+            on_page_hidden=lambda: calls.append(("hide", "overview-summary"))
+        ),
         _select_nav_row=lambda name: calls.append(("select", name)),
         _update_title=lambda name: calls.append(("title", name)),
         _update_back_button=lambda: calls.append(("back", True)),
@@ -234,11 +229,11 @@ def test_alarm_navigation_refreshes_and_closes_compact_sidebar():
     assert page._page_history == ["dashboard"]
     assert calls == [
         ("hide", "dashboard"),
+        ("hide", "overview-summary"),
         ("select", "alarm"),
         ("page", "alarm"),
         ("title", "alarm"),
         ("refresh", "alarm"),
-        ("sidebar", False),
         ("back", True),
     ]
 
@@ -282,3 +277,145 @@ def test_window_teardown_retires_chime_dialogs_and_alarm_view(monkeypatch):
     )
     RingWindow.stop_runtime_streams(page)
     assert calls == ["devices", "alarm"]
+
+
+def test_compact_navigation_is_hidden_while_focused():
+    states = []
+    page = SimpleNamespace(
+        _compact=True,
+        _active_page_name="focused_live",
+        _header_stack=SimpleNamespace(set_visible_child_name=lambda name: states.append(name)),
+        _bottom_navigation=SimpleNamespace(set_reveal=lambda value: states.append(value)),
+        _brand=SimpleNamespace(set_visible=lambda value: states.append(value)),
+    )
+    RingWindow._sync_navigation(page)
+    assert states == ["title", False, False]
+    states.clear()
+    page._active_page_name = "cameras"
+    RingWindow._sync_navigation(page)
+    assert states == ["title", True, True]
+    states.clear()
+    page._compact = False
+    RingWindow._sync_navigation(page)
+    assert states == ["navigation", False, True]
+
+
+def test_view_switcher_transition_invokes_lifecycle_only_for_new_page():
+    shown = []
+    page = SimpleNamespace(_active_page_name="dashboard", _show_page=shown.append)
+    RingWindow._on_view_changed(
+        page, SimpleNamespace(get_visible_child_name=lambda: "dashboard"), None
+    )
+    RingWindow._on_view_changed(
+        page, SimpleNamespace(get_visible_child_name=lambda: "history"), None
+    )
+    assert shown == ["history"]
+
+
+def test_activity_deep_link_retires_device_dialogs():
+    calls = []
+    page = SimpleNamespace(
+        _active_page_name="devices",
+        _page_history=[],
+        _devices_page=SimpleNamespace(on_page_hidden=lambda: calls.append("hide-devices")),
+        _select_nav_row=lambda name: calls.append(name),
+        _content_stack=SimpleNamespace(set_visible_child_name=lambda name: None),
+        _update_title=lambda name: None,
+        _update_back_button=lambda: None,
+    )
+    RingWindow._enter_history_page(page, lambda: calls.append("load-events"))
+    assert calls == ["hide-devices", "history", "load-events"]
+    assert page._page_history == ["devices"]
+
+
+def test_appearance_reset_updates_theme_and_menu_without_saving(monkeypatch):
+    calls = []
+    monkeypatch.setattr(window_module.config, "load", lambda: {"appearance": "system"})
+    monkeypatch.setattr(window_module.config, "save", lambda _: pytest.fail("Unexpected save"))
+    choice = SimpleNamespace(get_active=lambda: True)
+    page = SimpleNamespace(_apply_appearance=lambda value: calls.append(("theme", value)))
+
+    def select(active):
+        calls.append(("selected", active))
+        RingWindow._on_appearance_changed(page, choice, "system")
+
+    page._appearance_choices = {"system": SimpleNamespace(set_active=select)}
+    RingWindow._sync_appearance(page)
+    assert calls == [("selected", True), ("theme", "system")]
+    assert not page._syncing_appearance
+
+
+def test_selecting_saved_appearance_still_applies_it(monkeypatch):
+    applied = []
+    monkeypatch.setattr(window_module.config, "load", lambda: {"appearance": "system"})
+    monkeypatch.setattr(window_module.config, "save", lambda _: pytest.fail("Unexpected save"))
+    page = SimpleNamespace(_apply_appearance=applied.append)
+    RingWindow._on_appearance_changed(page, SimpleNamespace(get_active=lambda: True), "system")
+    assert applied == ["system"]
+
+
+def test_failed_appearance_save_restores_prior_choice_and_theme(monkeypatch):
+    applied = []
+    selected = []
+    notices = []
+    monkeypatch.setattr(window_module.config, "load", lambda: {"appearance": "light"})
+
+    def fail_save(_):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(window_module.config, "save", fail_save)
+    page = SimpleNamespace(_apply_appearance=applied.append, show_toast=notices.append)
+
+    def restore(active):
+        selected.append(active)
+        RingWindow._on_appearance_changed(page, SimpleNamespace(get_active=lambda: active), "light")
+
+    page._appearance_choices = {"light": SimpleNamespace(set_active=restore)}
+    RingWindow._on_appearance_changed(page, SimpleNamespace(get_active=lambda: True), "dark")
+    assert selected == [True]
+    assert applied == ["light"]
+    assert notices == ["Could not save the appearance setting."]
+
+
+def test_reopening_hidden_overview_resumes_observation_once():
+    refreshed = []
+    page = SimpleNamespace(
+        _resume_after_hide=True,
+        _active_page_name="dashboard",
+        refresh=lambda: refreshed.append(True),
+    )
+    RingWindow._on_map(page)
+    RingWindow._on_map(page)
+    assert refreshed == [True]
+    assert not page._resume_after_hide
+
+
+def test_reopening_hidden_focused_player_returns_to_source_before_refresh():
+    calls = []
+    page = SimpleNamespace(
+        _resume_after_hide=True,
+        _active_page_name="focused_live",
+        _on_back_clicked=lambda: calls.append("back"),
+        refresh=lambda: calls.append("refresh"),
+    )
+    RingWindow._on_map(page)
+    assert calls == ["back", "refresh"]
+
+
+@pytest.mark.parametrize("source", ["devices", "alarm"])
+def test_camera_notification_retires_device_or_security_page(source):
+    hidden = []
+    page = SimpleNamespace(
+        _active_page_name=source,
+        _page_history=[],
+        _devices_page=SimpleNamespace(on_page_hidden=lambda: hidden.append("devices")),
+        _alarm_page=SimpleNamespace(on_page_hidden=lambda: hidden.append("alarm")),
+        _focused_live_page=SimpleNamespace(show_device=lambda *_args, **_kwargs: None),
+        _cameras_page=SimpleNamespace(_max_live_monitoring_streams=lambda: 4),
+        _clear_nav_selection=lambda: None,
+        _update_title=lambda *_: None,
+        _update_back_button=lambda: None,
+    )
+    RingWindow._open_focused_live(page, SimpleNamespace(name="Camera"), source)
+    assert hidden == [source]
+    assert page._page_history == [source]

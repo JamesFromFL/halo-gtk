@@ -30,19 +30,19 @@
 > compatibility.
 
 <p align="center">
-  <img src="doc/images/halo-hero.webp" width="100%" alt="Halo Dashboard showing four Ring cameras in a native Linux desktop window">
+  <img src="doc/images/halo-hero.webp" width="100%" alt="Previous Halo interface showing four Ring cameras in a native Linux desktop window">
 </p>
 
-<p align="center"><sub>Real Halo production widgets shown with synthetic demonstration footage and account data. No private camera feeds or Ring account were used.</sub></p>
+<p align="center"><sub>Screenshots on this page show the previous interface, using real Halo production widgets with synthetic demonstration footage and account data. No private camera feeds or Ring account were used.</sub></p>
 
 ## Home monitoring that belongs on the desktop
 
 Halo turns Ring camera access into a focused Linux application instead of
-another browser tab. The adaptive interface follows your desktop theme, keeps
+another browser tab. The adaptive interface can follow your desktop theme, keeps
 camera state visible, and puts common monitoring workflows within one click.
 
-- **See the property at a glance.** Recent snapshots, motion state, power, and
-  network health share one clear dashboard.
+- **See the property at a glance.** Camera previews and reported security state
+  share the Overview; open Cameras for monitoring and device health.
 - **Build the monitoring wall you need.** Choose cameras, save layouts, and
   move between flexible Small, Medium, and Large grid densities.
 - **Move from an event to the camera.** Review recorded activity, open focused
@@ -52,15 +52,18 @@ camera state visible, and puts common monitoring workflows within one click.
 
 ## Meet Halo
 
-### Dashboard
+Halo has five main views: **Overview**, **Cameras**, **Activity**, **Devices**, and
+**Security**. Navigation moves from the header to a bottom bar in narrow windows.
 
-Your home at a glance. The Dashboard pairs a compact account summary with the
-latest camera snapshots, clearly labeled freshness, and device health. Open a
-camera immediately or adjust its settings without digging through menus.
+### Overview
 
-![Halo Dashboard with camera snapshots and device health information](doc/images/halo-dashboard.webp)
+Your home at a glance. Overview combines reported security state, camera snapshots
+with freshness labels, and recent events received while the view
+is open. Open a camera or continue to Activity for the full event history.
 
-### Live Monitoring
+![Previous Halo Dashboard with camera snapshots and device health information](doc/images/halo-dashboard.webp)
+
+### Cameras
 
 Turn selected cameras into a scrollable monitoring wall. Start or stop the
 wall together, save reusable layouts, filter the cameras on screen, and choose
@@ -72,7 +75,7 @@ Halo limits monitoring to four simultaneous streams by default. An optional
 six-stream mode is available as an experimental setting because reliability
 depends on Ring, the devices, and the local network.
 
-![Halo Live Monitoring wall with a selected-camera inspector](doc/images/halo-live-monitoring.webp)
+![Previous Halo Live Monitoring wall with a selected-camera inspector](doc/images/halo-live-monitoring.webp)
 
 ### Focused Live View
 
@@ -81,9 +84,9 @@ connects, then provides playback, volume, two-way talk, screenshots, and
 zoom-and-pan inspection from 100% to 250%. Light and siren actions appear only
 for devices that expose those capabilities.
 
-![Halo Focused Live View with camera controls and health status](doc/images/halo-focused-live.webp)
+![Previous Halo Focused Live View with camera controls and health status](doc/images/halo-focused-live.webp)
 
-### Event History
+### Activity
 
 Filter Ring activity by camera and event type, then review it in an adaptive
 list-and-detail workspace. Playback stays image-first: event identity and time
@@ -91,13 +94,14 @@ sit below the video instead of covering it. Previous/next navigation, scrubbing,
 volume, fullscreen, screenshots, Favorites, sharing, downloads, and deletion
 are available where Ring provides the recording and action for the account.
 
-![Halo Event History with an event list and unobstructed recording playback](doc/images/halo-event-history.webp)
+![Previous Halo Event History with an event list and unobstructed recording playback](doc/images/halo-event-history.webp)
 
 ### Devices
 
-See what Halo discovered on the connected account and jump back to the camera
-grid. Chime cards open account-reported device details, volume controls, and
-explicit Ring or Motion sound tests for recognized legacy models. These controls
+Browse connected devices by type, search their names and reported status, and
+open Cameras or Security from the same view. Chime cards open account-reported
+device details, volume controls, and explicit Ring or Motion sound tests for
+recognized legacy models. These controls
 are experimental until checked against a real device; unrecognized models and
 accounts without positive ownership evidence remain read-only. Light Groups has
 a separate location selector, reported group/member details, explicit timed On
@@ -119,7 +123,13 @@ validation. Off does not disable Ring motion rules or schedules. Group and camer
 light actions share a bounded no-queue guard, while streams and other device
 controls remain independent. See [Light Groups support and limits](doc/light-groups-support.md).
 
-![Halo Devices page showing discovered cameras and planned device families](doc/images/halo-devices.webp)
+![Previous Halo Devices page showing discovered cameras and planned device families](doc/images/halo-devices.webp)
+
+### Security
+
+Check reported Ring Alarm modes, sensor status, and connection health by location.
+Mode requests retain their confirmation and reported-outcome checks. See
+[Experimental Ring Alarm](#experimental-ring-alarm) for capabilities and limits.
 
 ### Settings
 
@@ -128,13 +138,14 @@ Settings are organized around real tasks: **General**, **Live View**,
 background behavior, notifications, media folders, stream preferences, account
 actions, and diagnostics from an adaptive Adwaita layout.
 
-![Halo Settings showing the General category and camera grid options](doc/images/halo-settings.webp)
+![Previous Halo Settings showing the General category and camera grid options](doc/images/halo-settings.webp)
 
 ## Made for Linux monitoring
 
-- **Native GTK 4 and libadwaita.** Halo follows the system light or dark style,
-  uses familiar symbolic icons, and adapts from a full navigation ribbon to a
-  compact overlay.
+- **Native GTK 4 and libadwaita.** Five views use a header switcher on wide windows
+  and bottom navigation on narrow windows, with familiar symbolic icons.
+- **Your preferred appearance.** Choose Follow system, Light, or Dark from the
+  header's Appearance menu. Halo saves the choice locally for future launches.
 - **Desktop event awareness.** Optional notifications can include Ring-provided
   descriptions and preview images, with actions that return to the relevant
   camera or event.
@@ -259,7 +270,7 @@ camera activity on a lock screen, so they remain configurable.
 | Data | Default path |
 | --- | --- |
 | Settings | `~/.config/halo-gtk/settings.json` |
-| Live Monitoring layouts | `~/.config/halo-gtk/live-monitoring-layouts.json` |
+| Camera monitoring layouts | `~/.config/halo-gtk/live-monitoring-layouts.json` |
 | Camera nicknames | `~/.config/halo-gtk/device-nicknames.json` |
 | Local Favorites | `~/.local/share/halo-gtk/favorites/` |
 | Preview cache | `~/.cache/halo-gtk/` |
@@ -274,7 +285,7 @@ Screenshot and recording folders can be changed in Settings.
 ## Experimental Ring Alarm
 
 Halo's native Alarm backend shares its authenticated Ring session with cameras.
-The Alarm page shows reported modes, transition state, sensor supervision and
+The Security view shows reported modes, transition state, sensor supervision and
 health, with location selection and a real inventory refresh. Offline sensor
 values remain last-known even while the hub is online. Reported hub battery
 power and siren state are read-only.
@@ -286,7 +297,7 @@ update. It shows an uncertain outcome when confirmation is lost; navigating away
 does not cancel a request that may have reached Ring. Pending and terminal
 outcomes are retained by the service while the application runs.
 
-Event History now has a separate **experimental Alarm cloud history** view.
+Activity has a separate **experimental Alarm cloud history** view.
 It uses a bounded session cache and labels unsupported fields and uncertain
 coverage. It does not provide a guaranteed complete archive, persist an Alarm
 journal, or treat historical events as current state. Unique server event IDs,

@@ -71,6 +71,42 @@ def test_event_labels_ignore_malformed_timestamps():
     assert _event_list_time_parts("not-a-date") == ("", "")
 
 
+def test_timeline_headers_group_local_dates_without_creating_event_rows(monkeypatch):
+    from halo_gtk import history_page
+
+    monkeypatch.setattr(history_page.Gtk, "Label", lambda **kwargs: kwargs)
+    today = datetime.now().astimezone().replace(hour=12)
+
+    def row(value):
+        result = SimpleNamespace(_event_data={"created_at": value}, header=None)
+        result.set_header = lambda header: setattr(result, "header", header)
+        return result
+
+    first = row(today)
+    same_day = row(today - timedelta(minutes=5))
+    yesterday = row(today - timedelta(days=1))
+    unknown = row("invalid")
+    for current, previous in (
+        (first, None),
+        (same_day, first),
+        (yesterday, same_day),
+        (unknown, yesterday),
+    ):
+        HistoryPage._event_date_header(current, previous)
+
+    assert first.header["label"] == "Today"
+    assert same_day.header is None
+    assert yesterday.header["label"] == "Yesterday"
+    assert unknown.header["label"] == "Date unavailable"
+    assert all(item._event_data for item in (first, same_day, yesterday, unknown))
+
+
+def test_timeline_load_more_row_has_no_date_header():
+    headers = []
+    HistoryPage._event_date_header(SimpleNamespace(set_header=headers.append), None)
+    assert headers == [None]
+
+
 def test_devices_with_history_events_filters_devices_without_events():
     camera = _Device("Doorbell Camera")
     chime = _Device("Master Bathroom Chime Pro")

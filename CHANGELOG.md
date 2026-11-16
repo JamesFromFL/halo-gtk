@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 This section tracks the work toward Halo GTK's first tagged release.
 
 ### Added
+- Follow system, Light, and Dark appearance choices, saved locally across launches.
 - Experimental Intercom status, bounded live call/unlock observations and notifications,
   and single-use confirmed entrance release with honest RPC/uncertain outcomes.
   No physical lock state is inferred; calling remains in the Ring app.
@@ -62,8 +63,10 @@ This section tracks the work toward Halo GTK's first tagged release.
 - Tray registration is asynchronous and Favorites reconciliation runs outside
   GTK callbacks with cached results. Deliberate media saves have tracked,
   bounded jobs with progress, cancellation and atomic publication.
-- Rebuilt the application interface around an adaptive libadwaita navigation ribbon, image-first
-  camera surfaces, a selected-camera monitoring inspector, and compact list/detail history.
+- Redesigned the native interface around Overview, Cameras, Activity, Devices, and Security,
+  with a libadwaita header switcher and bottom navigation on narrow windows. Overview combines
+  reported security state, camera previews, and recent live events; Activity uses a grouped
+  timeline, and Devices offers search and device-type filters.
 - Reorganized settings into General, Live View, Events, Storage, Account, and Advanced areas.
 - Camera grid density can use Balanced 4/2/1 or Dense 5/3/2 Small/Medium/Large presets.
 - In-app activity, power, network, light, siren, and media controls now use standard symbolic

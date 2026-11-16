@@ -65,18 +65,18 @@ class FocusedLivePage(Gtk.Box):
         top_bar = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL,
             spacing=8,
-            margin_top=12,
-            margin_bottom=10,
-            margin_start=20,
-            margin_end=20,
+            margin_top=24,
+            margin_bottom=12,
+            margin_start=24,
+            margin_end=24,
         )
         self.append(top_bar)
 
-        title_copy = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1, hexpand=True)
+        title_copy = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5, hexpand=True)
         self._title_label = Gtk.Label(label="Live camera", xalign=0, ellipsize=3)
-        self._title_label.add_css_class("title-3")
+        self._title_label.add_css_class("halo-page-heading")
         self._model_label = Gtk.Label(label="Ring camera", xalign=0, ellipsize=3)
-        self._model_label.add_css_class("dim-label")
+        self._model_label.add_css_class("halo-page-subtitle")
         title_copy.append(self._title_label)
         title_copy.append(self._model_label)
         top_bar.append(title_copy)
@@ -111,25 +111,26 @@ class FocusedLivePage(Gtk.Box):
 
         monitor = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
-            spacing=12,
+            spacing=16,
             margin_top=6,
-            margin_bottom=14,
-            margin_start=20,
-            margin_end=20,
+            margin_bottom=24,
+            margin_start=24,
+            margin_end=24,
             hexpand=True,
             vexpand=True,
         )
-        monitor.add_css_class("monitor-canvas")
         self.append(monitor)
 
-        video_overlay = Gtk.Overlay(hexpand=True, vexpand=True)
-        video_overlay.set_child(self._video_view)
-
-        controls = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-        controls.add_css_class("video-toolbar")
-        controls.set_halign(Gtk.Align.CENTER)
-        controls.set_valign(Gtk.Align.END)
-        controls.set_margin_bottom(12)
+        controls = Gtk.FlowBox(
+            selection_mode=Gtk.SelectionMode.NONE,
+            min_children_per_line=1,
+            max_children_per_line=2,
+            column_spacing=16,
+            row_spacing=8,
+            homogeneous=False,
+            halign=Gtk.Align.CENTER,
+        )
+        controls.add_css_class("halo-focus-controls")
 
         transport_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         transport_controls.set_halign(Gtk.Align.CENTER)
@@ -162,7 +163,7 @@ class FocusedLivePage(Gtk.Box):
 
         self._volume_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.0, 1.0, 0.05)
         self._volume_scale.set_draw_value(False)
-        self._volume_scale.set_size_request(120, -1)
+        self._volume_scale.set_size_request(96, -1)
         self._volume_scale.set_tooltip_text("Incoming camera audio volume")
         self._volume_scale.update_property(
             [Gtk.AccessibleProperty.LABEL],
@@ -200,19 +201,18 @@ class FocusedLivePage(Gtk.Box):
         view_controls.append(zoom_box)
 
         self._light_btn = Gtk.ToggleButton(tooltip_text="Light")
-        self._light_icon = Gtk.Image(pixel_size=24)
+        self._light_icon = Gtk.Image(pixel_size=16)
         self._light_btn.set_child(self._light_icon)
         self._light_btn.connect("toggled", self._on_light_toggled)
         view_controls.append(self._light_btn)
 
         self._siren_btn = Gtk.Button(tooltip_text="Siren")
         self._siren_icon = Gtk.Image.new_from_icon_name("alarm-symbolic")
-        self._siren_icon.set_pixel_size(24)
+        self._siren_icon.set_pixel_size(16)
         self._siren_btn.set_child(self._siren_icon)
         self._siren_btn.add_css_class("siren-button")
         self._siren_btn.connect("clicked", self._on_siren_clicked)
         view_controls.append(self._siren_btn)
-        video_overlay.add_overlay(controls)
 
         aspect = Gtk.AspectFrame(
             xalign=0.5,
@@ -223,9 +223,11 @@ class FocusedLivePage(Gtk.Box):
             vexpand=True,
         )
         aspect.add_css_class("video-frame")
+        aspect.add_css_class("halo-focus-canvas")
         aspect.set_overflow(Gtk.Overflow.HIDDEN)
-        aspect.set_child(video_overlay)
+        aspect.set_child(self._video_view)
         monitor.append(aspect)
+        monitor.append(controls)
 
         health = Gtk.FlowBox(
             selection_mode=Gtk.SelectionMode.NONE,
@@ -237,6 +239,7 @@ class FocusedLivePage(Gtk.Box):
             hexpand=True,
         )
         health.add_css_class("health-strip")
+        health.add_css_class("halo-focus-health")
         network_item, self._network_icon, self._network_value = self._build_health_item(
             "network-wireless-signal-good-symbolic"
         )

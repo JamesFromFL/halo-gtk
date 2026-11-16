@@ -441,16 +441,29 @@ class AlarmPage(Gtk.Box):
 
         clamp = Adw.Clamp(maximum_size=1080, tightening_threshold=720)
         scroll.set_child(clamp)
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
         content.add_css_class("page-scroll-content")
         clamp.set_child(content)
 
+        heading = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        title = Gtk.Label(label="Security", xalign=0, wrap=True)
+        title.add_css_class("halo-page-heading")
+        heading.append(title)
+        subtitle = Gtk.Label(
+            label="Alarm mode, sensors and the state of your home",
+            xalign=0,
+            wrap=True,
+        )
+        subtitle.add_css_class("halo-page-subtitle")
+        heading.append(subtitle)
+        content.append(heading)
+
         location_row = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
-            spacing=6,
+            spacing=10,
         )
         location_label = Gtk.Label(label="Location", xalign=0)
-        location_label.add_css_class("title-2")
+        location_label.add_css_class("halo-section-heading")
         location_row.append(location_label)
         self._location_model = Gtk.StringList()
         self._location_selector = Gtk.DropDown(model=self._location_model)
@@ -463,57 +476,75 @@ class AlarmPage(Gtk.Box):
         self._location_selector.connect("notify::selected", self._on_location_selected)
         location_row.append(self._location_selector)
         toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self._refresh_button = Gtk.Button(label="Refresh Alarm", icon_name="view-refresh-symbolic")
+        self._refresh_button = Gtk.Button(label="Refresh")
+        self._refresh_button.set_tooltip_text("Refresh alarm status and devices")
         self._refresh_button.connect("clicked", self._on_refresh_clicked)
         toolbar.append(self._refresh_button)
-        history_button = Gtk.Button(
-            label="Alarm History", icon_name="document-open-recent-symbolic"
-        )
+        history_button = Gtk.Button(label="Alarm History")
         history_button.connect("clicked", self._on_history_clicked)
         toolbar.append(history_button)
         location_row.append(toolbar)
         content.append(location_row)
 
-        overview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
-        overview.add_css_class("alarm-overview-content")
-        overview_frame = Gtk.Frame(child=overview)
-        overview_frame.add_css_class("alarm-overview")
-        content.append(overview_frame)
+        overview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
+        overview.add_css_class("halo-card")
+        overview.add_css_class("halo-security-summary")
+        content.append(overview)
 
         state_row = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL,
-            spacing=16,
+            spacing=20,
             valign=Gtk.Align.CENTER,
         )
         self._state_symbol = Gtk.Image.new_from_icon_name("security-low-symbolic")
-        self._state_symbol.set_pixel_size(32)
-        self._state_symbol.add_css_class("alarm-state-symbol")
+        self._state_symbol.set_pixel_size(40)
+        self._state_symbol.set_valign(Gtk.Align.START)
+        self._state_symbol.add_css_class("halo-security-icon")
         state_row.append(self._state_symbol)
-        state_copy = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3, hexpand=True)
+        state_copy = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7, hexpand=True)
         self._state_title = Gtk.Label(label="Alarm status unknown", xalign=0, wrap=True)
-        self._state_title.add_css_class("title-2")
+        self._state_title.add_css_class("halo-security-state")
         state_copy.append(self._state_title)
         self._state_detail = Gtk.Label(label="", xalign=0, wrap=True)
         self._state_detail.add_css_class("dim-label")
         state_copy.append(self._state_detail)
-        self._transition_label = Gtk.Label(label="", xalign=0, visible=False)
+        self._transition_label = Gtk.Label(label="", xalign=0, wrap=True, visible=False)
         self._transition_label.add_css_class("numeric")
         state_copy.append(self._transition_label)
         state_row.append(state_copy)
         overview.append(state_row)
 
-        self._mode_buttons_box = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL,
-            homogeneous=False,
+        self._mode_buttons_box = Gtk.FlowBox(
+            selection_mode=Gtk.SelectionMode.NONE,
+            homogeneous=True,
+            min_children_per_line=1,
+            max_children_per_line=3,
+            row_spacing=12,
+            column_spacing=12,
         )
-        self._mode_buttons_box.add_css_class("linked")
         self._mode_buttons: dict[AlarmMode, Gtk.Button] = {}
-        for mode in (AlarmMode.DISARMED, AlarmMode.HOME, AlarmMode.AWAY):
-            button = Gtk.Button(label=_mode_label(mode), hexpand=True)
-            button.add_css_class("command-button")
+        for mode, icon_name in (
+            (AlarmMode.DISARMED, "security-low-symbolic"),
+            (AlarmMode.HOME, "go-home-symbolic"),
+            (AlarmMode.AWAY, "avatar-default-symbolic"),
+        ):
+            button = Gtk.Button(hexpand=True)
+            button.add_css_class("halo-mode-choice")
+            button_content = Gtk.Box(
+                orientation=Gtk.Orientation.VERTICAL,
+                spacing=8,
+                halign=Gtk.Align.CENTER,
+            )
+            button_icon = Gtk.Image.new_from_icon_name(icon_name)
+            button_icon.set_pixel_size(24)
+            button_content.append(button_icon)
+            button_content.append(Gtk.Label(label=_mode_label(mode)))
+            button.set_child(button_content)
+            button.update_property([Gtk.AccessibleProperty.LABEL], [_mode_label(mode)])
             button.set_tooltip_text(f"Set Alarm to {_mode_label(mode)}")
             button.connect("clicked", self._on_mode_clicked, mode)
             self._mode_buttons_box.append(button)
+            button.get_parent().set_focusable(False)
             self._mode_buttons[mode] = button
         overview.append(self._mode_buttons_box)
 
@@ -529,12 +560,9 @@ class AlarmPage(Gtk.Box):
         command_status.append(self._command_status)
         overview.append(command_status)
 
-        separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        content.append(separator)
-
-        sensor_heading = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
-        sensor_title = Gtk.Label(label="Alarm Devices", xalign=0)
-        sensor_title.add_css_class("title-2")
+        sensor_heading = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        sensor_title = Gtk.Label(label="Sensors & Devices", xalign=0)
+        sensor_title.add_css_class("halo-section-heading")
         sensor_heading.append(sensor_title)
         self._sensor_summary = Gtk.Label(label="", xalign=0, wrap=True)
         self._sensor_summary.add_css_class("dim-label")
@@ -965,9 +993,9 @@ class AlarmPage(Gtk.Box):
         for mode, button in self._mode_buttons.items():
             available = location.can_set_mode and not busy and mode is not location.mode
             button.set_sensitive(available)
-            button.remove_css_class("suggested-action")
+            button.remove_css_class("halo-mode-selected")
             if mode is location.mode:
-                button.add_css_class("suggested-action")
+                button.add_css_class("halo-mode-selected")
         if selected_busy:
             self._command_spinner.start()
             self._command_status.set_label("Waiting for Ring to confirm the mode change…")

@@ -1,4 +1,4 @@
-"""Event History page — Adw.NavigationSplitView with event list and GStreamer player."""
+"""Activity timeline with adaptive event details and GStreamer playback."""
 
 from __future__ import annotations
 
@@ -799,17 +799,40 @@ class HistoryPage(Gtk.Box):
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
+        heading = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=4,
+            margin_top=24,
+            margin_bottom=16,
+            margin_start=24,
+            margin_end=24,
+        )
+        heading.append(Gtk.Label(label="Activity", xalign=0, css_classes=["halo-page-heading"]))
+        heading.append(
+            Gtk.Label(
+                label="Review recordings and events from your home.",
+                xalign=0,
+                wrap=True,
+                css_classes=["halo-page-subtitle"],
+            )
+        )
+        self.append(heading)
         self._nav_split = Adw.NavigationSplitView(
             hexpand=True,
             vexpand=True,
-            sidebar_width_fraction=0.3,
+            sidebar_width_fraction=0.4,
+            min_sidebar_width=300,
+            max_sidebar_width=480,
+            margin_start=12,
+            margin_end=12,
+            margin_bottom=12,
         )
         self._mode_stack = Gtk.Stack(hexpand=True, vexpand=True)
         self._mode_stack.add_named(self._nav_split, "camera")
         self.append(self._mode_stack)
 
         # --- Sidebar navigation page ---
-        self._sidebar_page = Adw.NavigationPage(title="Event History")
+        self._sidebar_page = Adw.NavigationPage(title="Activity")
         self._nav_split.set_sidebar(self._sidebar_page)
 
         self._sidebar_stack = Gtk.Stack(hexpand=True, vexpand=True)
@@ -854,27 +877,34 @@ class HistoryPage(Gtk.Box):
         )
         controls_row.append(self._device_filter_button)
 
-        filter_btn_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        filter_btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         filter_btn_box.append(Gtk.Image(icon_name="view-sort-descending-symbolic"))
-        filter_btn_box.append(Gtk.Label(label="Filter", css_classes=["caption"]))
+        filter_btn_box.append(Gtk.Label(label="Filters"))
         self._filter_panel_button = Gtk.Button(
             child=filter_btn_box,
             tooltip_text="Filter events",
-            css_classes=["flat"],
+            css_classes=["pill"],
         )
         self._filter_panel_button.connect("clicked", self._show_filter_panel)
         controls_row.append(self._filter_panel_button)
 
         # Event list.
-        scroll = Gtk.ScrolledWindow(vexpand=True)
+        scroll = Gtk.ScrolledWindow(
+            vexpand=True,
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            margin_start=8,
+            margin_end=8,
+            margin_bottom=8,
+        )
         event_sidebar.append(scroll)
 
         self._event_list = Gtk.ListBox(
-            css_classes=["navigation-sidebar"],
+            css_classes=["boxed-list", "halo-timeline-list"],
             selection_mode=Gtk.SelectionMode.SINGLE,
-            vexpand=True,
+            valign=Gtk.Align.START,
         )
         self._event_list.connect("row-activated", self._on_event_selected)
+        self._event_list.set_header_func(self._event_date_header)
         scroll.set_child(self._event_list)
 
         self._list_placeholder = Adw.StatusPage(
@@ -906,9 +936,22 @@ class HistoryPage(Gtk.Box):
         content_box = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL,
             hexpand=True,
+            valign=Gtk.Align.START,
+            margin_start=12,
+            margin_end=12,
+            margin_top=8,
+            margin_bottom=12,
+            css_classes=["card", "halo-card"],
+        )
+        content_box.set_overflow(Gtk.Overflow.HIDDEN)
+        detail_scroll = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+            hexpand=True,
             vexpand=True,
         )
-        content_toolbar.set_content(content_box)
+        detail_scroll.set_child(content_box)
+        content_toolbar.set_content(detail_scroll)
         content_page.set_child(content_toolbar)
 
         # Player widget.
@@ -917,6 +960,7 @@ class HistoryPage(Gtk.Box):
             on_next=self._on_next_event,
             on_finished=self._on_playback_finished,
         )
+        self._player.set_vexpand(False)
         content_box.append(self._player)
 
         self._details_row = Gtk.FlowBox(
@@ -953,15 +997,16 @@ class HistoryPage(Gtk.Box):
 
         self._event_type_label = Gtk.Label(
             xalign=0,
-            css_classes=["heading"],
-            ellipsize=Pango.EllipsizeMode.END,
+            css_classes=["halo-section-heading"],
+            wrap=True,
         )
         event_text.append(self._event_type_label)
 
         self._event_detail_label = Gtk.Label(
             xalign=0,
             css_classes=["dim-label", "caption"],
-            ellipsize=Pango.EllipsizeMode.END,
+            wrap=True,
+            wrap_mode=Pango.WrapMode.WORD_CHAR,
         )
         event_text.append(self._event_detail_label)
 
@@ -1413,7 +1458,7 @@ class HistoryPage(Gtk.Box):
             title = "Missing Metadata"
             subtitle = event.get("_missing_metadata_filename") or "Unknown local clip"
         else:
-            title = (
+            subtitle = (
                 device_names.display_name(device)
                 if device is not None
                 else device_names.display_name_for_id(
@@ -1421,31 +1466,28 @@ class HistoryPage(Gtk.Box):
                     event.get("camera_name", "Unknown camera"),
                 )
             )
-            subtitle = activity_icons.activity_label(event)
+            title = activity_icons.activity_label(event)
 
         row = Adw.ActionRow(title=title, subtitle=subtitle, activatable=True, use_markup=False)
+        row.set_title_lines(2)
+        row.set_subtitle_lines(2)
+        row.set_tooltip_text(_event_datetime_label(created_at) or "Event time unavailable")
         row._event_data = event  # type: ignore[attr-defined]
 
         icon = Gtk.Image()
         icon.set_pixel_size(20)
         icon.add_css_class("event-symbol")
+        icon.add_css_class("halo-event-icon")
         _set_activity_image(icon, event)
         row.add_prefix(icon)
 
         if created_at is not None:
-            date_text, time_text = _event_list_time_parts(created_at)
+            _date_text, time_text = _event_list_time_parts(created_at)
             ts_box = Gtk.Box(
                 orientation=Gtk.Orientation.VERTICAL,
                 valign=Gtk.Align.CENTER,
                 halign=Gtk.Align.END,
                 spacing=3,
-            )
-            ts_box.append(
-                Gtk.Label(
-                    label=date_text,
-                    xalign=1,
-                    css_classes=["dim-label", "caption"],
-                )
             )
             ts_box.append(
                 Gtk.Label(
@@ -1455,8 +1497,41 @@ class HistoryPage(Gtk.Box):
                 )
             )
             row.add_suffix(ts_box)
+        row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
 
         return row
+
+    @staticmethod
+    def _event_date_header(row, before) -> None:
+        """Group adjacent timeline rows without introducing selectable fake events."""
+        event = getattr(row, "_event_data", None)
+        if event is None:
+            row.set_header(None)
+            return
+        current = _normalized_event_datetime(event.get("created_at"))
+        previous_event = getattr(before, "_event_data", None)
+        previous = (
+            _normalized_event_datetime(previous_event.get("created_at"))
+            if previous_event is not None
+            else None
+        )
+        current_date = current.astimezone().date() if current else None
+        previous_date = previous.astimezone().date() if previous else None
+        if previous_event is not None and current_date == previous_date:
+            row.set_header(None)
+            return
+        date_text, _time_text = _event_list_time_parts(event.get("created_at"))
+        row.set_header(
+            Gtk.Label(
+                label=date_text or "Date unavailable",
+                xalign=0,
+                margin_top=14,
+                margin_bottom=8,
+                margin_start=12,
+                margin_end=12,
+                css_classes=["halo-section-heading", "halo-timeline-date"],
+            )
+        )
 
     def _make_load_older_row(self) -> Gtk.ListBoxRow:
         row = Gtk.ListBoxRow(activatable=False, selectable=False)

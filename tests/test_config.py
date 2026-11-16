@@ -428,3 +428,17 @@ def test_gsettings_config_migrates_to_settings_json(tmp_path, monkeypatch):
     assert fake_settings.reset_keys == [
         settings_key for settings_key, _type in config._KEYS.values()
     ]
+
+
+def test_appearance_round_trip_and_invalid_fallback(tmp_path, monkeypatch):
+    from halo_gtk import config
+
+    monkeypatch.setattr(config, "_GSETTINGS_ENABLED", False)
+    _redirect_config_store(config, monkeypatch, tmp_path)
+    assert config.load()["appearance"] == "system"
+    for appearance in ("light", "dark", "system"):
+        config.save({"appearance": appearance})
+        assert config.load()["appearance"] == appearance
+    for invalid in (None, "automatic", {}, 1):
+        config.save({"appearance": invalid})
+        assert config.load()["appearance"] == "system"

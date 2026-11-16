@@ -28,6 +28,14 @@ from halo_gtk.light_group_details import (  # noqa: E402
 from halo_gtk.ring_client import get_client  # noqa: E402
 
 _CAMERA_FAMILIES = frozenset({"doorbots", "authorized_doorbots", "stickup_cams"})
+_FAMILY_LABELS = {
+    "doorbots": "Doorbells",
+    "authorized_doorbots": "Shared doorbells",
+    "stickup_cams": "Cameras",
+    "chimes": "Chimes",
+    "intercoms": "Intercoms",
+    "other": "Other devices",
+}
 
 
 def _location_factory():
@@ -85,7 +93,12 @@ def _device_counts(devices, snapshot, intercom_snapshot=None):
 class DevicesPage(Gtk.ScrolledWindow):
     """Overview rendering is cache-only, including when the page is hidden."""
 
-    def __init__(self, *, on_show_cameras: Callable[[], None] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        on_show_cameras: Callable[[], None] | None = None,
+        on_show_security: Callable[[], None] | None = None,
+    ) -> None:
         super().__init__(
             hscrollbar_policy=Gtk.PolicyType.NEVER,
             vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
@@ -93,6 +106,7 @@ class DevicesPage(Gtk.ScrolledWindow):
             vexpand=True,
         )
         self._on_show_cameras = on_show_cameras
+        self._on_show_security = on_show_security
         self._visible = False
         self._dialog = None
         self._chime_rows = []
@@ -113,18 +127,65 @@ class DevicesPage(Gtk.ScrolledWindow):
         self._light_rows = []
         self._light_needs_groups = False
         self._light_force_groups = False
-        self._inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        self._inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
         self._inner.add_css_class("page-scroll-content")
-        clamp = Adw.Clamp(maximum_size=860, tightening_threshold=700)
+        clamp = Adw.Clamp(maximum_size=1180, tightening_threshold=900)
         clamp.set_child(self._inner)
         self.set_child(clamp)
         self._build_ui()
         self.refresh()
 
     def _build_ui(self):
-        self._account_group = Adw.PreferencesGroup(title="Ring Account")
+        heading = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        heading.append(Gtk.Label(label="Devices", xalign=0, css_classes=["halo-page-heading"]))
+        heading.append(
+            Gtk.Label(
+                label="Your connected devices, organized by type.",
+                xalign=0,
+                wrap=True,
+                css_classes=["halo-page-subtitle"],
+            )
+        )
+        self._inner.append(heading)
+        self._device_search = Gtk.SearchEntry(
+            placeholder_text="Search device names, models, or status",
+            hexpand=True,
+        )
+        self._device_search.update_property(
+            [Gtk.AccessibleProperty.LABEL], ["Search cached devices"]
+        )
+        self._device_search.connect("search-changed", lambda *_: self._apply_inventory_filter())
+        self._inner.append(self._device_search)
+        filters = Gtk.FlowBox(
+            selection_mode=Gtk.SelectionMode.NONE,
+            min_children_per_line=1,
+            max_children_per_line=4,
+            column_spacing=6,
+            row_spacing=6,
+            halign=Gtk.Align.START,
+        )
+        self._selected_family = "all"
+        first = None
+        for key, label in (
+            ("all", "All devices"),
+            ("chimes", "Chimes"),
+            ("lighting", "Light Groups"),
+            ("intercoms", "Intercoms"),
+        ):
+            button = Gtk.ToggleButton(label=label, css_classes=["pill"])
+            if first is None:
+                first = button
+                button.set_active(True)
+            else:
+                button.set_group(first)
+            button.connect("toggled", self._device_family_changed, key)
+            filters.append(button)
+        self._inner.append(filters)
+
+        self._account_group = Adw.PreferencesGroup(title="Connected devices")
+        self._account_group.add_css_class("halo-device-group")
         self._inner.append(self._account_group)
-        self._summary_row = Adw.ActionRow(title="Account Devices", use_markup=False)
+        self._summary_row = Adw.ActionRow(title="Account inventory", use_markup=False)
         self._summary_row.add_prefix(Gtk.Image(icon_name="preferences-system-devices-symbolic"))
         self._device_count_label = Gtk.Label(label="0", css_classes=["numeric", "dim-label"])
         self._summary_row.add_suffix(self._device_count_label)
@@ -136,17 +197,29 @@ class DevicesPage(Gtk.ScrolledWindow):
             self._camera_row.set_activatable(True)
             self._camera_row.connect("activated", lambda _row: self._on_show_cameras())
         self._account_group.add(self._camera_row)
+        if self._on_show_security is not None:
+            security_row = Adw.ActionRow(
+                title="Security sensors",
+                subtitle="Alarm status, sensors, and supported controls",
+                activatable=True,
+                use_markup=False,
+            )
+            security_row.add_prefix(Gtk.Image(icon_name="security-medium-symbolic"))
+            security_row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+            security_row.connect("activated", lambda _row: self._on_show_security())
+            self._account_group.add(security_row)
         self._chime_group = Adw.PreferencesGroup(
             title="Chimes",
             description="Standalone plug-in Ring Chimes. Legacy controls are experimental.",
         )
+        self._chime_group.add_css_class("halo-device-group")
         self._refresh_button = Gtk.Button(label="Refresh", valign=Gtk.Align.CENTER)
         self._refresh_button.set_tooltip_text("Refresh Chime inventory")
         self._refresh_button.connect("clicked", lambda *_: self._fetch(force=True))
         self._chime_group.set_header_suffix(self._refresh_button)
         self._inner.append(self._chime_group)
         self._chime_message = Gtk.Label(
-            wrap=True, xalign=0, use_markup=False, css_classes=["dim-label"]
+            wrap=True, xalign=0, use_markup=False, css_classes=["dim-label", "caption"]
         )
         self._inner.append(self._chime_message)
         self._build_lighting()
@@ -155,14 +228,53 @@ class DevicesPage(Gtk.ScrolledWindow):
             description="Reported status and entrance release with confirmation. "
             "Calling remains in the Ring app.",
         )
+        self._intercom_group.add_css_class("halo-device-group")
         self._intercom_refresh = Gtk.Button(label="Refresh", valign=Gtk.Align.CENTER)
         self._intercom_refresh.connect("clicked", lambda *_: self._fetch_intercoms(force=True))
         self._intercom_group.set_header_suffix(self._intercom_refresh)
         self._inner.append(self._intercom_group)
         self._intercom_message = Gtk.Label(
-            wrap=True, xalign=0, use_markup=False, css_classes=["dim-label"]
+            wrap=True, xalign=0, use_markup=False, css_classes=["dim-label", "caption"]
         )
         self._inner.append(self._intercom_message)
+        self._device_sections = (
+            ("chimes", self._chime_group, self._chime_message, "_chime_rows"),
+            ("lighting", self._light_group, self._light_message, "_light_rows"),
+            ("intercoms", self._intercom_group, self._intercom_message, "_intercom_rows"),
+        )
+        self._search_empty = Adw.StatusPage(
+            icon_name="system-search-symbolic",
+            title="No matching devices",
+            description="Try another name or choose a different device type.",
+            visible=False,
+        )
+        self._inner.append(self._search_empty)
+
+    def _device_family_changed(self, button, family):
+        if button.get_active():
+            self._selected_family = family
+            self._apply_inventory_filter()
+
+    def _apply_inventory_filter(self):
+        """Filter rendered cached rows; searching never fetches or changes a device."""
+        if not hasattr(self, "_device_sections"):
+            return
+        query = self._device_search.get_text().strip().casefold()
+        any_visible = False
+        for family, group, message, rows_name in self._device_sections:
+            selected = self._selected_family in {"all", family}
+            matching = False
+            for row in getattr(self, rows_name):
+                text = f"{row.get_title()} {row.get_subtitle()}".casefold()
+                visible = selected and (not query or query in text)
+                row.set_visible(visible)
+                matching = matching or visible
+            # Keep an unfiltered section's refresh action available, even while empty.
+            visible = selected and (matching or not query)
+            group.set_visible(visible)
+            message.set_visible(visible)
+            any_visible = any_visible or visible
+        self._search_empty.set_visible(bool(query) and not any_visible)
 
     def refresh(self) -> None:
         """Render cached snapshots; never start HTTP or a worker from here."""
@@ -188,7 +300,8 @@ class DevicesPage(Gtk.ScrolledWindow):
             self._account_group.set_description(f"{count} {label} cached")
             self._device_count_label.set_label(str(count))
             self._summary_row.set_subtitle(
-                ", ".join(f.replace("_", " ").title() for f in families) or "No devices cached"
+                ", ".join(_FAMILY_LABELS.get(f, f.replace("_", " ").title()) for f in families)
+                or "No devices cached"
             )
             camera_label = "camera" if cameras == 1 else "cameras"
             self._camera_row.set_subtitle(f"{cameras} {camera_label} linked to this account")
@@ -327,6 +440,8 @@ class DevicesPage(Gtk.ScrolledWindow):
             self._chime_message.set_label(
                 "Reported cloud status does not prove that a Chime speaker is reachable."
             )
+        if hasattr(self, "_device_sections"):
+            self._apply_inventory_filter()
 
     def _open_chime(self, _row, api_id, identity_epoch, generation):
         snapshot = self._session.current() if self._visible else None
@@ -352,6 +467,7 @@ class DevicesPage(Gtk.ScrolledWindow):
             title="Light Groups",
             description="Logical lighting groups, separate from physical device counts.",
         )
+        self._light_group.add_css_class("halo-device-group")
         self._light_refresh = Gtk.Button(label="Refresh", valign=Gtk.Align.CENTER)
         self._light_refresh.set_tooltip_text(
             "Refresh lighting locations and the selected group list"
@@ -370,7 +486,7 @@ class DevicesPage(Gtk.ScrolledWindow):
         self._light_group.add(location_row)
         self._inner.append(self._light_group)
         self._light_message = Gtk.Label(
-            wrap=True, xalign=0, use_markup=False, css_classes=["dim-label"]
+            wrap=True, xalign=0, use_markup=False, css_classes=["dim-label", "caption"]
         )
         self._inner.append(self._light_message)
 
@@ -466,6 +582,8 @@ class DevicesPage(Gtk.ScrolledWindow):
             self._light_message.set_label(
                 "Choose a Ring location to load its existing logical groups."
             )
+            if hasattr(self, "_device_sections"):
+                self._apply_inventory_filter()
             return
         for group in selected.groups:
             count = group.member_count
@@ -511,6 +629,8 @@ class DevicesPage(Gtk.ScrolledWindow):
                 "Lighting inventory is unavailable or stale. "
                 "Cached groups are not current evidence."
             )
+        if hasattr(self, "_device_sections"):
+            self._apply_inventory_filter()
 
     def _add_light_row(self, row):
         self._light_group.add(row)
@@ -614,6 +734,8 @@ class DevicesPage(Gtk.ScrolledWindow):
             if snapshot and not snapshot.complete
             else "No physical lock or door-position state is inferred."
         )
+        if hasattr(self, "_device_sections"):
+            self._apply_inventory_filter()
 
     def _open_intercom_row(self, _row, api_id, epoch, generation):
         return self.open_intercom(api_id, epoch, generation)

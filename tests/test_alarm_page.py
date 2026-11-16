@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
+
 from halo_gtk import alarm_page as alarm_page_module
 from halo_gtk.alarm import (
     AlarmAccountSnapshot,
@@ -17,6 +19,8 @@ from halo_gtk.alarm import (
     AlarmInventoryStatus,
     AlarmLocationSnapshot,
     AlarmMode,
+    AlarmOperationSnapshot,
+    AlarmOperationStatus,
     AlarmPhase,
     AlarmServiceStatus,
     AlarmSignal,
@@ -181,6 +185,141 @@ def test_ac_power_loss_overrides_online_system_device_state():
     )
 
     assert _device_state(keypad) == ("AC power lost", "warning")
+
+
+class _ModeWidget:
+    def __init__(self):
+        self.sensitive = True
+        self.css_classes = set()
+        self.label = ""
+        self.spinning = False
+
+    def set_sensitive(self, value):
+        self.sensitive = value
+
+    def add_css_class(self, value):
+        self.css_classes.add(value)
+
+    def remove_css_class(self, value):
+        self.css_classes.discard(value)
+
+    def set_label(self, value):
+        self.label = value
+
+    def start(self):
+        self.spinning = True
+
+    def stop(self):
+        self.spinning = False
+
+
+def _mode_controls():
+    return SimpleNamespace(
+        _command_pending=False,
+        _pending_location_id=None,
+        _location_ids=("home", "other"),
+        _location_selector=_ModeWidget(),
+        _mode_buttons={
+            mode: _ModeWidget() for mode in (AlarmMode.DISARMED, AlarmMode.HOME, AlarmMode.AWAY)
+        },
+        _command_spinner=_ModeWidget(),
+        _command_status=_ModeWidget(),
+    )
+
+
+@pytest.mark.parametrize("mode", [AlarmMode.DISARMED, AlarmMode.HOME, AlarmMode.AWAY])
+def test_mode_choices_highlight_only_reported_mode_and_keep_confirmation_copy(mode):
+    page = _mode_controls()
+    for button in page._mode_buttons.values():
+        button.add_css_class("halo-mode-selected")
+
+    AlarmPage._refresh_mode_controls(page, _location(mode=mode))
+
+    for button_mode, button in page._mode_buttons.items():
+        assert ("halo-mode-selected" in button.css_classes) is (button_mode is mode)
+        assert button.sensitive is (button_mode is not mode)
+    assert page._location_selector.sensitive
+    assert not page._command_spinner.spinning
+    assert "Changes require confirmation" in page._command_status.label
+
+
+@pytest.mark.parametrize("pending_source", ["page", "service"])
+def test_pending_mode_choices_keep_reported_state_without_enabling_another_request(pending_source):
+    page = _mode_controls()
+    location = _location(mode=AlarmMode.DISARMED)
+    if pending_source == "page":
+        page._command_pending = True
+        page._pending_location_id = location.location_id
+    else:
+        location = replace(
+            location,
+            operation=AlarmOperationSnapshot(
+                operation_id=1,
+                target=AlarmMode.AWAY,
+                status=AlarmOperationStatus.WAITING,
+            ),
+        )
+
+    AlarmPage._refresh_mode_controls(page, location)
+
+    assert all(not button.sensitive for button in page._mode_buttons.values())
+    assert "halo-mode-selected" in page._mode_buttons[AlarmMode.DISARMED].css_classes
+    assert "halo-mode-selected" not in page._mode_buttons[AlarmMode.AWAY].css_classes
+    assert not page._location_selector.sensitive
+    assert page._command_spinner.spinning
+    assert page._command_status.label == "Waiting for Ring to confirm the mode change…"
+
+
+def test_unavailable_mode_choices_keep_the_reported_state_and_reason():
+    page = _mode_controls()
+    location = replace(
+        _location(mode=AlarmMode.HOME, can_set_mode=False),
+        command_unavailable_reason="panel-inventory-incomplete",
+    )
+
+    AlarmPage._refresh_mode_controls(page, location)
+
+    assert all(not button.sensitive for button in page._mode_buttons.values())
+    assert "halo-mode-selected" in page._mode_buttons[AlarmMode.HOME].css_classes
+    assert page._command_status.label == "Halo is still loading the security panel."
+    assert page._location_selector.sensitive
+
+
+def test_uncertain_mode_request_does_not_select_the_requested_target():
+    page = _mode_controls()
+    location = replace(
+        _location(),
+        operation=AlarmOperationSnapshot(
+            operation_id=1,
+            target=AlarmMode.AWAY,
+            status=AlarmOperationStatus.OUTCOME_UNKNOWN,
+        ),
+    )
+
+    AlarmPage._refresh_mode_controls(page, location)
+
+    assert "halo-mode-selected" in page._mode_buttons[AlarmMode.DISARMED].css_classes
+    assert "halo-mode-selected" not in page._mode_buttons[AlarmMode.AWAY].css_classes
+    assert not page._command_spinner.spinning
+    assert "outcome is unknown" in page._command_status.label
+    assert "Refresh and review" in page._command_status.label
+
+
+def test_reported_mode_confirmation_preserves_exit_delay_notice():
+    page = _mode_controls()
+    location = replace(
+        _location(mode=AlarmMode.AWAY, phase=AlarmPhase.EXIT_DELAY),
+        operation=AlarmOperationSnapshot(
+            operation_id=1,
+            target=AlarmMode.AWAY,
+            status=AlarmOperationStatus.REPORTED_TARGET,
+        ),
+    )
+
+    AlarmPage._refresh_mode_controls(page, location)
+
+    assert "halo-mode-selected" in page._mode_buttons[AlarmMode.AWAY].css_classes
+    assert page._command_status.label == "Ring reports Away mode; exit delay is in progress."
 
 
 def test_retained_ac_power_never_overrides_offline_base_station():

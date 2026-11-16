@@ -66,7 +66,7 @@ def test_dense_large_uses_fixed_ratio_for_two_column_grid(monkeypatch):
     assert details == [True]
 
 
-def test_compact_tile_presentation_tracks_physical_column_width(monkeypatch):
+def test_wrapping_medium_tiles_retain_controls_at_narrow_width(monkeypatch):
     from halo_gtk import config
 
     compact_states = []
@@ -78,7 +78,58 @@ def test_compact_tile_presentation_tracks_physical_column_width(monkeypatch):
     page._update_tile_compactness(344)
     page._update_tile_compactness(1000)
 
-    assert compact_states == [True, False]
+    assert compact_states == [False, False]
+
+
+def test_embedded_camera_selection_preserves_full_device_list_and_order(monkeypatch):
+    from halo_gtk import config
+
+    devices = [SimpleNamespace(id=device_id) for device_id in (4, 1, 6, 2, 3)]
+    page = CamerasPage.__new__(CamerasPage)
+    page._embedded = True
+    page._show_monitoring_controls = False
+    page._order = [device.id for device in devices]
+    saved = []
+    monkeypatch.setattr(config, "save", saved.append)
+
+    assert page._visible_devices(devices) == devices[:3]
+    page._save_camera_order()
+
+    assert [device.id for device in devices] == [4, 1, 6, 2, 3]
+    assert page._order == [4, 1, 6, 2, 3]
+    assert saved == []
+
+
+def test_failed_preview_decode_does_not_reset_age():
+    timer_changes = []
+    tile = SimpleNamespace(
+        device=SimpleNamespace(name="Camera"),
+        _show_snapshot_timer=True,
+        _snapshot_loaded_at=100.0,
+        _timer_label=SimpleNamespace(set_visible=timer_changes.append),
+        _update_timer=lambda: timer_changes.append("updated"),
+    )
+
+    CameraTile.set_snapshot(tile, b"invalid image")
+
+    assert tile._snapshot_loaded_at == 100.0
+    assert timer_changes == []
+
+
+def test_preview_age_describes_local_load_time(monkeypatch):
+    from halo_gtk import cameras_page
+
+    labels = []
+    tile = SimpleNamespace(
+        _live_monitoring=False,
+        _snapshot_loaded_at=100.0,
+        _timer_label=SimpleNamespace(get_visible=lambda: True, set_label=labels.append),
+    )
+    monkeypatch.setattr(cameras_page.time, "monotonic", lambda: 170.0)
+
+    CameraTile._update_timer(tile)
+
+    assert labels == ["Preview loaded 1m 10s ago"]
 
 
 def test_camera_tile_keyboard_activation_selects_camera():

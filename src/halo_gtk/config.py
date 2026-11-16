@@ -19,6 +19,7 @@ CONFIG_FILE = CONFIG_DIR / "settings.json"
 LEGACY_CONFIG_FILE = CONFIG_DIR / "config.json"
 
 _DEFAULTS: dict[str, Any] = {
+    "appearance": "system",
     "show_notifications": True,
     "notify_doorbell": True,
     "notify_motion": True,
@@ -188,6 +189,8 @@ def _read_json_file(path: Path | None = None) -> dict[str, Any] | None:
 
 def _normalise_config(config: dict[str, Any]) -> dict[str, Any]:
     data = {key: config.get(key, default) for key, default in _DEFAULTS.items()}
+    if data["appearance"] not in ("system", "light", "dark"):
+        data["appearance"] = "system"
     data["show_notifications"] = _coerce_bool(
         data["show_notifications"], _DEFAULTS["show_notifications"]
     )
