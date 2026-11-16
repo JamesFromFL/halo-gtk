@@ -68,7 +68,8 @@ compatibility.
   permissions are verified.
 - Alarm history pagination/coverage and optional persistent local history.
 - Optional Halo Server connection mode, as a separately reviewed architecture
-  change. GTK currently connects directly to Ring.
+  change. The owner chose to keep GTK direct-to-Ring on 16 November 2026; this
+  item is deferred by that decision. See [research gates](backlog-research-gates-2026-11-16.md).
 
 ## Preserve throughout
 
