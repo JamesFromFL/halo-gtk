@@ -63,7 +63,7 @@ from halo_gtk.alarm.provider import (
     AlarmModePreparation,
     AlarmRefreshResult,
     AlarmRefreshStatus,
-    location_seeds_from_base_stations,
+    location_seeds_from_hubs,
 )
 from halo_gtk.alarm.rest import DEVICES_ENDPOINT, LOCATIONS_ENDPOINT
 from halo_gtk.alarm.rest import RingAlarmRestGateway as _RingAlarmRestGateway
@@ -939,8 +939,9 @@ class RingClient:
         if ring is None:
             return ()
         base_stations = getattr(ring, "devices_data", {}).get("base_stations", {})
-        return location_seeds_from_base_stations(
+        return location_seeds_from_hubs(
             base_stations,
+            getattr(ring, "devices_data", {}).get("beams_bridges", {}),
             raw_locations=raw_locations,
         )
 
@@ -1045,6 +1046,7 @@ class RingClient:
         service = self._alarm_service
         if service is None or not _is_active_client_generation(self, generation):
             return False
+        service.beams.update_owners(None)
         try:
             async with asyncio.timeout(12):
                 gateway = self._get_alarm_gateway()
@@ -1052,11 +1054,18 @@ class RingClient:
                     device_task = group.create_task(gateway.request_json(DEVICES_ENDPOINT))
                     location_task = group.create_task(gateway.request_json(LOCATIONS_ENDPOINT))
                 devices, locations = device_task.result(), location_task.result()
-                stations = devices.get("base_stations")
-                if not isinstance(stations, list) or len(stations) > _ALARM_DISCOVERY_RECORD_LIMIT:
+                if "base_stations" not in devices and "beams_bridges" not in devices:
+                    return False
+                stations = devices.get("base_stations", [])
+                bridges = devices.get("beams_bridges", [])
+                if (
+                    not isinstance(stations, list)
+                    or not isinstance(bridges, list)
+                    or len(stations) + len(bridges) > _ALARM_DISCOVERY_RECORD_LIMIT
+                ):
                     return False
                 location_ids = set()
-                for station in stations:
+                for station in stations + bridges:
                     if not isinstance(station, Mapping):
                         return False
                     # Match the provider's ordered field fallback and text
@@ -1079,7 +1088,7 @@ class RingClient:
                     location_ids.add(identity)
                     if len(location_ids) > _ALARM_DISCOVERY_LOCATION_LIMIT:
                         return False
-                seeds = location_seeds_from_base_stations(stations, raw_locations=locations)
+                seeds = location_seeds_from_hubs(stations, bridges, raw_locations=locations)
                 # Forgiving normalization must never turn partial discovery
                 # into authoritative removal of other locations.
                 if {seed.location_id for seed in seeds} != location_ids:
@@ -1098,6 +1107,7 @@ class RingClient:
                 self._alarm_discovery_at = alarm_monotonic_time()
                 self._alarm_discovery_generation = generation
                 self._alarm_discovery_service = service
+                service.beams.update_owners(bridges)
                 return True
         except asyncio.CancelledError:
             raise
@@ -1165,6 +1175,57 @@ class RingClient:
             location_id, asset_id, zid, brightness, revision=revision, intent=intent
         )
 
+    def get_beams_snapshot(self):
+        from halo_gtk.alarm.beams import BeamsSnapshot
+
+        service = self._alarm_service
+        if service is None:
+            return BeamsSnapshot(self.get_alarm_snapshot().generation)
+        return service.beams.snapshot.current(
+            alarm_monotonic_time(), getattr(self._lighting_actions, "revision", -1)
+        )
+
+    def request_beams_light(
+        self, location_id, asset_id, zid, duration, *, expected_revision, intent
+    ):
+        return self.submit(
+            self._async_beams_light(location_id, asset_id, zid, duration, expected_revision, intent)
+        )
+
+    def cancel_beams_intent(self, intent):
+        intent.cancel()
+
+    async def _async_beams_light(self, location_id, asset_id, zid, duration, revision, intent):
+        from halo_gtk.alarm.beams import BeamsResult
+
+        lighting = self._lighting_actions
+        reservation = lighting.try_acquire()
+        if reservation is None:
+            return BeamsResult("rejected", "lighting-busy")
+        try:
+            # Bound discovery and device confirmation together; no queued send.
+            async with asyncio.timeout(22):
+                generation = self._published_generation
+                self._require_alarm_location(location_id, generation)
+                service = self._alarm_service
+                if service is None or not await self._async_refresh_alarm_discovery():
+                    return BeamsResult("rejected", "discovery-unavailable")
+                self._require_alarm_location(location_id, generation)
+                lighting.admission(reservation)
+                if service is not self._alarm_service:
+                    return BeamsResult("rejected", "session-changed")
+                return await service.beams.request(
+                    location_id,
+                    asset_id,
+                    zid,
+                    duration,
+                    revision=revision,
+                    intent=intent,
+                    reservation=reservation,
+                )
+        finally:
+            lighting.release(reservation)
+
     def _create_alarm_service(
         self,
         generation: int,
@@ -1181,6 +1242,7 @@ class RingClient:
             self._on_alarm_snapshot,
             generation=generation,
             command_admission=partial(self._alarm_command_admission, generation),
+            lighting_actions=self._lighting_actions,
         )
 
     @contextlib.contextmanager

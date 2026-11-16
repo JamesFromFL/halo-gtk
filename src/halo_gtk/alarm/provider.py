@@ -227,6 +227,29 @@ def location_seeds_from_base_stations(
     )
 
 
+def location_seeds_from_hubs(raw_base_stations, raw_beams_bridges, *, raw_locations=None):
+    """Include bridge-only locations without granting Alarm ownership from a bridge."""
+    bases = location_seeds_from_base_stations(raw_base_stations, raw_locations=raw_locations)
+    records = (
+        raw_beams_bridges.values()
+        if isinstance(raw_beams_bridges, Mapping)
+        else raw_beams_bridges or ()
+    )
+    bridges = location_seeds_from_base_stations(
+        (
+            {**row, "owned": False}
+            for row in islice(records, _MAX_DISCOVERY_RECORDS)
+            if isinstance(row, Mapping)
+        ),
+        raw_locations=raw_locations,
+    )
+    combined = {seed.location_id: seed for seed in bases}
+    for seed in bridges:
+        if seed.location_id not in combined and len(combined) < _MAX_LOCATIONS:
+            combined[seed.location_id] = seed
+    return tuple(combined[key] for key in sorted(combined))
+
+
 def _location_names(
     raw_locations: Mapping[object, object] | Iterable[object] | None,
 ) -> dict[str, str]:

@@ -33,7 +33,9 @@ def discovery(monkeypatch):
         reconciled.append(tuple(seed.location_id for seed in seeds))
 
     client._alarm_gateway = Gateway()
-    client._alarm_service = SimpleNamespace(reconcile=reconcile)
+    client._alarm_service = SimpleNamespace(
+        reconcile=reconcile, beams=SimpleNamespace(update_owners=lambda _records: None)
+    )
     return client, records, calls, reconciled
 
 
@@ -107,11 +109,11 @@ async def test_empty_valid_discovery_is_authoritative(discovery):
 async def test_any_normalized_identity_set_mismatch_is_not_authoritative(discovery, monkeypatch):
     client, records, _calls, reconciled = discovery
     records.extend(({"location_id": "home"}, {"location_id": "other"}))
-    original = ring_client.location_seeds_from_base_stations
+    original = ring_client.location_seeds_from_hubs
     # Simulate a future forgiving parser dropping a record for another reason.
     monkeypatch.setattr(
         ring_client,
-        "location_seeds_from_base_stations",
+        "location_seeds_from_hubs",
         lambda *args, **kwargs: original(*args, **kwargs)[:1],
     )
     assert not await client._async_refresh_alarm_discovery()
@@ -128,14 +130,18 @@ async def test_service_replacement_while_reconciling_cannot_cache_success(discov
         entered.set()
         await release.wait()
 
-    client._alarm_service = SimpleNamespace(reconcile=blocked_reconcile)
+    client._alarm_service = SimpleNamespace(
+        reconcile=blocked_reconcile, beams=SimpleNamespace(update_owners=lambda _records: None)
+    )
     task = asyncio.create_task(client._async_refresh_alarm_discovery())
     await entered.wait()
 
     async def replacement_reconcile(seeds):
         reconciled.append(tuple(seed.location_id for seed in seeds))
 
-    replacement = SimpleNamespace(reconcile=replacement_reconcile)
+    replacement = SimpleNamespace(
+        reconcile=replacement_reconcile, beams=SimpleNamespace(update_owners=lambda _records: None)
+    )
     client._alarm_service = replacement
     release.set()
     assert not await task
@@ -156,7 +162,9 @@ async def test_retirement_while_reconciling_cannot_cache_success(discovery, monk
         entered.set()
         await release.wait()
 
-    client._alarm_service = SimpleNamespace(reconcile=blocked_reconcile)
+    client._alarm_service = SimpleNamespace(
+        reconcile=blocked_reconcile, beams=SimpleNamespace(update_owners=lambda _records: None)
+    )
     task = asyncio.create_task(client._async_refresh_alarm_discovery())
     await entered.wait()
     monkeypatch.setattr(ring_client, "_is_active_client_generation", lambda *_args: False)
@@ -178,7 +186,7 @@ async def test_success_cache_is_bound_to_generation_and_service(discovery):
     assert await client._async_refresh_alarm_discovery()
     assert len(calls) == 4
     original = client._alarm_service
-    client._alarm_service = SimpleNamespace(reconcile=original.reconcile)
+    client._alarm_service = SimpleNamespace(reconcile=original.reconcile, beams=original.beams)
     assert await client._async_refresh_alarm_discovery()
     assert len(calls) == 6
     assert reconciled == [("home",)] * 3

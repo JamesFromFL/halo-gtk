@@ -10,6 +10,12 @@ gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, Gtk, Pango  # noqa: E402
 
+from halo_gtk.beams_details import (  # noqa: E402
+    BeamsDetails,
+    BeamsViewSession,
+    refresh_text,
+    reported_text,
+)
 from halo_gtk.chime_details import (  # noqa: E402
     ChimeDetails,
     _ChimeViewSession,
@@ -120,6 +126,10 @@ class DevicesPage(Gtk.ScrolledWindow):
             self._intercom_changed, self._intercom_retired, provider=lambda: get_client()
         )
         self._intercom_rows = []
+        self._beams_rows = []
+        self._beams_session = BeamsViewSession(
+            self._beams_changed, self._account_retired, provider=lambda: get_client()
+        )
         self._light_location_ids = ()
         self._light_selected_id = None
         self._light_location_epoch = None
@@ -169,7 +179,7 @@ class DevicesPage(Gtk.ScrolledWindow):
         for key, label in (
             ("all", "All devices"),
             ("chimes", "Chimes"),
-            ("lighting", "Light Groups"),
+            ("lighting", "Lighting"),
             ("intercoms", "Intercoms"),
         ):
             button = Gtk.ToggleButton(label=label, css_classes=["pill"])
@@ -223,6 +233,7 @@ class DevicesPage(Gtk.ScrolledWindow):
         )
         self._inner.append(self._chime_message)
         self._build_lighting()
+        self._build_beams()
         self._intercom_group = Adw.PreferencesGroup(
             title="Intercoms",
             description="Reported status and entrance release with confirmation. "
@@ -240,6 +251,7 @@ class DevicesPage(Gtk.ScrolledWindow):
         self._device_sections = (
             ("chimes", self._chime_group, self._chime_message, "_chime_rows"),
             ("lighting", self._light_group, self._light_message, "_light_rows"),
+            ("lighting", self._beams_group, self._beams_message, "_beams_rows"),
             ("intercoms", self._intercom_group, self._intercom_message, "_intercom_rows"),
         )
         self._search_empty = Adw.StatusPage(
@@ -306,6 +318,16 @@ class DevicesPage(Gtk.ScrolledWindow):
             camera_label = "camera" if cameras == 1 else "cameras"
             self._camera_row.set_subtitle(f"{cameras} {camera_label} linked to this account")
         self._render_chimes(snapshot)
+        beams = getattr(self, "_beams_session", None)
+        if beams is not None:
+            if beams.active and (not signed_in or beams.current() is None):
+                beams.close()
+                self._close_dialog()
+            self._render_beams(
+                client.get_beams_snapshot()
+                if signed_in and hasattr(client, "get_beams_snapshot")
+                else None
+            )
         lighting = getattr(self, "_lighting_session", None)
         if lighting is not None:
             if lighting.active and (not signed_in or lighting.current() is None):
@@ -324,6 +346,14 @@ class DevicesPage(Gtk.ScrolledWindow):
         self._visible = True
         self.refresh()
         client = get_client()
+        beams = getattr(self, "_beams_session", None)
+        if (
+            beams is not None
+            and client is not None
+            and client.is_authenticated
+            and hasattr(client, "get_beams_snapshot")
+        ):
+            beams.open(client)
         if client is not None and client.is_authenticated and self._session.open(client):
             self._fetch(force=False)
         lighting = getattr(self, "_lighting_session", None)
@@ -348,6 +378,10 @@ class DevicesPage(Gtk.ScrolledWindow):
         self._session.close()
         self._close_dialog()
         self._render_chimes(None)
+        beams = getattr(self, "_beams_session", None)
+        if beams is not None:
+            beams.close()
+            self._render_beams(None)
         lighting = getattr(self, "_lighting_session", None)
         if lighting is not None:
             lighting.close()
@@ -461,6 +495,94 @@ class DevicesPage(Gtk.ScrolledWindow):
     def _dialog_closed(self, dialog):
         if self._dialog is dialog:
             self._dialog = None
+
+    def _build_beams(self):
+        self._beams_group = Adw.PreferencesGroup(
+            title="Individual Beams lights",
+            description=(
+                "Reported bridge-connected lights. Finite On and automatic controls "
+                "are available for qualified owner devices."
+            ),
+        )
+        self._beams_group.add_css_class("halo-device-group")
+        self._beams_refresh = Gtk.Button(label="Refresh", valign=Gtk.Align.CENTER)
+        self._beams_refresh.connect("clicked", self._refresh_beams)
+        self._beams_group.set_header_suffix(self._beams_refresh)
+        self._inner.append(self._beams_group)
+        self._beams_message = Gtk.Label(
+            wrap=True, xalign=0, use_markup=False, css_classes=["dim-label", "caption"]
+        )
+        self._inner.append(self._beams_message)
+
+    def _refresh_beams(self, *_args):
+        session = self._beams_session
+        if self._visible and session.current() is not None:
+            session.request("inventory", lambda: session.client.refresh_alarm())
+
+    def _beams_changed(self, snapshot, completed):
+        if not self._visible:
+            return
+        self._render_beams(snapshot)
+        if "inventory" in completed:
+            try:
+                self._beams_message.set_label(refresh_text(completed["inventory"].result()))
+            except Exception:
+                self._beams_message.set_label(
+                    "Beams refresh unavailable. Existing reports may be stale."
+                )
+
+    def _render_beams(self, snapshot):
+        for row in self._beams_rows:
+            self._beams_group.remove(row)
+        self._beams_rows.clear()
+        self._beams_refresh.set_sensitive(
+            self._visible
+            and self._beams_session.active
+            and not self._beams_session.pending("inventory")
+        )
+        if snapshot is None or not snapshot.lights:
+            row = Adw.ActionRow(title="No individual Beams lights reported", use_markup=False)
+            self._beams_group.add(row)
+            self._beams_rows.append(row)
+        else:
+            for light in snapshot.lights:
+                row = Adw.ActionRow(title=light.device.name or "Beams light", use_markup=False)
+                row.set_title_lines(2)
+                row.set_subtitle_lines(0)
+                row.set_subtitle(
+                    f"{light.location_name or 'Ring location'} · {reported_text(light)}"
+                    + (" · Read only" if light.reason else "")
+                )
+                row.add_prefix(Gtk.Image(icon_name="weather-clear-symbolic"))
+                row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+                row.set_activatable(True)
+                row.connect(
+                    "activated",
+                    self._open_beams,
+                    light.identity,
+                    light.device.epoch,
+                    snapshot.generation,
+                )
+                self._beams_group.add(row)
+                self._beams_rows.append(row)
+        self._beams_message.set_label(
+            "Inventory display limit reached; only the first 1,024 lights are shown."
+            if snapshot and snapshot.truncated
+            else "Light Groups and individual lights have separate reported states. "
+            "Automatic may leave a light on."
+        )
+        self._apply_inventory_filter()
+
+    def _open_beams(self, _row, identity, epoch, generation):
+        snapshot = self._beams_session.current() if self._visible else None
+        light = snapshot.find(identity) if snapshot else None
+        if light is None or snapshot.generation != generation or light.device.epoch != epoch:
+            return
+        self._close_dialog()
+        dialog = BeamsDetails(self._beams_session.client, identity)
+        self._dialog = dialog
+        dialog.connect("closed", self._dialog_closed)
+        dialog.present(self)
 
     def _build_lighting(self):
         self._light_group = Adw.PreferencesGroup(

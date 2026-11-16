@@ -12,6 +12,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from typing import Any
 
+from halo_gtk.alarm.beams import BeamsController
 from halo_gtk.alarm.keypads import KeypadController
 from halo_gtk.alarm.models import (
     AlarmAccountSnapshot,
@@ -141,6 +142,7 @@ class RingAlarmService:
         approval_lifetime: float = 60.0,
         inventory_max_age: float = 30.0,
         command_admission: Callable[[], AbstractContextManager[None]] | None = None,
+        lighting_actions=None,
     ) -> None:
         if reconnect_min < 0 or reconnect_max < reconnect_min:
             raise ValueError("invalid reconnect bounds")
@@ -205,6 +207,7 @@ class RingAlarmService:
         self._running = False
         self._closed = False
         self.keypads = KeypadController(self)
+        self.beams = BeamsController(self, lighting_actions)
         self._close_task: asyncio.Task[None] | None = None
         for seed in self._seeds.values():
             self._store.register_location(
@@ -250,6 +253,7 @@ class RingAlarmService:
 
     async def _close_impl(self) -> None:
         await self.keypads.close()
+        await self.beams.close()
         for pending in tuple(self._pending.values()):
             if not pending.future.done():
                 pending.future.set_exception(_CommandConnectionLost("service-closed"))
@@ -862,6 +866,7 @@ class RingAlarmService:
                     )
         location = self._store.snapshot.find_location(runtime.seed.location_id)
         self.keypads.observe(runtime, message, previous)
+        self.beams.observe(runtime, message)
         if location is not None and location.inventory is AlarmInventoryStatus.COMPLETE:
             runtime.phase = (
                 "online" if location.connection is AlarmConnectionStatus.ONLINE else "degraded"
@@ -1318,6 +1323,7 @@ class RingAlarmService:
 
     def _publish(self, *, status: AlarmServiceStatus | None = None) -> None:
         base = self.keypads.decorate(self._store.snapshot)
+        self.beams.publish(base)
         decorated_locations = tuple(
             self._decorate_location(location) for location in base.locations
         )

@@ -164,7 +164,9 @@ async def test_alarm_discovery_refresh_coalesces_and_reconciles_owner_evidence(m
         reconciled.append(seeds)
 
     client._alarm_gateway = Gateway()
-    client._alarm_service = SimpleNamespace(reconcile=reconcile)
+    client._alarm_service = SimpleNamespace(
+        reconcile=reconcile, beams=SimpleNamespace(update_owners=lambda _records: None)
+    )
     assert await asyncio.gather(
         client._async_refresh_alarm_discovery(), client._async_refresh_alarm_discovery()
     ) == [True, True]
@@ -187,7 +189,9 @@ async def test_malformed_discovery_is_not_authoritative_removal(monkeypatch):
         reconciled.append(seeds)
 
     client._alarm_gateway = Gateway()
-    client._alarm_service = SimpleNamespace(reconcile=reconcile)
+    client._alarm_service = SimpleNamespace(
+        reconcile=reconcile, beams=SimpleNamespace(update_owners=lambda _records: None)
+    )
     assert not await client._async_refresh_alarm_discovery()
     assert not reconciled
     assert client.get_alarm_snapshot().find_location("home") is not None
@@ -229,6 +233,8 @@ async def test_discovery_failure_cancels_sibling_request(monkeypatch):
                 cleaned.set()
 
     client._alarm_gateway = Gateway()
-    client._alarm_service = SimpleNamespace(reconcile=lambda *_: None)
+    client._alarm_service = SimpleNamespace(
+        reconcile=lambda *_: None, beams=SimpleNamespace(update_owners=lambda _records: None)
+    )
     assert not await client._async_refresh_alarm_discovery()
     assert cleaned.is_set()

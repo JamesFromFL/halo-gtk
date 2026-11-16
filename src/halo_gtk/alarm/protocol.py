@@ -424,6 +424,30 @@ def encode_keypad_brightness(asset_id: str, zid: str, brightness: int, sequence:
     }
 
 
+def encode_beams_light(asset_id: str, zid: str, duration: int | None, sequence: int):
+    """Finite On or Ring automatic mode, never permanent On or forced Off."""
+    asset_id = _validate_outbound_identifier(asset_id, "asset_id")
+    zid = _validate_outbound_identifier(zid, "light_zid")
+    _validate_outbound_sequence(sequence)
+    if duration is not None and (type(duration) is not int or duration not in {30, 60, 300, 900}):
+        raise ValueError("unsupported light duration")
+    data = (
+        {"lightMode": "default"} if duration is None else {"lightMode": "on", "duration": duration}
+    )
+    return {
+        "channel": "message",
+        "msg": {
+            "msg": "DeviceInfoSet",
+            "datatype": "DeviceInfoSetType",
+            "dst": asset_id,
+            "body": [
+                {"zid": zid, "command": {"v1": [{"commandType": "light-mode.set", "data": data}]}}
+            ],
+            "seq": sequence,
+        },
+    }
+
+
 def encode_mode_command(
     asset_id: str,
     panel_zid: str,

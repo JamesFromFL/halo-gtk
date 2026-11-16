@@ -17,6 +17,8 @@ is committed as `c9475b2`; the items below preserve the separate feature work.
   [camera privacy](camera-privacy.md). Ring receipt delays and live-device
   acceptance remain explicit limitations.
 - Remaining device controls: in progress.
+- Individual Beams discovery and qualified finite/automatic controls: complete;
+  see [Beams support](beams-support.md). Physical-device acceptance is separate.
 - Camera light outcome reporting and read-only motion-timer information:
   complete; see [camera lighting](camera-lighting.md). Indefinite manual On is
   still an evidence gate, not an inferred capability.

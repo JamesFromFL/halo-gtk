@@ -9,6 +9,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 This section tracks the work toward Halo GTK's first tagged release.
 
 ### Added
+- Individual Beams lights with bridge-specific ownership, finite On requests,
+  return-to-automatic controls and fresh reported outcomes, including bridge-only
+  locations without Ring Alarm.
 - Optional managed installation with validated immutable releases, running-app
   leases, rollback and recovery of interrupted desktop integration updates.
 - Fresh Ring camera privacy checks for previews, live video, listening and

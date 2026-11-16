@@ -20,6 +20,7 @@ from halo_gtk.alarm.protocol import (
     AlarmProtocolError,
     ClapMessage,
     HubDisconnection,
+    encode_beams_light,
     encode_clap_frame,
     encode_device_list_request,
     encode_keypad_brightness,
@@ -65,6 +66,7 @@ class AlarmTicketAsset:
     kind: str
     status: str
     on_battery: bool | None = None
+    doorbot_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,12 +277,23 @@ class RingAlarmTransport:
     ) -> None:
         """Send one typed keypad setting on its current base-station socket."""
         if not callable(admission) or not any(
-            asset.asset_id == asset_id and asset.kind == "base_station_v1"
-            for asset in self._assets
+            asset.asset_id == asset_id and asset.kind == "base_station_v1" for asset in self._assets
         ):
             raise AlarmCommandSupersededError("keypad-asset-unavailable")
         await self._send_encoded(
             lambda sequence: encode_keypad_brightness(asset_id, zid, brightness, sequence),
+            epoch=epoch,
+            admission=admission,
+        )
+
+    async def send_beams_light(self, asset_id, zid, duration, *, epoch, admission):
+        """One typed command on the qualified bridge, guarded at socket handoff."""
+        if not callable(admission) or not any(
+            asset.asset_id == asset_id and asset.kind == "beams_bridge_v1" for asset in self._assets
+        ):
+            raise AlarmCommandSupersededError("light-asset-unavailable")
+        await self._send_encoded(
+            lambda sequence: encode_beams_light(asset_id, zid, duration, sequence),
             epoch=epoch,
             admission=admission,
         )
@@ -430,6 +443,11 @@ def _parse_ticket(payload: object) -> _Ticket:
                 kind=kind,
                 status=status,
                 on_battery=on_battery if isinstance(on_battery, bool) else None,
+                doorbot_id=(
+                    value["doorbot_id"]
+                    if type(value.get("doorbot_id")) is int and 0 < value["doorbot_id"] < 2**53
+                    else None
+                ),
             )
         )
     if not assets:
