@@ -13,11 +13,21 @@ AUTOSTART_DIR = storage_paths.autostart_dir()
 AUTOSTART_FILE = AUTOSTART_DIR / f"{APP_ID}.desktop"
 
 
+def is_supported() -> bool:
+    # A sandbox-local .desktop file does not configure host session startup.
+    # Keep this unavailable until the Background portal is qualified.
+    return not Path("/.flatpak-info").is_file()
+
+
 def is_enabled() -> bool:
-    return AUTOSTART_FILE.exists()
+    return is_supported() and AUTOSTART_FILE.exists()
 
 
 def set_enabled(enabled: bool, *, background: bool = False) -> None:
+    if not is_supported():
+        if enabled:
+            raise OSError("Login startup is unavailable in this Flatpak build")
+        return
     if enabled:
         _write_desktop_file(background=background)
     else:

@@ -1,0 +1,45 @@
+{
+  "app-id": "io.github.JamesFromFL.HaloGtk",
+  "runtime": "org.gnome.Platform",
+  "runtime-version": "50",
+  "sdk": "org.gnome.Sdk",
+  "command": "halo-gtk",
+  "finish-args": [
+    "--share=network",
+    "--share=ipc",
+    "--socket=wayland",
+    "--socket=fallback-x11",
+    "--socket=pulseaudio",
+    "--device=dri",
+    "--talk-name=org.freedesktop.secrets",
+    "--talk-name=org.freedesktop.Notifications",
+    "--talk-name=org.kde.StatusNotifierWatcher",
+    "--filesystem=~/Pictures/halo-gtk:create",
+    "--filesystem=~/Videos/halo-gtk:create"
+  ],
+  "modules": [
+    "python-dependencies.json",
+    {
+      "name": "halo-gtk",
+      "buildsystem": "simple",
+      "build-commands": [
+        "test \"$(python3 -c 'import sys;print(str(sys.version_info.major)+\".\"+str(sys.version_info.minor))')\" = 3.13",
+        "python3 -m pip install --ignore-installed --no-index --no-deps --no-build-isolation --prefix=/app .",
+        "install -d /app/share/icons/hicolor",
+        "install -Dm644 data/io.github.JamesFromFL.HaloGtk.desktop /app/share/applications/io.github.JamesFromFL.HaloGtk.desktop",
+        "install -Dm644 data/io.github.JamesFromFL.HaloGtk.metainfo.xml /app/share/metainfo/io.github.JamesFromFL.HaloGtk.metainfo.xml",
+        "install -Dm644 data/io.github.JamesFromFL.HaloGtk.gschema.xml /app/share/glib-2.0/schemas/io.github.JamesFromFL.HaloGtk.gschema.xml",
+        "glib-compile-schemas --strict /app/share/glib-2.0/schemas",
+        "cp -a data/icons/hicolor/. /app/share/icons/hicolor/",
+        "install -Dm644 LICENSE /app/share/licenses/halo-gtk/LICENSE"
+      ],
+      "sources": [
+        {"type": "dir", "path": "../../src", "dest": "src", "skip": ["__pycache__"]},
+        {"type": "dir", "path": "../../data", "dest": "data", "skip": ["gschemas.compiled"]},
+        {"type": "file", "path": "../../LICENSE"},
+        {"type": "file", "path": "../../README.md"},
+        {"type": "file", "path": "../../pyproject.toml"}
+      ]
+    }
+  ]
+}

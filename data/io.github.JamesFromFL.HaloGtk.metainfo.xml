@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.JamesFromFL.HaloGtk</id>
+  <name>Halo</name>
+  <summary>Your Ring cameras and home security on the Linux desktop</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="io.github.JamesFromFL"><name>JamesFromFL</name></developer>
+  <description>
+    <p>See your cameras, review events and manage supported Ring devices in a
+    native GTK interface that fits your Linux desktop.</p>
+    <ul>
+      <li>Camera previews, focused live view and multi-camera monitoring</li>
+      <li>Listening and deliberate push-to-talk with Ring privacy checks</li>
+      <li>Event history, downloads, screenshots and Favorites</li>
+      <li>Alarm observations and supported device controls</li>
+      <li>Desktop notifications with quiet hours and per-device rules</li>
+    </ul>
+    <p>A Ring account and compatible hardware are required. Available features
+    depend on the device, account permissions and Ring services.</p>
+  </description>
+  <launchable type="desktop-id">io.github.JamesFromFL.HaloGtk.desktop</launchable>
+  <url type="homepage">https://github.com/JamesFromFL/halo-gtk</url>
+  <url type="bugtracker">https://github.com/JamesFromFL/halo-gtk/issues</url>
+  <provides><binary>halo-gtk</binary></provides>
+  <content_rating type="oars-1.1" />
+</component>

@@ -22,6 +22,8 @@ jobs:
       - run: uv sync --frozen --no-group audit
       - run: .venv/bin/ruff check --no-cache src tests scripts
       - run: .venv/bin/ruff format --check --no-cache src tests scripts
+      - name: Check locked Flatpak dependency sources
+        run: .venv/bin/python scripts/flatpak_dependencies.py --check
 
   dependency-audit:
     runs-on: ubuntu-latest

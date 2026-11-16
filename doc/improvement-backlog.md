@@ -31,6 +31,10 @@ is committed as `c9475b2`; the items below preserve the separate feature work.
 - Optional staged installer, rollback and interruption recovery: complete; see
   [managed installation](staged-install-design.md). System runtime dependencies
   remain shared; this does not establish broader distribution compatibility.
+- Experimental x86_64 GNOME 50 Flatpak: built and tested in an isolated runtime;
+  see [packaging qualification](flatpak-packaging.md). Desktop portal, real media
+  and distribution acceptance remain separate; host login startup is unavailable
+  in the sandbox candidate.
 
 ## 1. Maintenance and desktop baseline
 

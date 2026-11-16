@@ -156,6 +156,8 @@ class RingApplication(Adw.Application):
             self._tray.shutdown()
 
     def reconcile_autostart(self) -> None:
+        if not autostart.is_supported():
+            return
         cfg = _config.load()
         try:
             autostart.set_enabled(

@@ -362,7 +362,9 @@ class SettingsPage(Gtk.Box):
         self._autostart_switch = self._add_switch_row(
             group,
             "Launch at Login",
-            "Start Halo when you sign in to the computer.",
+            "Start Halo when you sign in to the computer."
+            if autostart.is_supported()
+            else "Login startup is unavailable in this Flatpak build.",
             self._on_autostart_toggled,
         )
         self._autostart_background_row, self._autostart_background_switch = self._add_switch_row(
@@ -676,7 +678,10 @@ class SettingsPage(Gtk.Box):
             self._refresh_account()
             background_enabled = cfg.get("background_service", False)
             self._set_switch_active(self._background_switch, background_enabled)
-            autostart_enabled = cfg.get("autostart_login", False) or autostart.is_enabled()
+            autostart_enabled = autostart.is_supported() and (
+                cfg.get("autostart_login", False) or autostart.is_enabled()
+            )
+            self._autostart_switch.set_sensitive(autostart.is_supported())
             self._set_switch_active(
                 self._autostart_switch,
                 autostart_enabled,
@@ -888,6 +893,9 @@ class SettingsPage(Gtk.Box):
     def _on_autostart_toggled(self, switch: Gtk.Switch, _pspec) -> None:
         if self._refreshing:
             return
+        if not autostart.is_supported():
+            self.refresh()
+            return
         enabled = switch.get_active()
         cfg = _config.load()
         previous = dict(cfg)
@@ -901,6 +909,9 @@ class SettingsPage(Gtk.Box):
 
     def _on_autostart_background_toggled(self, switch: Gtk.Switch, _pspec) -> None:
         if self._refreshing:
+            return
+        if not autostart.is_supported():
+            self.refresh()
             return
         enabled = switch.get_active()
         cfg = _config.load()

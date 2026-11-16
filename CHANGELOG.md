@@ -9,6 +9,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 This section tracks the work toward Halo GTK's first tagged release.
 
 ### Added
+- An experimental x86_64 GNOME 50 Flatpak with hash-pinned offline build inputs,
+  isolated runtime/media qualification and explicit sandbox startup limitations.
 - Individual Beams lights with bridge-specific ownership, finite On requests,
   return-to-automatic controls and fresh reported outcomes, including bridge-only
   locations without Ring Alarm.
