@@ -107,6 +107,8 @@ This section tracks the work toward Halo GTK's first tagged release.
   compatibility contracts.
 
 ### Fixed
+- A failed packaged-logo decoder no longer prevents the window from opening;
+  Halo uses a symbolic icon and keeps navigation available.
 - Preview refreshes reuse an authorized live frame or Ring's cached snapshot
   while streaming, avoiding fresh snapshot requests that can interrupt live view.
 - Alarm history stops on ambiguous overlapping pages and at the supported offset

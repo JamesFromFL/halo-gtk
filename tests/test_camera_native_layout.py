@@ -13,7 +13,7 @@ gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gst", "1.0")
 
-from gi.repository import Adw, GLib, Gst, Gtk  # noqa: E402
+from gi.repository import Adw, GdkPixbuf, GLib, Gst, Gtk  # noqa: E402
 
 from halo_gtk import config  # noqa: E402
 from halo_gtk.cameras_page import CamerasPage  # noqa: E402
@@ -46,6 +46,9 @@ def _settle():
 def test_camera_inspector_adapts_before_content_allocation(isolated_native_ui, width):
     window = RingWindow()
     try:
+        logo = window._brand.get_first_child()
+        assert isinstance(logo, Gtk.Picture)
+        assert logo.get_paintable() is not None
         window.set_default_size(width, 920)
         window._show_page("cameras")
         window.present()
@@ -87,3 +90,29 @@ def test_embedded_signed_out_message_fits_its_minimum_height(isolated_native_ui)
         )
         assert label.get_height() > 0
     assert not isinstance(page._scroll, Gtk.ScrolledWindow)
+
+
+def test_window_starts_when_packaged_logo_decoder_fails(isolated_native_ui, monkeypatch, caplog):
+    def fail_to_decode(*_args):
+        raise GLib.Error("Synthetic image loader failure")
+
+    monkeypatch.setattr(GdkPixbuf.Pixbuf, "new_from_file_at_scale", fail_to_decode)
+    window = RingWindow()
+    try:
+        logo = window._brand.get_first_child()
+        assert isinstance(logo, Gtk.Image)
+        assert logo.get_icon_name() == "camera-video-symbolic"
+        assert logo.get_pixel_size() == 28
+        window.set_default_size(420, 920)
+        window.present()
+        for destination in ("cameras", "history", "devices", "alarm", "dashboard"):
+            window._show_page(destination)
+            _settle()
+            assert window._content_stack.get_visible_child_name() == destination
+        assert window.get_mapped()
+        assert "Packaged app logo unavailable; using a symbolic icon" in caplog.text
+    finally:
+        window.stop_runtime_streams()
+        window.destroy()
+        _settle()
+    assert get_client() is None

@@ -11,7 +11,7 @@ gi.require_version("Adw", "1")
 gi.require_version("Gdk", "4.0")
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import Adw, Gdk, GdkPixbuf, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, GdkPixbuf, GLib, Gtk  # noqa: E402
 
 from halo_gtk import APP_ID, config, device_names  # noqa: E402
 from halo_gtk.alarm_page import AlarmPage  # noqa: E402
@@ -241,20 +241,25 @@ class RingWindow(Adw.ApplicationWindow):
         return toast
 
     @staticmethod
-    def _make_sidebar_logo(pixel_size: int) -> Gtk.Picture:
+    def _make_sidebar_logo(pixel_size: int) -> Gtk.Widget:
         """Load the packaged app mark for the native header bar."""
         icon_path = Path(__file__).resolve().parent / "assets" / "icons" / "apps" / f"{APP_ID}.png"
-        pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
-            str(icon_path),
-            pixel_size,
-            pixel_size,
-            True,
-        )
-        icon = Gtk.Picture(
-            paintable=Gdk.Texture.new_for_pixbuf(pixbuf),
-            content_fit=Gtk.ContentFit.CONTAIN,
-            can_shrink=False,
-        )
+        try:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                str(icon_path),
+                pixel_size,
+                pixel_size,
+                True,
+            )
+        except GLib.Error:
+            _log.warning("Packaged app logo unavailable; using a symbolic icon")
+            icon = Gtk.Image(icon_name="camera-video-symbolic", pixel_size=pixel_size)
+        else:
+            icon = Gtk.Picture(
+                paintable=Gdk.Texture.new_for_pixbuf(pixbuf),
+                content_fit=Gtk.ContentFit.CONTAIN,
+                can_shrink=False,
+            )
         icon.set_size_request(pixel_size, pixel_size)
         icon.set_halign(Gtk.Align.CENTER)
         icon.set_valign(Gtk.Align.CENTER)
