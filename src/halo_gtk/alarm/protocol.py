@@ -49,11 +49,14 @@ class DeviceDocument:
 
     zid: str
     data: Mapping[str, Any]
+    keypad_motion: bool = False
 
     def __post_init__(self) -> None:
         _validate_identifier(self.zid, "device zid")
         if not isinstance(self.data, Mapping):
             raise AlarmSchemaError("device data must be an object")
+        if type(self.keypad_motion) is not bool:
+            raise AlarmSchemaError("keypad motion must be a boolean")
         data = dict(self.data)
         if data.get("zid") != self.zid:
             raise AlarmSchemaError("device document zid does not match its data")
@@ -206,7 +209,7 @@ def _require_body(message: Mapping[str, Any]) -> list[Any]:
     return body
 
 
-def _flatten_device_document(value: object) -> DeviceDocument:
+def _flatten_device_document(value: object, *, realtime: bool = False) -> DeviceDocument:
     if not isinstance(value, dict):
         raise AlarmSchemaError("device document must be an object")
 
@@ -229,11 +232,30 @@ def _flatten_device_document(value: object) -> DeviceDocument:
     if not saw_versioned_document:
         raise AlarmSchemaError("device document has no supported versioned data")
     zid = _validate_identifier(flat.get("zid"), "device zid")
-    return DeviceDocument(zid=zid, data=flat)
+    impulse = value.get("impulse")
+    entries = impulse.get("v1") if isinstance(impulse, dict) else None
+    keypad_motion = (
+        realtime
+        and isinstance(entries, list)
+        and any(
+            isinstance(entry, dict) and entry.get("impulseType") == "keypad.motion"
+            for entry in entries
+        )
+    )
+    if keypad_motion:
+        general = value.get("general")
+        general_v2 = general.get("v2") if isinstance(general, dict) else None
+        if not isinstance(general_v2, dict) or general_v2.get("zid") != zid:
+            raise AlarmSchemaError("keypad impulse requires matching general.v2.zid")
+    return DeviceDocument(zid=zid, data=flat, keypad_motion=bool(keypad_motion))
 
 
-def _parse_device_documents(message: Mapping[str, Any]) -> tuple[DeviceDocument, ...]:
-    documents = tuple(_flatten_device_document(value) for value in _require_body(message))
+def _parse_device_documents(
+    message: Mapping[str, Any], *, realtime: bool = False
+) -> tuple[DeviceDocument, ...]:
+    documents = tuple(
+        _flatten_device_document(value, realtime=realtime) for value in _require_body(message)
+    )
     zids = [document.zid for document in documents]
     if len(zids) != len(set(zids)):
         raise AlarmSchemaError("device document batch contains duplicate zids")
@@ -342,7 +364,7 @@ def parse_clap_frame(
         asset_id = _validate_identifier(source, "device-update source")
         return DeviceInfoDocUpdate(
             asset_id=asset_id,
-            devices=_parse_device_documents(message),
+            devices=_parse_device_documents(message, realtime=True),
             sequence=sequence,
         )
     if message_type == "SessionInfo":
@@ -378,6 +400,25 @@ def encode_device_list_request(asset_id: str, sequence: int) -> dict[str, Any]:
         "msg": {
             "msg": "DeviceInfoDocGetList",
             "dst": asset_id,
+            "seq": sequence,
+        },
+    }
+
+
+def encode_keypad_brightness(asset_id: str, zid: str, brightness: int, sequence: int) -> dict:
+    """Build the exact keypad LED setting; never a generic device command."""
+    asset_id = _validate_outbound_identifier(asset_id, "asset_id")
+    zid = _validate_outbound_identifier(zid, "keypad_zid")
+    _validate_outbound_sequence(sequence)
+    if type(brightness) is not int or not 0 <= brightness <= 100:
+        raise ValueError("brightness must be an integer from 0 to 100")
+    return {
+        "channel": "message",
+        "msg": {
+            "msg": "DeviceInfoSet",
+            "datatype": "DeviceInfoSetType",
+            "dst": asset_id,
+            "body": [{"zid": zid, "device": {"v1": {"brightness": brightness / 100}}}],
             "seq": sequence,
         },
     }

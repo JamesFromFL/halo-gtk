@@ -158,6 +158,7 @@ class AlarmCapability(StrEnum):
     SWITCH = "switch"
     VALVE = "valve"
     SIREN = "siren"
+    KEYPAD_BRIGHTNESS = "keypad-brightness"
 
 
 @unique
@@ -269,12 +270,21 @@ class AlarmDeviceSnapshot:
     epoch: int = 0
     updated_at: float | None = None
 
+    keypad_brightness: int | None = None
+    keypad_proximity: TriState = TriState.UNKNOWN
+    keypad_proximity_at: float | None = None
+    keypad_proximity_monotonic: float | None = None
+
     def __post_init__(self) -> None:
         _validate_identity(self.location_id, "location_id")
         _validate_identity(self.asset_id, "asset_id")
         _validate_identity(self.zid, "zid")
         _validate_revision(self.revision)
         _validate_revision(self.epoch, "epoch")
+        if self.keypad_brightness is not None and (
+            type(self.keypad_brightness) is not int or not 0 <= self.keypad_brightness <= 100
+        ):
+            raise ValueError("keypad_brightness must be an integer from 0 to 100 or None")
         if not isinstance(self.name, str):
             raise ValueError("name must be a string")
         if self.room is not None and not isinstance(self.room, str):

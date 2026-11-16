@@ -18,6 +18,8 @@ is committed as `c9475b2`; the items below preserve the separate feature work.
   [Chime support](chime-support.md). Physical-device acceptance remains separate.
 - Alarm history pagination guard and coverage reporting: complete; see
   [history coverage](alarm-history-coverage.md). Persistent history is separate.
+- Qualified keypad brightness, local control lock and observed proximity:
+  complete; see [keypad support](keypad-support.md).
 
 ## 1. Maintenance and desktop baseline
 

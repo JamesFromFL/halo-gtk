@@ -613,6 +613,10 @@ class AlarmPage(Gtk.Box):
 
     def on_page_hidden(self):
         self._view_active = False
+        keypad_dialog = getattr(self, "_keypad_dialog", None)
+        if keypad_dialog is not None:
+            keypad_dialog.close()
+            self._keypad_dialog = None
         self._command_nonce += 1
         self._approval_ids.clear()
         if self._prepare_future is not None:
@@ -666,6 +670,15 @@ class AlarmPage(Gtk.Box):
             root.open_alarm_history(self._selected_location_id)
 
     def _present_device_details(self, device):
+        if device.raw_type == "security-keypad" and self._alarm_client is not None:
+            from halo_gtk.keypad_details import KeypadDetailsDialog
+
+            previous = getattr(self, "_keypad_dialog", None)
+            if previous is not None:
+                previous.close()
+            self._keypad_dialog = KeypadDetailsDialog(self._alarm_client, device)
+            self._keypad_dialog.present(self)
+            return
         lines = [_device_subtitle(device), f"Communication: {_connection_label(device.connection)}"]
         if device.room:
             lines.append(f"Room: {device.room}")
@@ -709,6 +722,10 @@ class AlarmPage(Gtk.Box):
         self._invalidate_command_state()
 
     def _invalidate_command_state(self) -> None:
+        keypad_dialog = getattr(self, "_keypad_dialog", None)
+        if keypad_dialog is not None:
+            keypad_dialog.close()
+            self._keypad_dialog = None
         self._command_nonce += 1
         if hasattr(self, "_approval_ids"):
             self._approval_ids.clear()

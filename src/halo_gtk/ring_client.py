@@ -1110,6 +1110,32 @@ class RingClient:
         self._require_alarm_location(location_id, generation)
         return result
 
+    def request_keypad_brightness(
+        self, location_id, asset_id, zid, brightness, *, expected_revision, intent
+    ):
+        return self.submit(
+            self._async_keypad_brightness(
+                location_id, asset_id, zid, brightness, expected_revision, intent
+            )
+        )
+
+    async def _async_keypad_brightness(
+        self, location_id, asset_id, zid, brightness, revision, intent
+    ):
+        from halo_gtk.alarm.keypads import KeypadResult
+
+        generation = self._published_generation
+        self._require_alarm_location(location_id, generation)
+        service = self._alarm_service
+        if service is None or not await self._async_refresh_alarm_discovery():
+            return KeypadResult("rejected", "discovery-unavailable")
+        self._require_alarm_location(location_id, generation)
+        if service is not self._alarm_service:
+            return KeypadResult("rejected", "session-changed")
+        return await service.keypads.request(
+            location_id, asset_id, zid, brightness, revision=revision, intent=intent
+        )
+
     def _create_alarm_service(
         self,
         generation: int,

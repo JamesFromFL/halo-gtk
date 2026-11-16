@@ -22,6 +22,7 @@ from halo_gtk.alarm.protocol import (
     HubDisconnection,
     encode_clap_frame,
     encode_device_list_request,
+    encode_keypad_brightness,
     encode_mode_command,
     parse_clap_frame,
 )
@@ -265,6 +266,21 @@ class RingAlarmTransport:
                 sequence,
                 bypass_ids,
             ),
+            epoch=epoch,
+            admission=admission,
+        )
+
+    async def send_keypad_brightness(
+        self, asset_id: str, zid: str, brightness: int, *, epoch: int, admission
+    ) -> None:
+        """Send one typed keypad setting on its current base-station socket."""
+        if not callable(admission) or not any(
+            asset.asset_id == asset_id and asset.kind == "base_station_v1"
+            for asset in self._assets
+        ):
+            raise AlarmCommandSupersededError("keypad-asset-unavailable")
+        await self._send_encoded(
+            lambda sequence: encode_keypad_brightness(asset_id, zid, brightness, sequence),
             epoch=epoch,
             admission=admission,
         )

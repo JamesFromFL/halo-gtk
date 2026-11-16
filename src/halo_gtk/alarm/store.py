@@ -7,6 +7,7 @@ import math
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, TypeAlias
 
 from halo_gtk.alarm.models import (
@@ -189,6 +190,7 @@ _RETAINED_SCALAR_FIELDS = {
     "transitionDelayEndTimestamp",
     "alarmStatus",
     "commStatus",
+    "brightness",
 }
 _RETAINED_NESTED_FIELDS = {
     "siren": ("state",),
@@ -547,6 +549,13 @@ def _kind(
     return AlarmDeviceKind.UNKNOWN
 
 
+def keypad_brightness(value: object) -> int | None:
+    """Normalize the evidenced Ring LED range without boolean/string coercion."""
+    if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
+        return None
+    return int((Decimal(str(value)) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
 def _capabilities(data: Mapping[str, Any], raw_type: str) -> frozenset[AlarmCapability]:
     capabilities = set(_TYPE_CAPABILITIES.get(raw_type, ()))
     field_capabilities = {
@@ -578,6 +587,10 @@ def _capabilities(data: Mapping[str, Any], raw_type: str) -> frozenset[AlarmCapa
             capabilities.add(AlarmCapability.SMOKE)
         if _mapping(components.get("alarm.co")) is not None:
             capabilities.add(AlarmCapability.CARBON_MONOXIDE)
+    if raw_type == "security-keypad":
+        capabilities.discard(AlarmCapability.MOTION)
+        if keypad_brightness(data.get("brightness")) is not None:
+            capabilities.add(AlarmCapability.KEYPAD_BRIGHTNESS)
     return frozenset(capabilities)
 
 
@@ -716,7 +729,10 @@ def _normalize_device(
             if kind in {AlarmDeviceKind.CONTACT_SENSOR, AlarmDeviceKind.RETROFIT_ZONE}
             else TriState.UNKNOWN
         ),
-        motion=motion,
+        motion=motion if raw_type != "security-keypad" else TriState.UNKNOWN,
+        keypad_brightness=(
+            keypad_brightness(data.get("brightness")) if raw_type == "security-keypad" else None
+        ),
         glass_break=faulted if kind is AlarmDeviceKind.GLASS_BREAK_SENSOR else TriState.UNKNOWN,
         tilt=faulted if kind is AlarmDeviceKind.TILT_SENSOR else TriState.UNKNOWN,
         flood=_nested_tri(

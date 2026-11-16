@@ -12,6 +12,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from typing import Any
 
+from halo_gtk.alarm.keypads import KeypadController
 from halo_gtk.alarm.models import (
     AlarmAccountSnapshot,
     AlarmCapability,
@@ -203,6 +204,7 @@ class RingAlarmService:
         self._reconcile_revision = 0
         self._running = False
         self._closed = False
+        self.keypads = KeypadController(self)
         self._close_task: asyncio.Task[None] | None = None
         for seed in self._seeds.values():
             self._store.register_location(
@@ -247,6 +249,7 @@ class RingAlarmService:
         await asyncio.shield(task)
 
     async def _close_impl(self) -> None:
+        await self.keypads.close()
         for pending in tuple(self._pending.values()):
             if not pending.future.done():
                 pending.future.set_exception(_CommandConnectionLost("service-closed"))
@@ -858,6 +861,7 @@ class RingAlarmService:
                         epoch=runtime.epoch,
                     )
         location = self._store.snapshot.find_location(runtime.seed.location_id)
+        self.keypads.observe(runtime, message, previous)
         if location is not None and location.inventory is AlarmInventoryStatus.COMPLETE:
             runtime.phase = (
                 "online" if location.connection is AlarmConnectionStatus.ONLINE else "degraded"
@@ -1313,7 +1317,7 @@ class RingAlarmService:
         return faulted if len(faulted) <= 256 else None
 
     def _publish(self, *, status: AlarmServiceStatus | None = None) -> None:
-        base = self._store.snapshot
+        base = self.keypads.decorate(self._store.snapshot)
         decorated_locations = tuple(
             self._decorate_location(location) for location in base.locations
         )
