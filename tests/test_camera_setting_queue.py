@@ -257,6 +257,22 @@ def test_sdk_exception_text_is_not_sent_to_ui(queue_fixture):
     assert "could not confirm" in outcomes[0][0]
 
 
+def test_accepted_motion_write_with_failed_readback_is_not_reported_as_write_failure(queue_fixture):
+    from halo_gtk.camera_privacy import CameraPrivacyReadbackError
+
+    client, key = queue_fixture
+    outcomes = []
+    module._SettingQueue.enqueue(
+        key, client, request(client, False, finished=lambda *args: outcomes.append(args))
+    )
+    wait_for(lambda: len(client.futures) == 1)
+    client.futures[0].set_exception(CameraPrivacyReadbackError("private transport detail"))
+    wait_for(lambda: key not in module._setting_queues)
+    assert len(outcomes) == 1 and outcomes[0][1] is True
+    assert "accepted" in outcomes[0][0] and "Media stays hidden" in outcomes[0][0]
+    assert "private transport" not in outcomes[0][0]
+
+
 def test_stopped_client_is_rejected_even_if_pointer_still_matches(monkeypatch):
     client = SimpleNamespace(_published_generation=4, _stopped=False)
     window = module.CameraSettingsWindow.__new__(module.CameraSettingsWindow)

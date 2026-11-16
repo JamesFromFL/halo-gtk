@@ -9,6 +9,8 @@ import time
 
 import gi
 
+from halo_gtk import camera_privacy
+
 gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 
@@ -412,6 +414,18 @@ class CameraTile(Gtk.Frame):
         self._stream_state_box.append(self._stream_state_icon)
         self._stream_state_box.append(self._stream_state_label)
         picture_overlay.add_overlay(self._stream_state_box)
+        self._privacy_label = Gtk.Label(
+            xalign=0,
+            wrap=True,
+            halign=Gtk.Align.FILL,
+            valign=Gtk.Align.END,
+            margin_start=12,
+            margin_end=12,
+            margin_bottom=12,
+            css_classes=["caption", "camera-overlay"],
+            visible=False,
+        )
+        picture_overlay.add_overlay(self._privacy_label)
         box.append(picture_overlay)
 
         footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=9)
@@ -574,6 +588,24 @@ class CameraTile(Gtk.Frame):
     # ------------------------------------------------------------------
     # Snapshot
     # ------------------------------------------------------------------
+
+    def clear_snapshot(self) -> None:
+        self.aspect_box.set_paintable(None)
+        self._snapshot_loaded_at = 0.0
+        self._timer_label.set_visible(False)
+
+    def refresh_privacy(self) -> None:
+        view = camera_privacy.current_view(self.device)
+        self._privacy_label.set_label(view.message)
+        self._privacy_label.set_visible(view.reason != "allowed")
+        if view.preview_allowed is not True:
+            self.clear_snapshot()
+        if self._live_monitoring:
+            if view.live_allowed is not True:
+                self.stop_live_monitoring()
+            elif view.audio_allowed is not True:
+                self.stop_talking()
+            self._set_stream_controls_sensitive(self._live_active)
 
     def set_snapshot(self, png_bytes: bytes, *, motion_detection_off: bool = False) -> None:
         """Update the thumbnail from raw PNG bytes (GTK main thread)."""
@@ -739,6 +771,9 @@ class CameraTile(Gtk.Frame):
     def start_live_monitoring(self, volume: float = 0.0, *, max_streams: int | None = None) -> bool:
         if not self._live_monitoring:
             return False
+        if camera_privacy.current_view(self.device).live_allowed is not True:
+            self.refresh_privacy()
+            return False
         if self._live_active:
             session = get_live_session_manager().session_for(self.device.id)
             if session is not None and session.active and LIVE_MONITORING_OWNER in session.owners:
@@ -813,9 +848,11 @@ class CameraTile(Gtk.Frame):
     def _set_stream_controls_sensitive(self, sensitive: bool) -> None:
         if not hasattr(self, "_mic_btn"):
             return
-        self._mic_btn.set_sensitive(sensitive and self._intercom_supported)
-        self._volume_btn.set_sensitive(sensitive)
-        self._volume_scale.set_sensitive(sensitive)
+        privacy = camera_privacy.current_view(self.device)
+        audio = sensitive and privacy.live_allowed is True and privacy.audio_allowed is True
+        self._mic_btn.set_sensitive(audio and self._intercom_supported)
+        self._volume_btn.set_sensitive(audio)
+        self._volume_scale.set_sensitive(audio)
 
     def _set_volume_state(self, value: float) -> None:
         volume = max(0.0, min(1.0, value))
@@ -1050,6 +1087,7 @@ class CamerasPage(Gtk.Box):
         self._refresh_timers: dict[int, int] = {}
         # device_id → last good PNG bytes; survives grid rebuilds for cache-first display.
         self._snapshot_cache: dict[int, bytes] = {}
+        self._snapshot_cache_leases: dict[int, camera_privacy.PrivacyLease] = {}
         self._snapshot_generation = 0
         self._snapshot_cancel_event = threading.Event()
         self._snapshot_inflight_generations: dict[int, int] = {}
@@ -1078,8 +1116,21 @@ class CamerasPage(Gtk.Box):
         self._current_saved_layout_id: str | None = None
         self._current_layout_label = live_layouts.DEFAULT_LAYOUT_NAME
         self._build_ui()
+        self._privacy_watch = camera_privacy.PrivacyWatch(self._refresh_camera_privacy)
+
+    def _refresh_camera_privacy(self) -> None:
+        for device_id in tuple(self._snapshot_cache):
+            if not camera_privacy.lease_is_current(self._snapshot_cache_leases.get(device_id)):
+                self._snapshot_cache.pop(device_id, None)
+                self._snapshot_cache_leases.pop(device_id, None)
+                tile = self._cards.get(device_id)
+                if tile is not None:
+                    tile.clear_snapshot()
+        for tile in self._cards.values():
+            tile.refresh_privacy()
 
     def do_unroot(self) -> None:
+        self._privacy_watch.close()
         self.stop_live_monitoring()
         self.deactivate_snapshot_updates()
         self._clear_grid()
@@ -2145,6 +2196,7 @@ class CamerasPage(Gtk.Box):
         self._layout_btn.set_active(False)
         self._clear_grid()
         self._snapshot_cache.clear()
+        self._snapshot_cache_leases.clear()
         self._monitoring_active = False
         self._update_monitoring_buttons()
         self._show_empty_monitoring_inspector()
@@ -2238,7 +2290,10 @@ class CamerasPage(Gtk.Box):
 
             cached = self._snapshot_cache.get(device.id)
             if cached is not None:
-                self._set_card_snapshot(device.id, cached)
+                self._set_card_snapshot(
+                    device.id, cached, lease=self._snapshot_cache_leases.get(device.id)
+                )
+            tile.refresh_privacy()
 
             self._queue_snapshot_load(device, restart_timer=True)
 
@@ -2287,6 +2342,9 @@ class CamerasPage(Gtk.Box):
     ) -> None:
         if not self._snapshot_updates_active:
             return
+        if camera_privacy.acquire_current(device, "preview") is None:
+            self._refresh_camera_privacy()
+            return
         device_id = int(device.id)
         generation = self._snapshot_generation
         if restart_timer:
@@ -2320,6 +2378,9 @@ class CamerasPage(Gtk.Box):
         client = get_client()
         if client is None:
             return
+        lease = camera_privacy.acquire_current(device, "preview")
+        if lease is None:
+            return
 
         def fetch(method, *args):
             if cancel_event is not None and cancel_event.is_set():
@@ -2346,7 +2407,7 @@ class CamerasPage(Gtk.Box):
             base = bytes(png_bytes) if png_bytes else _make_dark_placeholder()
             img = _apply_preview_blur(base)
             if img:
-                self._queue_card_snapshot_update(device.id, img, False, generation)
+                self._queue_card_snapshot_update(device.id, img, False, generation, lease)
             return
 
         if not getattr(device, "motion_detection", True):
@@ -2363,7 +2424,7 @@ class CamerasPage(Gtk.Box):
             base = bytes(png_bytes) if png_bytes else _make_dark_placeholder()
             img = _apply_motion_off_overlay(base)
             if img:
-                self._queue_card_snapshot_update(device.id, img, True, generation)
+                self._queue_card_snapshot_update(device.id, img, True, generation, lease)
             return
 
         png_bytes: bytes | None = None
@@ -2378,7 +2439,7 @@ class CamerasPage(Gtk.Box):
         if cancel_event is not None and cancel_event.is_set():
             return
         if png_bytes:
-            self._queue_card_snapshot_update(device.id, bytes(png_bytes), False, generation)
+            self._queue_card_snapshot_update(device.id, bytes(png_bytes), False, generation, lease)
         else:
             _log.debug("No snapshot available for %s", device.name)
 
@@ -2388,10 +2449,11 @@ class CamerasPage(Gtk.Box):
         png_bytes: bytes,
         motion_off: bool,
         generation: int | None,
+        lease: camera_privacy.PrivacyLease | None = None,
     ) -> None:
         # All callers pass a generation; _set_card_snapshot treats None as
         # "always apply", so this single call covers both.
-        GLib.idle_add(self._set_card_snapshot, device_id, png_bytes, motion_off, generation)
+        GLib.idle_add(self._set_card_snapshot, device_id, png_bytes, motion_off, generation, lease)
 
     def _set_card_snapshot(
         self,
@@ -2399,11 +2461,15 @@ class CamerasPage(Gtk.Box):
         png_bytes: bytes,
         motion_off: bool = False,
         generation: int | None = None,
+        lease: camera_privacy.PrivacyLease | None = None,
     ) -> bool:
         if generation is not None and generation != self._snapshot_generation:
             return GLib.SOURCE_REMOVE
+        if not camera_privacy.lease_is_current(lease):
+            return GLib.SOURCE_REMOVE
 
         self._snapshot_cache[device_id] = png_bytes
+        self._snapshot_cache_leases[device_id] = lease
         tile = self._cards.get(device_id)
         if tile is not None:
             tile.set_snapshot(png_bytes, motion_detection_off=motion_off)
@@ -2489,7 +2555,12 @@ class CamerasPage(Gtk.Box):
         self._on_open_live_focus(
             device,
             "cameras" if self._show_monitoring_controls else "dashboard",
-            self._snapshot_cache.get(device.id),
+            camera_privacy.CameraPreview(
+                self._snapshot_cache[device.id], self._snapshot_cache_leases[device.id]
+            )
+            if device.id in self._snapshot_cache
+            and camera_privacy.lease_is_current(self._snapshot_cache_leases.get(device.id))
+            else None,
         )
 
     def _on_tile_light_toggle(self, device, active: bool) -> None:

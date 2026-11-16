@@ -8,6 +8,8 @@ from datetime import datetime
 
 import gi
 
+from halo_gtk import camera_privacy
+
 gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 
@@ -53,11 +55,14 @@ class FocusedLivePage(Gtk.Box):
         self._drag_start_x = 0.0
         self._drag_start_y = 0.0
         self._still_paintable = None
+        self._still_privacy_lease = None
         self._live_ready_source_id: int | None = None
 
         self._build_ui()
+        self._privacy_watch = camera_privacy.PrivacyWatch(self._refresh_privacy)
 
     def do_unroot(self) -> None:
+        self._privacy_watch.close()
         self.leave()
         Gtk.Box.do_unroot(self)
 
@@ -79,6 +84,8 @@ class FocusedLivePage(Gtk.Box):
         self._model_label.add_css_class("halo-page-subtitle")
         title_copy.append(self._title_label)
         title_copy.append(self._model_label)
+        self._privacy_label = Gtk.Label(xalign=0, wrap=True, css_classes=["caption"])
+        title_copy.append(self._privacy_label)
         top_bar.append(title_copy)
 
         self._settings_btn = Gtk.Button(
@@ -179,7 +186,7 @@ class FocusedLivePage(Gtk.Box):
         self._mic_btn.connect("toggled", self._on_mic_toggled)
         transport_controls.append(self._mic_btn)
 
-        screenshot_btn = Gtk.Button(
+        screenshot_btn = self._screenshot_btn = Gtk.Button(
             icon_name="camera-photo-symbolic",
             tooltip_text="Save screenshot",
         )
@@ -271,7 +278,7 @@ class FocusedLivePage(Gtk.Box):
         device,
         *,
         max_streams: int = 4,
-        initial_snapshot: bytes | None = None,
+        initial_snapshot: camera_privacy.CameraPreview | None = None,
     ) -> None:
         previous = getattr(self, "_still_cancel_event", None)
         if previous is not None:
@@ -286,10 +293,17 @@ class FocusedLivePage(Gtk.Box):
             model = ""
         self._model_label.set_label(model or "Ring camera")
         self._cancel_live_ready_poll()
-        if initial_snapshot:
-            self._set_still_paintable(initial_snapshot)
+        self._clear_video_box()
+        if (
+            isinstance(initial_snapshot, camera_privacy.CameraPreview)
+            and initial_snapshot.lease.device is device
+            and camera_privacy.lease_is_current(initial_snapshot.lease)
+        ):
+            self._still_privacy_lease = initial_snapshot.lease
+            self._set_still_paintable(initial_snapshot.data)
         else:
             self._load_snapshot_still(device)
+        self._refresh_privacy()
         self._refresh_status_icons()
         self._refresh_device_capability_controls()
         existing_session = get_live_session_manager().session_for(device.id)
@@ -318,6 +332,9 @@ class FocusedLivePage(Gtk.Box):
 
     def _start_session(self) -> None:
         if self._device is None:
+            return
+        if camera_privacy.current_view(self._device).live_allowed is not True:
+            self._refresh_privacy()
             return
         try:
             self._session = get_live_session_manager().acquire(
@@ -350,6 +367,7 @@ class FocusedLivePage(Gtk.Box):
         if self._session is not None:
             png = self._session.get_current_frame_png()
             if png:
+                self._still_privacy_lease = camera_privacy.acquire_current(self._device, "preview")
                 self._set_still_paintable(png)
             elif self._still_paintable is not None:
                 self._video_view.set_paintable(self._still_paintable)
@@ -364,6 +382,30 @@ class FocusedLivePage(Gtk.Box):
         self._video_view.set_paintable(None)
         self._video_view.reset_pan()
         self._still_paintable = None
+        self._still_privacy_lease = None
+
+    def _refresh_privacy(self) -> None:
+        if self._device is None:
+            return
+        view = camera_privacy.current_view(self._device)
+        self._privacy_label.set_label(view.message)
+        self._privacy_label.set_visible(view.reason != "allowed")
+        if self._still_paintable is not None and not camera_privacy.lease_is_current(
+            self._still_privacy_lease
+        ):
+            self._clear_video_box()
+        if view.live_allowed is not True:
+            self._stop_talking()
+            get_live_session_manager().release(self._device.id, owner=FOCUSED_OWNER)
+            self._session = None
+            self._clear_video_box()
+            self._cancel_live_ready_poll()
+        elif view.audio_allowed is not True:
+            self._stop_talking()
+        session = self._session
+        if session is not None and session.get_paintable() is None:
+            self._video_view.set_paintable(None)
+        self._set_controls_sensitive(session is not None and session.active)
 
     def _show_session_paintable(self) -> None:
         paintable = self._session.get_paintable() if self._session is not None else None
@@ -371,6 +413,8 @@ class FocusedLivePage(Gtk.Box):
         self._video_view.reset_pan()
 
     def _set_still_paintable(self, png_bytes: bytes) -> bool:
+        if not camera_privacy.lease_is_current(self._still_privacy_lease):
+            return False
         texture = _texture_from_png(png_bytes)
         if texture is None:
             return False
@@ -380,6 +424,9 @@ class FocusedLivePage(Gtk.Box):
         return True
 
     def _load_snapshot_still(self, device) -> None:
+        lease = camera_privacy.acquire_current(device, "preview")
+        if lease is None:
+            return
         device_id = getattr(device, "id", None)
         generation = self._view_generation
         previous = getattr(self, "_still_cancel_event", None)
@@ -402,20 +449,26 @@ class FocusedLivePage(Gtk.Box):
             except Exception as exc:
                 _log.debug("Focused still snapshot failed for %s: %s", device.name, exc)
             if png_bytes and not cancel_event.is_set():
-                GLib.idle_add(self._set_loaded_still, device_id, bytes(png_bytes), generation)
+                GLib.idle_add(
+                    self._set_loaded_still, device_id, bytes(png_bytes), generation, lease
+                )
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _set_loaded_still(self, device_id: int | None, png_bytes: bytes, generation: int) -> bool:
+    def _set_loaded_still(
+        self, device_id: int | None, png_bytes: bytes, generation: int, lease=None
+    ) -> bool:
         if (
             generation != self._view_generation
             or self._device is None
             or getattr(self._device, "id", None) != device_id
+            or not camera_privacy.lease_is_current(lease)
         ):
             return GLib.SOURCE_REMOVE
         # Do not overwrite a live stream that already has its first frame.
         if self._session is not None and self._session.get_current_frame_png() is not None:
             return GLib.SOURCE_REMOVE
+        self._still_privacy_lease = lease
         self._set_still_paintable(png_bytes)
         return GLib.SOURCE_REMOVE
 
@@ -448,11 +501,16 @@ class FocusedLivePage(Gtk.Box):
         return 1.0 if _cfg.load().get("live_monitoring_unmute_on_start", False) else 0.0
 
     def _set_controls_sensitive(self, sensitive: bool) -> None:
-        self._play_btn.set_sensitive(not sensitive)
+        view = camera_privacy.current_view(self._device)
+        self._play_btn.set_sensitive(not sensitive and view.live_allowed is True)
         self._stop_btn.set_sensitive(sensitive)
-        self._mic_btn.set_sensitive(sensitive and self._intercom_supported)
-        self._volume_btn.set_sensitive(sensitive)
-        self._volume_scale.set_sensitive(sensitive)
+        audio = sensitive and view.live_allowed is True and view.audio_allowed is True
+        self._mic_btn.set_sensitive(audio and self._intercom_supported)
+        self._volume_btn.set_sensitive(audio)
+        self._volume_scale.set_sensitive(audio)
+        screenshot = getattr(self, "_screenshot_btn", None)
+        if screenshot is not None:
+            screenshot.set_sensitive(sensitive and view.preview_allowed is True)
 
     def _refresh_status_icons(self) -> None:
         if self._device is None:
@@ -541,6 +599,9 @@ class FocusedLivePage(Gtk.Box):
 
         if self._session is None:
             return
+        lease = camera_privacy.acquire_current(self._device, "preview")
+        if lease is None:
+            return
         png = self._session.get_current_frame_png()
         if png is None:
             return
@@ -548,6 +609,8 @@ class FocusedLivePage(Gtk.Box):
         if zoomed_png is not None:
             png = zoomed_png
         camera_name = device_names.display_name(self._device) if self._device is not None else None
+        if not camera_privacy.lease_is_current(lease):
+            return
         try:
             dest = media_paths.snapshot_dir(camera_name)
             media_paths.write_unique_bytes(

@@ -3,6 +3,7 @@
 import asyncio
 import fractions
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import av
@@ -187,13 +188,19 @@ async def test_three_h264_audio_loopback_renewals_with_simulated_ptt(monkeypatch
                 monkeypatch.setattr(live_stream, "activate_ring_camera_speaker", fake_speaker)
                 resources = _StreamResources(
                     token=generation,
-                    device=object(),
+                    device=SimpleNamespace(id=1),
                     client=object(),
                     session_id=f"fake-{generation}",
                     mic_track=microphone,
                     connected=True,
                     talkback_requested=True,
                     talkback_generation=1,
+                )
+                from tests.privacy_helpers import grant
+
+                resources.client = grant(resources.client, resources.device)
+                resources.privacy_lease = resources.client.camera_privacy.acquire(
+                    resources.device, "live"
                 )
                 view = LiveStreamView.__new__(LiveStreamView)
                 view._resources, view._stream_token, view._closing = resources, generation, False
@@ -237,6 +244,10 @@ async def test_cancel_halo_startup_closes_real_peer_without_ring(monkeypatch):
 
     monkeypatch.setattr(live_stream.GLib, "idle_add", lambda *args: None)
     resources = _StreamResources(token=1, device=Device(), client=object(), session_id="fake")
+    from tests.privacy_helpers import grant
+
+    resources.client = grant(resources.client, resources.device)
+    resources.privacy_lease = resources.client.camera_privacy.acquire(resources.device, "live")
     view = LiveStreamView.__new__(LiveStreamView)
     view._resources, view._stream_token, view._closing = resources, 1, False
     with patch("aioice.ice.get_host_addresses", return_value=["127.0.0.1"]):

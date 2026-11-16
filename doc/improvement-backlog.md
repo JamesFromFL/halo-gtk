@@ -13,7 +13,10 @@ is committed as `c9475b2`; the items below preserve the separate feature work.
 - Local notification rules, snooze and quiet hours: complete; see
   [notification rules](notification-rules.md). Critical Alarm preferences retain
   their existing master controls.
-- Camera privacy, receive-path recovery and device controls: in progress.
+- Camera privacy and live-preview coordination: complete; see
+  [camera privacy](camera-privacy.md). Ring receipt delays and live-device
+  acceptance remain explicit limitations.
+- Remaining device controls: in progress.
 - Chime snooze/resume and qualified automatic nightlight: complete; see
   [Chime support](chime-support.md). Physical-device acceptance remains separate.
 - Alarm history pagination guard and coverage reporting: complete; see

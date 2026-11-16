@@ -9,6 +9,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 This section tracks the work toward Halo GTK's first tagged release.
 
 ### Added
+- Fresh Ring camera privacy checks for previews, live video, listening and
+  talkback, with visible unknown/stale states and immediate local media revocation.
 - Keypad LED brightness with explicit Apply, a persistent local permission/lock,
   fresh ownership and connection checks, and qualified live proximity observations.
 - Qualified Chime snooze/resume and automatic-nightlight settings, with explicit
@@ -90,6 +92,8 @@ This section tracks the work toward Halo GTK's first tagged release.
   compatibility contracts.
 
 ### Fixed
+- Preview refreshes reuse an authorized live frame or Ring's cached snapshot
+  while streaming, avoiding fresh snapshot requests that can interrupt live view.
 - Alarm history stops on ambiguous overlapping pages and at the supported offset
   bound. Coverage shows source-row counts, unsupported rows and retrieval time;
   partial fields remain partial across multi-page reads.

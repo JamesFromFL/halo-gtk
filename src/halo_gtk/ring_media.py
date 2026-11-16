@@ -406,8 +406,9 @@ class MicrophoneTrack(AudioStreamTrack):
 
     kind = "audio"
 
-    def __init__(self) -> None:
+    def __init__(self, *, capture_allowed=None) -> None:
         super().__init__()
+        self._capture_allowed = capture_allowed or (lambda: True)
         self._active = False
         self._mic_pipeline: Gst.Pipeline | None = None
         self._mic_appsink: Gst.Element | None = None
@@ -422,6 +423,8 @@ class MicrophoneTrack(AudioStreamTrack):
 
     async def start_capture(self) -> None:
         """Start the GStreamer pulsesrc pipeline and begin sending mic audio."""
+        if not self._capture_allowed():
+            raise RuntimeError("Ring privacy does not allow microphone capture")
         if self._active:
             return
         pipeline = Gst.parse_launch(
@@ -437,6 +440,8 @@ class MicrophoneTrack(AudioStreamTrack):
                 raise RuntimeError("Microphone pipeline did not provide an audio sink")
             if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
                 raise RuntimeError("Microphone pipeline could not start")
+            if not self._capture_allowed():
+                raise RuntimeError("Ring privacy changed during microphone startup")
         except BaseException:
             pipeline.set_state(Gst.State.NULL)
             raise
@@ -518,7 +523,7 @@ class MicrophoneTrack(AudioStreamTrack):
         frame.time_base = fractions.Fraction(1, MIC_SAMPLE_RATE)
 
         appsink = self._mic_appsink
-        if self._active and appsink is not None:
+        if self._active and appsink is not None and self._capture_allowed():
             loop = asyncio.get_running_loop()
             try:
                 raw = await loop.run_in_executor(None, self._pull_sample_blocking, appsink)
@@ -527,6 +532,7 @@ class MicrophoneTrack(AudioStreamTrack):
                     and self._active
                     and self._mic_appsink is appsink
                     and self.readyState == "live"
+                    and self._capture_allowed()
                 ):
                     # Pad or trim to exactly the expected frame size.
                     needed = MIC_SAMPLES * 2  # S16LE = 2 bytes per sample

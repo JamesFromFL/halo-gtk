@@ -15,6 +15,7 @@ from gi.repository import Adw, Gdk, GdkPixbuf, Gtk  # noqa: E402
 
 from halo_gtk import APP_ID, config, device_names  # noqa: E402
 from halo_gtk.alarm_page import AlarmPage  # noqa: E402
+from halo_gtk.camera_privacy import CameraPreview  # noqa: E402
 from halo_gtk.cameras_page import CamerasPage  # noqa: E402
 from halo_gtk.dashboard_page import DashboardPage  # noqa: E402
 from halo_gtk.devices_page import DevicesPage  # noqa: E402
@@ -481,7 +482,7 @@ class RingWindow(Adw.ApplicationWindow):
         self,
         device,
         source_page: str,
-        initial_snapshot: bytes | None = None,
+        initial_snapshot: CameraPreview | None = None,
     ) -> None:
         if self._active_page_name == "focused_live":
             source_page = self._focused_source_page or source_page

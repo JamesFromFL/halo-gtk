@@ -67,6 +67,13 @@ from halo_gtk.alarm.provider import (
 )
 from halo_gtk.alarm.rest import DEVICES_ENDPOINT, LOCATIONS_ENDPOINT
 from halo_gtk.alarm.rest import RingAlarmRestGateway as _RingAlarmRestGateway
+from halo_gtk.camera_privacy import (
+    CAMERA_FAMILIES,
+    CameraPrivacy,
+    CameraPrivacyReadbackError,
+    privacy_time,
+    ring_privacy_receipt,
+)
 from halo_gtk.chime_client import ChimeClientState
 from halo_gtk.intercom_client import IntercomClientState
 from halo_gtk.light_groups_client import LightGroupsClientState
@@ -116,6 +123,7 @@ _ALARM_DISCOVERY_RECORD_LIMIT = 1_024
 _ALARM_DISCOVERY_LOCATION_LIMIT = 128
 _ALARM_DISCOVERY_IDENTIFIER_LIMIT = 512
 _PREVIEW_CALL_SLOTS = threading.BoundedSemaphore(2)
+_CAMERA_PREVIEW_LEASE = ContextVar("camera_preview_lease", default=None)
 
 
 def _bounded_preview(method):
@@ -125,7 +133,19 @@ def _bounded_preview(method):
     async def call(self, *args, **kwargs):
         task = asyncio.current_task()
         entered = False
+        context_token = None
         try:
+            admission = _CAMERA_PREVIEW_LEASE.get()
+            if admission is None:
+                if method.__name__ == "_async_history_snapshot_bytes":
+                    return None
+                device = args[0] if args else None
+                if method.__name__ == "_async_cached_snapshot_bytes":
+                    device = self.get_device_by_id(device)
+                lease = self.camera_privacy.acquire(device, "preview")
+                if lease is None:
+                    return None
+                context_token = _CAMERA_PREVIEW_LEASE.set((self, lease))
             async with asyncio.timeout(_PREVIEW_CALL_TIMEOUT):
                 with self._preview_tasks_lock:
                     nested = task in self._preview_tasks
@@ -147,6 +167,8 @@ def _bounded_preview(method):
         except TimeoutError:
             return None
         finally:
+            if context_token is not None:
+                _CAMERA_PREVIEW_LEASE.reset(context_token)
             if entered:
                 with self._preview_tasks_lock:
                     self._preview_tasks[task] -= 1
@@ -603,6 +625,11 @@ class RingClient:
         token_updater: Callable[[dict], None] | None = None,
     ) -> None:
         self._ring = None
+        self.camera_privacy = CameraPrivacy()
+        self._privacy_future = None
+        self._media_resources = set()
+        self._media_resources_lock = threading.Lock()
+        self._inventory_refresh_lock = asyncio.Lock()
         self._authenticated = False
         self._token_updater = token_updater or _save_token
         self._pending_auth_token: dict | None = None
@@ -788,6 +815,7 @@ class RingClient:
 
         self._authenticated = False
         self._ring = None
+        self.camera_privacy.invalidate()
         self._pending_auth_token = None
 
         # Always do a fresh OAuth exchange — never shortcut via the cache on an
@@ -811,7 +839,7 @@ class RingClient:
             )
             await ring.async_update_data()
             self._finish_authentication(auth, ring)
-            self._last_device_update_at = time.monotonic()
+            self._record_camera_privacy_receipt()
             _log.info(
                 "Ring authenticated — %d device(s) found",
                 len(ring.devices().all_devices),
@@ -826,6 +854,7 @@ class RingClient:
 
         self._authenticated = False
         self._ring = None
+        self.camera_privacy.invalidate()
         self._pending_auth_token = None
         auth = Auth(_APP_USER_AGENT, token, self._capture_auth_token)
         _install_serialized_auth_refresh(auth)
@@ -839,7 +868,7 @@ class RingClient:
             # can delete the stale secret.
             await ring.async_update_data()
             self._finish_authentication(auth, ring)
-            self._last_device_update_at = time.monotonic()
+            self._record_camera_privacy_receipt()
         except BaseException:
             self._pending_auth_token = None
             await self._close_auth(auth)
@@ -886,9 +915,7 @@ class RingClient:
             raise RuntimeError("Not signed in to Ring")
 
         await self._ring.auth.async_refresh_tokens()
-        await self._ring.async_update_data()
-        self._last_device_update_at = time.monotonic()
-        await self._async_reconcile_alarm_discovery()
+        await self._async_refresh_devices(None, -1)
 
     async def _async_reconcile_alarm_discovery(self) -> None:
         service = self._alarm_service
@@ -1482,16 +1509,71 @@ class RingClient:
         families: set[str] | frozenset[str] | None,
         max_age_seconds: int = _DEVICE_REFRESH_TTL,
     ) -> list:
-        if time.monotonic() - self._last_device_update_at > max_age_seconds:
-            await self._ring.async_update_data()
-            self._last_device_update_at = time.monotonic()
-            await self._async_reconcile_alarm_discovery()
+        async with self._inventory_refresh_lock:
+            if privacy_time() - self._last_device_update_at > max_age_seconds:
+                await self._ring.async_update_data()
+                self._record_camera_privacy_receipt()
+                await self._async_reconcile_alarm_discovery()
         devices = list(self._ring.devices().all_devices)
         if families is None:
             return devices
         return [
             device for device in devices if (getattr(device, "family", None) or "other") in families
         ]
+
+    def _record_camera_privacy_receipt(self) -> None:
+        # Called in the Ring loop immediately after a successful GET. A cached
+        # inventory read must never extend the privacy freshness deadline.
+        self._last_device_update_at = privacy_time()
+        cameras = [
+            device
+            for device in self.all_devices
+            if getattr(device, "family", None) in CAMERA_FAMILIES
+        ]
+        self.camera_privacy.observe(ring_privacy_receipt(cameras, self._last_device_update_at))
+
+    async def _async_refresh_camera_privacy(self) -> None:
+        while self._preview_is_current():
+            try:
+                async with asyncio.timeout(30):
+                    await self._async_refresh_devices(None, 60)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # The last successful receipt expires naturally; errors and
+                # partially updated SDK attributes cannot grant permission.
+                _log.debug("Camera privacy refresh failed: %s", exc)
+            await asyncio.sleep(30)
+
+    async def _async_camera_privacy_setting(self, device, invoke):
+        # Share the inventory admission lock so an older in-flight GET cannot
+        # restore media after this setting has started changing.
+        async with self._inventory_refresh_lock:
+            if not self._preview_is_current() or not any(d is device for d in self.all_devices):
+                raise SessionSupersededError("The camera or Ring session changed")
+            token = self.camera_privacy.begin_change(device)
+            try:
+                await invoke()
+            finally:
+                self.camera_privacy.end_change(token)
+            if self._preview_is_current():
+                try:
+                    await self._ring.async_update_data()
+                    self._record_camera_privacy_receipt()
+                except Exception as exc:
+                    raise CameraPrivacyReadbackError(
+                        "Ring accepted the change, but privacy could not be verified."
+                    ) from exc
+
+    def retain_media_resources(self, resources) -> None:
+        with self._media_resources_lock:
+            if self._stopped:
+                raise SessionSupersededError("The Ring client stopped before media admission")
+            self._media_resources.add(resources)
+
+    def release_media_resources(self, resources) -> None:
+        with self._media_resources_lock:
+            self._media_resources.discard(resources)
 
     def get_device_by_id(self, device_id: int) -> Any | None:
         """Return a Ring device by API id."""
@@ -1660,6 +1742,10 @@ class RingClient:
         if device is None:
             return {}
 
+        lease = self.camera_privacy.acquire(device, "preview")
+        if lease is None or not self._preview_is_current():
+            return {}
+
         history_event = None
         description = None
         if event_id is not None:
@@ -1673,6 +1759,9 @@ class RingClient:
                 )
 
         image_bytes = await self._async_event_preview_bytes(device, event_id, event, history_event)
+
+        if not self.camera_privacy.valid(lease) or not self._preview_is_current():
+            return {}
 
         return {
             "description": description,
@@ -1742,6 +1831,16 @@ class RingClient:
 
     @_bounded_preview
     async def _async_snapshot_bytes(self, device) -> bytes | None:
+        from halo_gtk.live_sessions import active_session_for_device
+
+        session = active_session_for_device(device)
+        if session is not None:
+            # Requesting a fresh Ring snapshot can interrupt an active camera
+            # stream. Reuse its frame, or ask only for Ring's cached snapshot.
+            frame = session.get_current_frame_png()
+            if frame is not None and self._preview_is_current():
+                return frame
+            return await self._async_cached_snapshot_bytes(device.id, device_name=device.name)
         try:
             from ring_doorbell.const import SNAPSHOT_ENDPOINT, SNAPSHOT_TIMESTAMP_ENDPOINT
 
@@ -1755,10 +1854,14 @@ class RingClient:
                 requested = time.time()
                 for _attempt in range(2):
                     await asyncio.sleep(1)
+                    if not self._preview_is_current():
+                        return None
                     response = await self._ring.async_query(
                         SNAPSHOT_TIMESTAMP_ENDPOINT, method="POST", json=payload
                     )
                     if response.json()["timestamps"][0]["timestamp"] / 1000 > requested:
+                        if not self._preview_is_current():
+                            return None
                         data = await _bounded_snapshot_bytes(
                             self._ring.auth, SNAPSHOT_ENDPOINT.format(device.id)
                         )
@@ -1805,6 +1908,11 @@ class RingClient:
             return None
 
     def _preview_is_current(self) -> bool:
+        admission = _CAMERA_PREVIEW_LEASE.get()
+        if admission is not None:
+            client, lease = admission
+            if client is not self or not self.camera_privacy.valid(lease):
+                return False
         generation = self._published_generation
         return (
             not self._stopped
@@ -1821,6 +1929,8 @@ class RingClient:
         if self._ring is None:
             return
         self._stop_event.clear()
+        if self._privacy_future is None or self._privacy_future.done():
+            self._privacy_future = self.submit(self._async_refresh_camera_privacy())
         if self._listener_future is None or self._listener_future.done():
             self._listener_future = self.submit(self._async_listen())
             _log.debug("FCM listener task submitted")
@@ -1835,6 +1945,11 @@ class RingClient:
         """Stop the listener, close the ring auth session, shut down the loop."""
         with self._loop_lock:
             self._stopped = True
+        self.camera_privacy.invalidate()
+        privacy_future = self._privacy_future
+        self._privacy_future = None
+        if privacy_future is not None:
+            privacy_future.cancel()
         self._stop_event.set()
         self._preview.close()
         from halo_gtk.save_jobs import cancel_for_client
@@ -1914,6 +2029,15 @@ class RingClient:
 
     async def _async_close(self) -> None:
         """Close feature requests, shared transport, then Auth-owned HTTP."""
+        with self._media_resources_lock:
+            media = tuple(self._media_resources)
+            self._media_resources.clear()
+        # stop() refuses new submissions before invalidating privacy. Retained
+        # media must still close on this existing loop before Auth disappears.
+        if media:
+            await asyncio.gather(
+                *(resource.close_for_client() for resource in media), return_exceptions=True
+            )
         discovery = self._alarm_discovery_task
         self._alarm_discovery_task = None
         if discovery is not None and not discovery.done():

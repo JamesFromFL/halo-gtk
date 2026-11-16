@@ -16,6 +16,7 @@ from halo_gtk.cameras_page import (
     _preview_blur_radius,
     _reorder_ids,
 )
+from tests.privacy_helpers import grant_current
 
 
 class _FakeToggle:
@@ -177,6 +178,7 @@ def test_camera_tile_reports_immediate_stream_start_failure(monkeypatch):
         device=SimpleNamespace(id=7, name="Camera"),
     )
     monkeypatch.setattr(cameras_page, "get_live_session_manager", FailedManager)
+    grant_current(monkeypatch, tile.device)
 
     started = CameraTile.start_live_monitoring(tile)
 
@@ -431,11 +433,14 @@ def test_event_refresh_prefers_event_preview(monkeypatch):
     page = CamerasPage.__new__(CamerasPage)
     page._show_monitoring_controls = False
     captured = {}
-    page._set_card_snapshot = lambda device_id, data, motion_off=False, generation=None: (
-        captured.update({"device_id": device_id, "data": data, "motion_off": motion_off})
+    page._set_card_snapshot = (
+        lambda device_id, data, motion_off=False, generation=None, lease=None: captured.update(
+            {"device_id": device_id, "data": data, "motion_off": motion_off}
+        )
     )
     device = SimpleNamespace(id=12, name="Front Door", motion_detection=True)
     event = SimpleNamespace(id=34)
+    grant_current(monkeypatch, device, client)
 
     monkeypatch.setattr(cameras_page, "get_client", lambda: client)
     monkeypatch.setattr(cameras_page.GLib, "idle_add", lambda callback, *args: callback(*args))
@@ -447,16 +452,18 @@ def test_event_refresh_prefers_event_preview(monkeypatch):
     assert captured == {"device_id": 12, "data": b"event-preview", "motion_off": False}
 
 
-def test_stale_snapshot_generation_does_not_update_cache():
+def test_stale_snapshot_generation_does_not_update_cache(monkeypatch):
     page = CamerasPage.__new__(CamerasPage)
     page._snapshot_generation = 2
     page._snapshot_cache = {}
+    page._snapshot_cache_leases = {}
     page._cards = {}
+    lease = grant_current(monkeypatch, SimpleNamespace(id=12))
 
     page._set_card_snapshot(12, b"old", False, generation=1)
     assert page._snapshot_cache == {}
 
-    page._set_card_snapshot(12, b"new", False, generation=2)
+    page._set_card_snapshot(12, b"new", False, generation=2, lease=lease)
     assert page._snapshot_cache == {12: b"new"}
 
 
@@ -567,7 +574,9 @@ def test_cancelled_preview_does_not_start_fallback_or_update_a_card(monkeypatch)
     page = CamerasPage.__new__(CamerasPage)
     page._show_monitoring_controls = True
     page._queue_card_snapshot_update = lambda *_args: calls.append("update")
-    page._load_snapshot(SimpleNamespace(id=1, name="fixture"), cancel_event=cancelled)
+    device = SimpleNamespace(id=1, name="fixture")
+    grant_current(monkeypatch, device, client)
+    page._load_snapshot(device, cancel_event=cancelled)
     assert calls == ["snapshot"]
 
 

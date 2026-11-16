@@ -168,6 +168,12 @@ class LiveSessionManager:
     ) -> LiveStreamSession:
         device_id = int(device.id)
         session = self._sessions.get(device_id)
+        if session is not None and session.device is not device:
+            # An inventory replacement or another account may reuse an API id.
+            # Its old view and owners cannot be transferred to the new wrapper.
+            self._sessions.pop(device_id, None)
+            session.stop()
+            session = None
         created = session is None
         # Connecting and active sessions occupy a slot. Failed/stopped sessions
         # can restart only when another slot is available.
@@ -254,3 +260,10 @@ _MANAGER = LiveSessionManager()
 
 def get_live_session_manager() -> LiveSessionManager:
     return _MANAGER
+
+
+def active_session_for_device(device) -> LiveStreamSession | None:
+    session = _MANAGER.session_for(device.id)
+    if session is not None and session.device is device and session.active:
+        return session
+    return None

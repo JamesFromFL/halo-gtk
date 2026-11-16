@@ -88,7 +88,7 @@ def test_failed_stream_restarts_when_reacquired():
     session = manager.acquire(SimpleNamespace(id=1), owner="live-monitoring")
     session.view.fail_stream()
 
-    restarted = manager.acquire(SimpleNamespace(id=1), owner="live-monitoring")
+    restarted = manager.acquire(session.device, owner="live-monitoring")
 
     assert restarted is session
     assert restarted.state is StreamState.CONNECTING
@@ -176,7 +176,7 @@ def test_ended_session_restarts_when_reacquired_within_cap():
     session.view.end_stream()
     assert session.active is False
 
-    again = manager.acquire(SimpleNamespace(id=1), owner="live-monitoring")
+    again = manager.acquire(session.device, owner="live-monitoring")
     assert again is session
     assert session.active is True
     assert session.view.starts == 2

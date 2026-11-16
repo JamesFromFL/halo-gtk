@@ -5,6 +5,7 @@ import pytest
 
 from halo_gtk import live_stream, ring_media
 from halo_gtk.live_stream import LiveStreamView, _StreamResources
+from tests.privacy_helpers import grant
 
 
 @pytest.mark.asyncio
@@ -76,7 +77,7 @@ async def test_start_failure_produces_current_ui_outcome(monkeypatch, failure):
     monkeypatch.setattr(live_stream, "activate_ring_camera_speaker", activate)
     resources = _StreamResources(
         token=1,
-        device=object(),
+        device=SimpleNamespace(id=1),
         client=object(),
         session_id="fake",
         mic_track=SimpleNamespace(start_capture=capture),
@@ -85,6 +86,8 @@ async def test_start_failure_produces_current_ui_outcome(monkeypatch, failure):
         talkback_requested=True,
         talkback_callback=outcomes.append,
     )
+    resources.client = grant(resources.client, resources.device)
+    resources.privacy_lease = resources.client.camera_privacy.acquire(resources.device, "live")
     view = LiveStreamView.__new__(LiveStreamView)
     view._resources = resources
     view._stream_token = 1

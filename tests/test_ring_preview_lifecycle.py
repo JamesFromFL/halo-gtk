@@ -9,6 +9,7 @@ import pytest
 
 from halo_gtk import preview, ring_client
 from halo_gtk.ring_client import RingClient
+from tests.privacy_helpers import grant
 
 
 @pytest.mark.asyncio
@@ -22,6 +23,7 @@ async def test_stop_cancels_authenticated_snapshot_wait_before_decode(monkeypatc
     monkeypatch.setattr(ring_client, "_bounded_snapshot_bytes", fetch)
     client = RingClient()
     client._ring = SimpleNamespace(auth=object())
+    grant(client, SimpleNamespace(id=123))
     task = asyncio.create_task(client._async_cached_snapshot_bytes(123))
     await started.wait()
     client.stop()
@@ -46,6 +48,7 @@ async def test_retired_session_drops_finished_recording_result(monkeypatch):
 
     monkeypatch.setattr(client._preview, "recording", recording)
     device = SimpleNamespace(async_recording_url=AsyncMock(return_value="https://example.invalid/"))
+    grant(client, device)
     task = asyncio.create_task(client._async_first_recording_frame(device, 1))
     await started.wait()
     current[0] = False
@@ -77,6 +80,7 @@ async def test_fresh_snapshot_uses_timestamp_sequence_and_bounded_fetch(monkeypa
         name="fixture",
         async_get_snapshot=AsyncMock(side_effect=AssertionError("eager SDK image call")),
     )
+    grant(client, device)
     assert await client._async_snapshot_bytes(device) == b"bounded png"
     assert query.await_count == 2
     fetch.assert_awaited_once_with(client._ring.auth, "/clients_api/snapshots/image/123")
@@ -104,6 +108,7 @@ def test_view_cancellation_kills_child_and_releases_preview_slots(monkeypatch):
         async_recording_url=AsyncMock(return_value="https://fixture.invalid/recording.mp4"),
     )
     fallback = AsyncMock(side_effect=AssertionError("cancelled preview must not fetch fallback"))
+    grant(client, device)
     monkeypatch.setattr(client, "_async_cached_snapshot_bytes", fallback)
     cancelled = threading.Event()
     results = []

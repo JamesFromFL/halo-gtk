@@ -56,6 +56,7 @@ async def test_actual_receivers_preserve_source_intervals(monkeypatch, audio):
     from aiortc.mediastreams import MediaStreamError
 
     from halo_gtk import live_stream
+    from tests.privacy_helpers import grant
 
     Gst = live_stream.Gst
     Gst.init(None)
@@ -65,8 +66,10 @@ async def test_actual_receivers_preserve_source_intervals(monkeypatch, audio):
         emit=lambda _, buffer: captured.append(buffer.pts) or Gst.FlowReturn.OK,
     )
     resources = live_stream._StreamResources(
-        token=1, device=object(), client=object(), session_id="fixture", connected=True
+        token=1, device=SimpleNamespace(id=1), client=object(), session_id="fixture", connected=True
     )
+    resources.client = grant(resources.client, resources.device)
+    resources.privacy_lease = resources.client.camera_privacy.acquire(resources.device, "live")
     view = live_stream.LiveStreamView.__new__(live_stream.LiveStreamView)
     view._resources, view._stream_token, view._closing = resources, 1, False
     view._audio_appsrc = view._video_appsrc = source

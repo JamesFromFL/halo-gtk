@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from halo_gtk.live_stream import LiveStreamView, _StreamResources
+from tests.privacy_helpers import grant
 
 
 class FakeDevice:
@@ -25,7 +26,7 @@ class FakePeerConnection:
 
 
 class FakeMicrophoneTrack:
-    def __init__(self):
+    def __init__(self, **_kwargs):
         self.start_calls = 0
         self.stop_calls = 0
 
@@ -89,6 +90,8 @@ class LoopClient:
 
 
 def make_bare_view(resources):
+    resources.client = grant(resources.client, resources.device)
+    resources.privacy_lease = resources.client.camera_privacy.acquire(resources.device, "live")
     view = LiveStreamView.__new__(LiveStreamView)
     view._resources = resources
     view._stream_token = resources.token

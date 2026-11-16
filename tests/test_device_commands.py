@@ -267,12 +267,17 @@ def test_focused_siren_second_click_stops_after_success(monkeypatch):
     assert calls == [(0, client)]
 
 
-def test_intercom_support_gates_mic_sensitivity_without_gating_volume():
+def test_intercom_support_gates_mic_sensitivity_without_gating_volume(monkeypatch):
+    from tests.privacy_helpers import grant_current
+
+    device = _Device()
+    grant_current(monkeypatch, device)
     tile = CameraTile.__new__(CameraTile)
     tile._mic_btn = _Button()
     tile._volume_btn = _Button()
     tile._volume_scale = _Button()
     tile._intercom_supported = False
+    tile.device = device
 
     tile._set_stream_controls_sensitive(True)
 
@@ -287,6 +292,7 @@ def test_intercom_support_gates_mic_sensitivity_without_gating_volume():
     page._volume_btn = _Button()
     page._volume_scale = _Button()
     page._intercom_supported = False
+    page._device = device
 
     page._set_controls_sensitive(True)
 

@@ -26,6 +26,7 @@ gi.require_version("Gtk", "4.0")
 from aiortc.mediastreams import MediaStreamError  # noqa: E402
 from gi.repository import GLib, Gst, Gtk  # noqa: E402
 
+from halo_gtk.camera_privacy import PrivacyLease  # noqa: E402
 from halo_gtk.frame_timing import FrameClock  # noqa: E402
 
 # Importing the media module applies the validated aiortc compatibility patches.
@@ -59,12 +60,15 @@ class _StreamResources:
     device: Any
     client: Any
     session_id: str
+    privacy_lease: PrivacyLease | None = None
+    privacy_callback: Any = None
     pc: Any = None
     mic_track: MicrophoneTrack | None = None
     ring_session_started: bool = False
     tasks: set[asyncio.Task] = field(default_factory=set)
     start_future: concurrent.futures.Future | None = None
     cleanup_started: bool = False
+    cleanup_complete: asyncio.Event = field(default_factory=asyncio.Event)
     terminal_notified: bool = False
     connected: bool = False
     talkback_generation: int = 0
@@ -75,6 +79,9 @@ class _StreamResources:
         if self.cleanup_started:
             return
         self.cleanup_started = True
+        if self.privacy_callback is not None and self.privacy_lease is not None:
+            self.privacy_lease.policy.unsubscribe(self.privacy_callback)
+            self.privacy_callback = None
         cancellation_requested = False
 
         async def run_step(awaitable, label: str) -> None:
@@ -114,8 +121,17 @@ class _StreamResources:
         if self.pc is not None:
             await run_step(self.pc.close(), "RTCPeerConnection")
 
+        self.cleanup_complete.set()
+        release = getattr(self.client, "release_media_resources", None)
+        if release is not None:
+            release(self)
+
         if cancellation_requested:
             raise asyncio.CancelledError
+
+    async def close_for_client(self):
+        await self.cleanup()
+        await self.cleanup_complete.wait()
 
 
 def _audio_sink_description() -> str:
@@ -219,7 +235,7 @@ class LiveStreamView(Gtk.Box):
         overlay = Gtk.Overlay(hexpand=True, vexpand=True)
         self.append(overlay)
 
-        video = Gtk.Picture(
+        video = self._video_picture = Gtk.Picture(
             paintable=self._paintable,
             content_fit=Gtk.ContentFit.CONTAIN,
             hexpand=True,
@@ -273,13 +289,29 @@ class LiveStreamView(Gtk.Box):
                 "Not signed in to Ring",
             )
             return
+        lease = client.camera_privacy.acquire(device, "live")
+        if lease is None or not client._preview_is_current():
+            self._last_frame_rgb = None
+            self._video_picture.set_paintable(None)
+            GLib.idle_add(
+                self._on_stream_terminal,
+                stream_token,
+                "failed",
+                client.camera_privacy.view(device).message,
+            )
+            return
         resources = _StreamResources(
             token=stream_token,
             device=device,
             client=client,
             session_id=str(uuid.uuid4()),
+            privacy_lease=lease,
         )
+        client.retain_media_resources(resources)
         self._resources = resources
+        self._video_picture.set_paintable(self._paintable)
+        resources.privacy_callback = lambda: self._privacy_changed(resources)
+        lease.policy.subscribe(resources.privacy_callback)
         resources.start_future = self._submit(
             client,
             self._async_start(resources),
@@ -297,6 +329,7 @@ class LiveStreamView(Gtk.Box):
     def stop(self) -> None:
         """Stop WebRTC and GStreamer.  Safe to call from GTK thread."""
         self._closing = True
+        self._last_frame_rgb = None
         self._stream_token += 1
         resources = self._resources
         self._resources = None
@@ -310,6 +343,9 @@ class LiveStreamView(Gtk.Box):
 
     def set_volume(self, value: float) -> None:
         volume = max(0.0, min(1.0, value))
+        resources = self._resources
+        if resources is not None and not self._privacy_current(resources, "audio"):
+            volume = 0.0
         if self._vol_element is not None:
             self._vol_element.set_property("volume", volume)
         if self._audio_sink is not None and self._audio_sink.find_property("mute") is not None:
@@ -319,12 +355,15 @@ class LiveStreamView(Gtk.Box):
 
     def get_paintable(self):
         """Return the GTK paintable backing the live video sink."""
-        return self._paintable
+        resources = self._resources
+        return (
+            self._paintable if resources is not None and self._privacy_current(resources) else None
+        )
 
     def start_talking(self, *, on_state_changed=None) -> None:
         """Begin sending microphone audio to Ring.  Safe to call from GTK thread."""
         resources = self._resources
-        if resources is None:
+        if resources is None or not self._privacy_current(resources, "talkback"):
             if on_state_changed is not None:
                 on_state_changed("failed")
             return
@@ -361,7 +400,10 @@ class LiveStreamView(Gtk.Box):
                     if set_error is not None:
                         set_error(lambda: self._talkback_failed(resources, generation))
                     await resources.mic_track.start_capture()
-                    self._talkback_outcome(resources, generation, "active")
+                    if self._talkback_request_is_current(resources, generation):
+                        self._talkback_outcome(resources, generation, "active")
+                    else:
+                        await resources.mic_track.stop_capture()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -414,6 +456,7 @@ class LiveStreamView(Gtk.Box):
     ) -> bool:
         return (
             self._is_current_resources(resources)
+            and self._privacy_current(resources, "talkback")
             and resources.talkback_requested
             and resources.talkback_generation == generation
         )
@@ -421,7 +464,8 @@ class LiveStreamView(Gtk.Box):
     def get_current_frame_png(self) -> bytes | None:
         """Return the most recently decoded video frame as PNG bytes, or None."""
         arr = self._last_frame_rgb
-        if arr is None:
+        resources = self._resources
+        if arr is None or resources is None or not self._privacy_current(resources):
             return None
         try:
             import io
@@ -431,7 +475,7 @@ class LiveStreamView(Gtk.Box):
             img = Image.fromarray(arr, "RGB")
             buf = io.BytesIO()
             img.save(buf, format="PNG")
-            return buf.getvalue()
+            return buf.getvalue() if self._privacy_current(resources) else None
         except Exception as exc:
             _log.debug("Screenshot encode failed: %s", exc)
             return None
@@ -456,8 +500,10 @@ class LiveStreamView(Gtk.Box):
         terminal_message = "Stream stopped"
 
         try:
-            if not self._is_current_resources(resources):
+            if not self._is_current_resources(resources) or not self._privacy_current(resources):
                 return
+
+            self._spawn_resource_task(resources, self._watch_privacy(resources), "Camera privacy")
 
             pc = RTCPeerConnection(
                 RTCConfiguration(iceServers=[RTCIceServer(urls=resources.device.get_ice_servers())])
@@ -467,12 +513,17 @@ class LiveStreamView(Gtk.Box):
                 return
 
             pc.addTransceiver("video", direction="recvonly")
-            resources.mic_track = MicrophoneTrack()
+            resources.mic_track = MicrophoneTrack(
+                capture_allowed=lambda: (
+                    self._privacy_current(resources, "talkback") and resources.talkback_requested
+                )
+            )
             pc.addTransceiver(resources.mic_track, direction="sendrecv")
 
             def is_current_stream() -> bool:
                 return (
                     self._is_current_resources(resources)
+                    and self._privacy_current(resources)
                     and getattr(pc, "signalingState", None) != "closed"
                 )
 
@@ -655,6 +706,52 @@ class LiveStreamView(Gtk.Box):
             and self._is_current_stream_token(resources.token)
         )
 
+    def _privacy_current(self, resources, purpose="live") -> bool:
+        lease = resources.privacy_lease
+        return (
+            lease is not None
+            and resources.client._preview_is_current()
+            and lease.policy.valid(lease)
+            and lease.policy.allowed(resources.device, purpose)
+        )
+
+    def _privacy_changed(self, resources) -> None:
+        if self._is_current_resources(resources) and not self._privacy_current(resources):
+            # GStreamer state changes are thread-safe. Flush queued audio and
+            # video at revocation before GTK gets its next idle callback.
+            self._last_frame_rgb = None
+            if self._pipeline is not None:
+                self._pipeline.set_state(Gst.State.NULL)
+            resources.talkback_requested = False
+            GLib.idle_add(self._hide_private_frame, resources.token)
+            if getattr(resources.client, "_stopped", False):
+                # RingClient._async_close owns the retained resource teardown.
+                return
+            self._submit(
+                resources.client,
+                self._terminate_resources(
+                    resources,
+                    "failed",
+                    resources.client.camera_privacy.view(resources.device).message,
+                ),
+                "Camera privacy revocation",
+            )
+
+    def _hide_private_frame(self, token):
+        if self._is_current_stream_token(token):
+            self._video_picture.set_paintable(None)
+        return GLib.SOURCE_REMOVE
+
+    async def _watch_privacy(self, resources):
+        try:
+            while self._is_current_resources(resources):
+                self._privacy_changed(resources)
+                await asyncio.sleep(0.1)
+        finally:
+            if not self._privacy_current(resources):
+                with contextlib.suppress(asyncio.CancelledError):
+                    await resources.cleanup()
+
     async def _receive_frames(self, track, resources: _StreamResources) -> None:
         import numpy as np
 
@@ -666,15 +763,19 @@ class LiveStreamView(Gtk.Box):
         terminal_state = "stopped"
         terminal_message = "Stream ended"
         try:
-            while self._is_current_resources(resources):
+            while self._is_current_resources(resources) and self._privacy_current(resources):
                 frame = await track.recv()
-                if not self._is_current_resources(resources):
+                if not self._is_current_resources(resources) or not self._privacy_current(
+                    resources
+                ):
                     break
                 rgb = frame.to_ndarray(format="rgb24", threads=1)
                 h, w = rgb.shape[:2]
 
                 # Store the un-padded frame for screenshots.
-                self._last_frame_rgb = rgb
+                resources.privacy_lease.policy.apply(
+                    resources.privacy_lease, lambda rgb=rgb: setattr(self, "_last_frame_rgb", rgb)
+                )
 
                 # GStreamer requires RGB row stride to be a multiple of 4 bytes.
                 w_caps = (w + 3) & ~3
@@ -703,7 +804,14 @@ class LiveStreamView(Gtk.Box):
                 buffer.duration = Gst.CLOCK_TIME_NONE
                 if discontinuity:
                     buffer.set_flags(Gst.BufferFlags.DISCONT)
-                result = self._video_appsrc.emit("push-buffer", buffer)
+                result = None
+
+                def push(buffer=buffer):
+                    nonlocal result
+                    result = self._video_appsrc.emit("push-buffer", buffer)
+
+                if not resources.privacy_lease.policy.apply(resources.privacy_lease, push):
+                    break
                 if not gst_push_succeeded(result):
                     _log.debug("Stopping video receiver after appsrc push result: %s", result)
                     terminal_state = "failed"
@@ -723,6 +831,8 @@ class LiveStreamView(Gtk.Box):
             terminal_message = f"Video stream failed: {exc}"
         finally:
             if self._is_current_resources(resources):
+                if not self._privacy_current(resources):
+                    self._privacy_changed(resources)
                 await self._terminate_resources(
                     resources,
                     terminal_state,
@@ -739,10 +849,12 @@ class LiveStreamView(Gtk.Box):
         clock = FrameClock()
         audio_push_logged = False
         try:
-            while self._is_current_resources(resources):
+            while self._is_current_resources(resources) and self._privacy_current(resources):
                 frame = await track.recv()
                 if not self._is_current_resources(resources):
                     break
+                if not self._privacy_current(resources, "audio"):
+                    continue
                 raw, channels, rate, samples = audio_frame_to_s16le_interleaved(frame)
 
                 if audio_format != (channels, rate):
@@ -762,7 +874,14 @@ class LiveStreamView(Gtk.Box):
                 buffer.duration = duration
                 if discontinuity:
                     buffer.set_flags(Gst.BufferFlags.DISCONT)
-                result = self._audio_appsrc.emit("push-buffer", buffer)
+                result = None
+
+                def push(buffer=buffer):
+                    nonlocal result
+                    result = self._audio_appsrc.emit("push-buffer", buffer)
+
+                if not resources.privacy_lease.policy.apply(resources.privacy_lease, push):
+                    break
                 if not audio_push_logged:
                     _log.debug("Ring audio push result: %s", result.value_nick)
                     audio_push_logged = True
@@ -886,6 +1005,8 @@ class LiveStreamView(Gtk.Box):
 
     def _on_connected(self, stream_token: int) -> bool:
         if not self._is_current_stream_token(stream_token):
+            return GLib.SOURCE_REMOVE
+        if self._resources is None or not self._privacy_current(self._resources):
             return GLib.SOURCE_REMOVE
         self._status_label.set_visible(False)
         if self._on_stream_state_changed_cb is not None:

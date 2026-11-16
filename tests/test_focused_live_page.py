@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from halo_gtk.focused_live_page import FocusedLivePage
+from tests.privacy_helpers import grant_current
 
 
 def test_focused_still_passes_cancel_token_and_skips_fallback(monkeypatch):
@@ -28,7 +29,9 @@ def test_focused_still_passes_cancel_token_and_skips_fallback(monkeypatch):
         focused_live_page.threading, "Thread", lambda **kw: SimpleNamespace(start=kw["target"])
     )
     page = SimpleNamespace(_view_generation=1)
-    FocusedLivePage._load_snapshot_still(page, SimpleNamespace(id=1, name="fixture"))
+    device = SimpleNamespace(id=1, name="fixture")
+    grant_current(monkeypatch, device, client)
+    FocusedLivePage._load_snapshot_still(page, device)
     assert calls == [page._still_cancel_event]
     assert page._still_cancel_event.is_set()
 
@@ -72,9 +75,10 @@ def test_screenshot_distinguishes_save_and_folder_failures(monkeypatch, tmp_path
     page = SimpleNamespace(
         _session=SimpleNamespace(get_current_frame_png=lambda: b"png"),
         _video_view=SimpleNamespace(zoomed_frame_png=lambda _: None),
-        _device=None,
+        _device=SimpleNamespace(id=1),
         get_root=lambda: SimpleNamespace(show_toast=messages.append),
     )
+    grant_current(monkeypatch, page._device)
     FocusedLivePage._on_screenshot(page)
     if failure == "write":
         assert len(messages) == 1 and messages[0].startswith("Could not save screenshot")

@@ -10,6 +10,7 @@ from ring_doorbell import AuthenticationError, Requires2FAError
 
 from halo_gtk import ring_client
 from halo_gtk.ring_client import RingClient, _extract_event_description, is_ring_session_rejected
+from tests.privacy_helpers import grant
 
 
 class _FakeDevices:
@@ -818,13 +819,11 @@ async def test_async_refresh_devices_filters_by_family():
 
 @pytest.mark.asyncio
 async def test_async_refresh_devices_reuses_fresh_account_data():
-    import time
-
     client = RingClient()
     device = _FakeDevice(name="Front Door", family="doorbots")
     fake_ring = _FakeRing([device])
     client._ring = fake_ring
-    client._last_device_update_at = time.monotonic()
+    client._last_device_update_at = ring_client.privacy_time()
 
     devices = await client._async_refresh_devices(None)
 
@@ -879,6 +878,7 @@ async def test_last_event_frame_prefers_history_snapshot_url(monkeypatch):
     fake_ring = _FakeRing([device])
     fake_ring.auth = _FakeAuth()
     client._ring = fake_ring
+    grant(client, device)
     monkeypatch.setattr(client._preview, "image_url", AsyncMock(return_value=b"history-snapshot"))
 
     preview = await client._async_last_event_frame_for_device(device)
@@ -899,6 +899,7 @@ async def test_event_preview_for_device_uses_matching_history_event_snapshot(mon
     fake_ring = _FakeRing([device])
     fake_ring.auth = _FakeAuth()
     client._ring = fake_ring
+    grant(client, device)
     monkeypatch.setattr(client._preview, "image_url", AsyncMock(return_value=b"history-snapshot"))
     event = type("FakeEvent", (), {"id": 2})()
 
@@ -1264,6 +1265,7 @@ async def test_recording_frame_decode_uses_preview_process_manager(monkeypatch):
     client = RingClient()
     monkeypatch.setattr(client._preview, "recording", decode)
     client._ring = _FakeRing([device])
+    grant(client, device)
 
     first_task = asyncio.create_task(client._async_first_recording_frame(device, 22))
     while not first_task.done():
@@ -1300,6 +1302,7 @@ async def test_recording_decode_does_not_block_asyncio_progress(monkeypatch):
     client = RingClient()
     monkeypatch.setattr(client._preview, "recording", decode)
     device = RecordingDevice()
+    grant(client, device)
 
     decode_task = asyncio.create_task(client._async_first_recording_frame(device, 1))
     for _ in range(1_000):

@@ -390,7 +390,7 @@ def test_alarm_start_is_independent_when_fcm_is_already_running(monkeypatch):
 
     client.start()
 
-    assert submitted == ["_async_run_alarm"]
+    assert submitted == ["_async_refresh_camera_privacy", "_async_run_alarm"]
     assert client._alarm_future is not None
 
 
@@ -412,7 +412,7 @@ def test_repeated_start_does_not_duplicate_background_services(monkeypatch):
     client.start()
     client.start()
 
-    assert submitted == ["_async_listen", "_async_run_alarm"]
+    assert submitted == ["_async_refresh_camera_privacy", "_async_listen", "_async_run_alarm"]
 
 
 def test_unpublished_client_does_not_start_alarm(monkeypatch):
@@ -430,7 +430,7 @@ def test_unpublished_client_does_not_start_alarm(monkeypatch):
 
     client.start()
 
-    assert submitted == ["_async_listen"]
+    assert submitted == ["_async_refresh_camera_privacy", "_async_listen"]
     assert client._alarm_future is None
 
 
@@ -686,6 +686,10 @@ async def test_manual_session_refresh_reconciles_alarm_discovery(monkeypatch):
 
     class FakeRing:
         auth = FakeAuth()
+
+        @staticmethod
+        def devices():
+            return SimpleNamespace(all_devices=[])
 
         @staticmethod
         async def async_update_data():

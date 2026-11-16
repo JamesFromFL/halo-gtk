@@ -134,9 +134,14 @@ class _SettingQueue:
             except Exception as exc:
                 _log.debug("Camera setting write failed: %s", exc)
                 if request.current():
-                    uncertain = isinstance(exc, TimeoutError | RingTimeout)
+                    accepted = getattr(exc, "accepted", False) is True
+                    uncertain = accepted or isinstance(exc, TimeoutError | RingTimeout)
                     request.finished(
-                        "Ring timed out; the change may have been applied. "
+                        "Ring accepted this change, but its privacy settings "
+                        "could not be verified. "
+                        "Media stays hidden until Ring settings refresh."
+                        if accepted
+                        else "Ring timed out; the change may have been applied. "
                         "Check the camera before trying again."
                         if uncertain
                         else "Ring could not confirm this change. "
@@ -544,6 +549,13 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
             self._set_status(f"{title} was not saved: not signed in to Ring")
             return
         generation = getattr(client, "_published_generation", None)
+        privacy_setting = getattr(client, "_async_camera_privacy_setting", None)
+        if setting_key == "motion_detection" and callable(privacy_setting):
+            invoke_setting = coroutine_factory
+
+            def coroutine_factory():
+                return privacy_setting(self.device, invoke_setting)
+
         self._setting_serial += 1
         serial = self._setting_serial
         self._set_status(f"Waiting to save {title}...")
