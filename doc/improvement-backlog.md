@@ -35,6 +35,11 @@ is committed as `c9475b2`; the items below preserve the separate feature work.
   see [packaging qualification](flatpak-packaging.md). Desktop portal, real media
   and distribution acceptance remain separate; host login startup is unavailable
   in the sandbox candidate.
+- Experimental Intercom Video media: complete for the evidence-qualified Video
+  model, with explicit Start/End, listening and hold-to-talk; see
+  [Intercom support](intercom-support.md). Audio-only calling and physical
+  Intercom acceptance remain evidence gates. Camera/doorbell talkback is a
+  separate existing feature.
 
 ## 1. Maintenance and desktop baseline
 

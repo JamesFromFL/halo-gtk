@@ -144,6 +144,7 @@ class Details:
             "_release",
             "_ack",
             "_reload_button",
+            "_media_button",
             "_events",
         ):
             setattr(self, name, Widget())
@@ -333,3 +334,28 @@ def test_notification_page_open_rejects_reused_or_retired_identity(context, monk
     )
     assert not page.open_intercom(42, 9, 7)
     assert not page.open_intercom(42, 2, 8)
+
+
+def test_open_media_child_keeps_existing_metadata_poll_without_any_release(context):
+    context.client.intercom_snapshot = snapshot(device(kind="intercom_handset_video"))
+    dialog = shown(context)
+    child_calls = []
+    dialog._media_dialog = SimpleNamespace(
+        retire=lambda: child_calls.append("retire"),
+        force_close=lambda: child_calls.append("close"),
+    )
+    assert dialog._media_button.visible and dialog._media_button.sensitive
+    for _ in range(4):
+        context.now[0] += 15
+        context.scheduler.sources.pop(dialog._poll_id)
+        ui.IntercomDetails._poll(lambda: dialog)
+        context.client.intercom_snapshot = snapshot(
+            device(kind="intercom_handset_video", inventory_monotonic=context.now[0])
+        )
+        context.client.futures[-1].set_result(context.client.intercom_snapshot)
+        context.scheduler.drain()
+    assert context.client.calls == [("intercom-inventory", (), {"force": False})] * 4
+    assert not child_calls
+    dialog.retire()
+    assert child_calls == ["retire", "close"]
+    assert not context.scheduler.sources

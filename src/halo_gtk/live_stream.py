@@ -68,6 +68,7 @@ class _StreamResources:
     tasks: set[asyncio.Task] = field(default_factory=set)
     start_future: concurrent.futures.Future | None = None
     cleanup_started: bool = False
+    cleanup_failed: bool = False
     cleanup_complete: asyncio.Event = field(default_factory=asyncio.Event)
     terminal_notified: bool = False
     connected: bool = False
@@ -90,7 +91,9 @@ class _StreamResources:
                 await awaitable
             except asyncio.CancelledError:
                 cancellation_requested = True
+                self.cleanup_failed = True
             except Exception as exc:
+                self.cleanup_failed = True
                 _log.debug("%s cleanup failed: %s", label, exc)
 
         if self.mic_track is not None:
@@ -121,6 +124,10 @@ class _StreamResources:
         if self.pc is not None:
             await run_step(self.pc.close(), "RTCPeerConnection")
 
+        if self.privacy_lease is not None:
+            release_policy = getattr(self.privacy_lease.policy, "release", None)
+            if release_policy is not None:
+                release_policy(self.privacy_lease, resources_closed=not self.cleanup_failed)
         self.cleanup_complete.set()
         release = getattr(self.client, "release_media_resources", None)
         if release is not None:
@@ -155,8 +162,9 @@ class LiveStreamView(Gtk.Box):
         png = view.get_current_frame_png()  # for screenshot
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, media_authority=None) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, hexpand=True, vexpand=True)
+        self._media_authority = media_authority
         self._device = None
         self._resources: _StreamResources | None = None
         self._pipeline: Gst.Pipeline | None = None
@@ -289,15 +297,18 @@ class LiveStreamView(Gtk.Box):
                 "Not signed in to Ring",
             )
             return
-        lease = client.camera_privacy.acquire(device, "live")
+        policy = getattr(self, "_media_authority", None) or client.camera_privacy
+        lease = policy.acquire(device, "live")
         if lease is None or not client._preview_is_current():
+            if lease is not None and (release := getattr(policy, "release", None)) is not None:
+                release(lease)
             self._last_frame_rgb = None
             self._video_picture.set_paintable(None)
             GLib.idle_add(
                 self._on_stream_terminal,
                 stream_token,
                 "failed",
-                client.camera_privacy.view(device).message,
+                policy.view(device).message,
             )
             return
         resources = _StreamResources(
@@ -307,7 +318,12 @@ class LiveStreamView(Gtk.Box):
             session_id=str(uuid.uuid4()),
             privacy_lease=lease,
         )
-        client.retain_media_resources(resources)
+        try:
+            client.retain_media_resources(resources)
+        except Exception:
+            if (release := getattr(policy, "release", None)) is not None:
+                release(lease)
+            raise
         self._resources = resources
         self._video_picture.set_paintable(self._paintable)
         resources.privacy_callback = lambda: self._privacy_changed(resources)
@@ -318,6 +334,15 @@ class LiveStreamView(Gtk.Box):
             "Live stream startup",
         )
         if resources.start_future is None:
+            # Submission failed before the coroutine could own any resources.
+            # Release synchronous admission too; there will be no async finally.
+            lease.policy.unsubscribe(resources.privacy_callback)
+            resources.privacy_callback = None
+            if (release := getattr(policy, "release", None)) is not None:
+                release(lease)
+            client.release_media_resources(resources)
+            resources.cleanup_started = True
+            resources.cleanup_complete.set()
             self._resources = None
             GLib.idle_add(
                 self._on_stream_terminal,
@@ -732,7 +757,7 @@ class LiveStreamView(Gtk.Box):
                 self._terminate_resources(
                     resources,
                     "failed",
-                    resources.client.camera_privacy.view(resources.device).message,
+                    resources.privacy_lease.policy.view(resources.device).message,
                 ),
                 "Camera privacy revocation",
             )

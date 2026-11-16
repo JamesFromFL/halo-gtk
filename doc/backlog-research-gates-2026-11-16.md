@@ -41,18 +41,23 @@ existing Ring session. Its camera source (blob
 snapshot/live contention, and a close-callback self-await workaround. These are
 real lifecycle requirements; a generic camera capability flag is insufficient.
 
-Proposed implementation: explicitly opt-in model-qualified calls; one owned live
-session per Intercom; Start/End and push-to-talk; no automatic answering or
-microphone activation; no snapshot-only WebRTC sessions; bounded signaling and
-account-revocation teardown; confirmed entrance release remains a separate action.
-Use the existing raw media pipeline. First qualify offer/answer, incoming-call
-lifetime, reconnect, silence/mute, and final microphone/session teardown on the
-actual target model. Video-model evidence must not enable audio-only models.
+Decision: the owner requested the widest support supported by evidence, rather
+than selecting hardware. This is the separate building-entry Ring Intercom
+product, not camera/doorbell talkback, which already exists in GTK.
 
-The necessary decision is the model to target and availability of an owner-operated
-call test. A fixture can establish cleanup logic, but cannot establish that a real
-building intercom answers or hangs up correctly. No call or entrance-release test
-was run here.
+The resulting implementation uses explicitly enabled, exact-model Intercom
+Video sessions, one owned capture per Intercom, Start/End, muted-by-default
+listening and hold-to-talk. It has no automatic answering, microphone activation
+or snapshot-only sessions. Signaling and call duration are bounded; account
+revocation ends local media; confirmed entrance release remains separate. See
+[Intercom support](intercom-support.md) for implementation and qualification.
+
+Actual offer/answer, incoming-call behavior, reconnect, audio quality and remote
+hangup still require supervised Intercom Video hardware acceptance. Fixtures
+establish local control and cleanup logic, not whether a real building intercom
+answers correctly. Audio-only Intercoms retain observation and confirmed release;
+the Video evidence does not establish their calling protocol. No real call or
+entrance release was performed.
 
 ## Ring group editing and schedules
 
@@ -111,8 +116,10 @@ code, deployment, credentials or pairing were changed by this backlog pass.
 
 The optional managed installer improves updates on an existing compatible host.
 It does not bundle system GTK/GStreamer or establish support for another Linux
-distribution. A Flatpak is the recommended next packaging candidate for this
-GNOME-oriented app, subject to a separate sandbox/portal and runtime qualification:
-Secret Service, microphone, PulseAudio/PipeWire, file dialogs, notifications,
-background/tray behavior, and the pinned media dependencies all need acceptance.
-Select the intended distribution/runtime before publishing installation promises.
+distribution. An x86_64 GNOME 50 Flatpak candidate now builds with locked Python
+dependencies and passes generated-media/loopback checks in the actual runtime.
+See [packaging qualification](flatpak-packaging.md). Secret Service prompts,
+microphone/speaker quality, file portals, notifications and background/tray
+behavior still need desktop acceptance. Host login startup is disabled in the
+sandbox candidate until a Background portal implementation is qualified. No
+Flathub release or broader distribution-support promise is made by this pass.

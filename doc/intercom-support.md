@@ -50,13 +50,63 @@ Intercom details and never opens a camera or enriches camera media. Logout
 withdraws notifications for the retired account. Missing events do not imply
 that no calls or unlocks occurred.
 
-Calling, live audio/video, guest keys, access invitations, setup, configuration
-writes and per-door selection remain in the Ring app. The pinned SDK lacks
-Intercom WebRTC methods; an external custom integration's monkey patch and
-Audio-only prerelease do not establish Halo hardware compatibility. No SDK
-class patch, media backend replacement or dependency change is introduced here.
+## Experimental Intercom Video
 
-See the accompanying research plan for source links. Live account schema,
-permissions, actual entrance behavior and native dialog overlay/focus require
-supervised target-hardware testing. Development tests use synthetic responses;
-no real Ring account read or door-release action is part of implementation.
+Account-visible devices with the exact `intercom_handset_video` kind can open an
+experimental media dialog from Intercom details. Enable the local per-view
+checkbox, then press Start when you intend to connect. Starting may open or
+answer the building intercom's media path. Opening details, incoming events,
+notifications, polling and enabling the checkbox alone never start media.
+
+Listening starts muted. Listen enables received audio; Hold to talk requests
+the microphone only while the pointer or Space/Enter key is held. Releasing,
+canceling the gesture, leaving button focus, ending or closing the view stops
+talkback. End closes the media session. Entrance release remains a separate
+confirmed operation and is never triggered by these media controls.
+
+The media authority is deliberately separate from camera privacy: Ring's
+camera GET flags do not establish Intercom permissions and are never fabricated.
+Admission requires the pinned SDK contract, explicit local opt-in, a current
+client, fresh complete Intercom inventory, the exact model and identity epoch,
+a matching current SDK wrapper. This establishes current account access, not
+an owner role; Ring decides permission for the media request. The pinned SDK
+constructs every Intercom wrapper with `shared=True`, so that synthetic flag is
+not used as an ownership or permission claim. Unknown, stale and denied current
+account evidence cannot start media.
+The existing selected-details inventory poll runs every 15 seconds, including
+while its media child is open. These metadata reads do not initiate calls or
+release the entrance. Lost or stale access evidence ends media; a later fresh
+receipt cannot resurrect that lease. Freshness and the five-minute session cap
+use the Linux suspend-aware clock. An expired session requires another explicit
+Start. A read failure or cooldown can end a session before five minutes.
+
+Only one capture consumer is admitted per Intercom in the client. Ownership
+continues through microphone, peer and Ring teardown, including natural Ring
+reader closure. Failed or canceled local teardown keeps that ownership reserved;
+close Halo before trying again when cleanup cannot be verified. There are no
+automatic snapshots, background media consumers, recording saves or stream
+renewals for Intercom Video.
+
+The instance-owned adapter reuses `RingWebRtcStream` from `ring-doorbell==0.9.14`
+and the existing Halo live media pipeline. It does not patch `RingOther`, change
+dependencies, replace the backend, or change ordinary camera and doorbell
+privacy/talkback behavior. The source evidence is the upstream integration's
+[video camera adapter](https://github.com/cmos486/ring-intercom-video/blob/52f2888fdc51c4c01369ccd9536ac2d090094e06/custom_components/ring_intercom_camera/camera.py)
+and [SDK integration](https://github.com/cmos486/ring-intercom-video/blob/52f2888fdc51c4c01369ccd9536ac2d090094e06/custom_components/ring_intercom_camera/__init__.py).
+Its global patch is not reproduced. Source compatibility and synthetic fixtures
+do not prove video, received audio or talkback on a physical Intercom.
+
+Audio-only Intercom calling, guest keys, access invitations, setup,
+configuration writes and per-door selection remain in the Ring app. Existing
+camera-doorbell talkback is independent of this building-intercom experiment.
+
+## Qualification limits
+
+Offline tests cover qualification, fresh/expired receipts, account/identity
+changes, one consumer, cancellation and natural-reader cleanup, failed cleanup,
+worker-submission failure, delayed talkback, explicit controls and parent polling.
+Native GTK layout and closed-state checks use synthetic inventory with no media
+session. Live account schema, permissions, actual entrance behavior, physical
+Intercom video/audio/talkback, and compositor input/overlay behavior still require
+supervised target-hardware testing. No real Ring request, door-release action,
+call or microphone capture is part of this implementation's development checks.

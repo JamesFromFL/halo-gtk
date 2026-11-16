@@ -91,6 +91,7 @@ class IntercomDetails(Adw.Dialog):
         self._confirmation = None
         self._approval = None
         self._poll_id = None
+        self._media_dialog = None
         self._session = IntercomViewSession(self._changed, self.retire)
         self._build_ui()
         self.connect("closed", lambda *_: self.retire(close=False))
@@ -140,6 +141,9 @@ class IntercomDetails(Adw.Dialog):
                 css_classes=["dim-label"],
             )
         )
+        self._media_button = Gtk.Button(label="Experimental Intercom Video…", visible=False)
+        self._media_button.connect("clicked", self._open_media)
+        content.append(self._media_button)
         self._release = Gtk.Button(label="Request entrance release…")
         self._release.add_css_class("destructive-action")
         self._release.connect("clicked", lambda *_: self._confirm())
@@ -165,8 +169,7 @@ class IntercomDetails(Adw.Dialog):
             _label(
                 "Release is a momentary request, not a lock toggle. Halo does not "
                 "automatically release, retry, relock or infer door position. "
-                "Calling, audio/video, "
-                "guest keys and setup remain in the Ring app.",
+                "Audio-only Intercom calling, guest keys and setup remain in the Ring app.",
                 css_classes=["dim-label"],
             )
         )
@@ -198,6 +201,11 @@ class IntercomDetails(Adw.Dialog):
         if self._closed:
             return
         self._closed = True
+        media = getattr(self, "_media_dialog", None)
+        if media is not None:
+            media.retire()
+            media.force_close()
+            self._media_dialog = None
         self._cancel_confirmation()
         self._session.close()
         if self._poll_id is not None:
@@ -230,6 +238,8 @@ class IntercomDetails(Adw.Dialog):
         ):
             self._cancel_confirmation()
         self._device = device
+        self._media_button.set_visible(device.kind == "intercom_handset_video")
+        self._media_button.set_sensitive(_fresh(device) and not device.denied)
         self._name.set_label(device.name)
         fields = {
             "model": device.model,
@@ -322,6 +332,25 @@ class IntercomDetails(Adw.Dialog):
         self._session.request(
             "inventory", lambda: self._session.client.refresh_intercoms(force=force)
         )
+
+    def _open_media(self, *_):
+        device = self._selected()
+        if device is None or device.kind != "intercom_handset_video" or not _fresh(device):
+            return
+        if self._media_dialog is not None:
+            self._media_dialog.present(self)
+            return
+        from halo_gtk.intercom_video_dialog import IntercomVideoDialog
+
+        dialog = IntercomVideoDialog(self._session.client, device.api_id, device.identity_epoch)
+        self._media_dialog = dialog
+
+        def closed(*_):
+            if self._media_dialog is dialog:
+                self._media_dialog = None
+
+        dialog.connect("closed", closed)
+        dialog.present(self)
 
     def _confirm(self):
         device = self._selected()

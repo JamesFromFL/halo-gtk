@@ -9,6 +9,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 This section tracks the work toward Halo GTK's first tagged release.
 
 ### Added
+- Explicit experimental Intercom Video sessions for the qualified Video model,
+  with Start/End, muted listening, hold-to-talk and account-aware cleanup.
+  Audio-only Intercom calling still requires a verified protocol and hardware.
 - An experimental x86_64 GNOME 50 Flatpak with hash-pinned offline build inputs,
   isolated runtime/media qualification and explicit sandbox startup limitations.
 - Individual Beams lights with bridge-specific ownership, finite On requests,
@@ -30,7 +33,7 @@ This section tracks the work toward Halo GTK's first tagged release.
 - Follow system, Light, and Dark appearance choices, saved locally across launches.
 - Experimental Intercom status, bounded live call/unlock observations and notifications,
   and single-use confirmed entrance release with honest RPC/uncertain outcomes.
-  No physical lock state is inferred; calling remains in the Ring app.
+  No physical lock state is inferred; media and entrance release are separate actions.
 - Experimental Light Groups discovery by location, reported state/member details,
   explicit duration-based On and Off requests, and bounded fresh readback.
   Group reports do not establish every lamp's state; live validation is deferred.
