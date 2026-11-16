@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
@@ -328,3 +329,138 @@ async def test_read_network_error_remains_sanitized():
     with pytest.raises(RingJsonError) as error:
         await RingJsonTransport(auth).request_json(LOCATIONS_ENDPOINT)
     assert str(error.value) == "network-unavailable" and error.value.__cause__ is None
+
+
+async def test_actual_aiohttp_put_disconnect_cannot_replay_submitted_write():
+    """Use loopback to exercise aiohttp's real disconnected-connection retry."""
+    received, handlers = [], set()
+    payload = {"chime": {"settings": {"volume": 2}}}
+
+    async def disconnect(reader, writer):
+        current = asyncio.current_task()
+        handlers.add(current)
+        try:
+            head = await reader.readuntil(b"\r\n\r\n")
+            length = next(
+                int(line.split(b":", 1)[1])
+                for line in head.split(b"\r\n")
+                if line.lower().startswith(b"content-length:")
+            )
+            received.append(await reader.readexactly(length))
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            handlers.discard(current)
+
+    server = await asyncio.start_server(disconnect, "127.0.0.1", 0)
+    local = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/fixture"
+    try:
+        async with aiohttp.ClientSession() as session:
+            with pytest.raises(aiohttp.ServerDisconnectedError):
+                await session.put(local, json=payload)
+            assert len(received) == 2
+            received.clear()
+            auth, _, _ = fake_auth()
+
+            class LoopbackSession:
+                _middlewares = ()
+
+                async def request(self, method, url, *, middlewares, **kwargs):
+                    assert str(url) == LOCATIONS_ENDPOINT
+                    assert len(middlewares) == 1
+                    guard = middlewares[0]
+
+                    async def local_guard(request, handler):
+                        # Adapt only the test boundary; production still checks
+                        # the authenticated Ring destination before every send.
+                        identity = SimpleNamespace(url=url, method=request.method)
+
+                        async def send(_identity):
+                            return await handler(request)
+
+                        return await guard(identity, send)
+
+                    return await session.request(
+                        method, local, middlewares=(local_guard,), **kwargs
+                    )
+
+            auth._session = LoopbackSession()
+            core = RingJsonTransport(auth)
+            with pytest.raises(RingJsonError, match="write-replay-blocked") as error:
+                await core.request_write(LOCATIONS_ENDPOINT, method="PUT", json=payload)
+            assert error.value.possibly_sent and len(received) == 1
+            assert core._active == 0 and not core._requests
+            await core.close()
+    finally:
+        server.close()
+        await server.wait_closed()
+        if handlers:
+            await asyncio.gather(*handlers)
+
+
+@pytest.mark.parametrize("changed", ["url", "method", "authority"])
+async def test_write_middleware_rechecks_destination_and_authority(changed):
+    auth, _, _ = fake_auth()
+    allowed, sent = [True], []
+
+    def admission():
+        if not allowed[0]:
+            raise RingJsonError("superseded")
+
+    class Session:
+        _middlewares = ()
+
+        async def request(self, method, url, *, middlewares, **_kwargs):
+            await asyncio.sleep(0)
+            allowed[0] = changed != "authority"
+            request = SimpleNamespace(
+                url="https://evil.invalid/" if changed == "url" else url,
+                method="POST" if changed == "method" else method,
+            )
+
+            async def send(request):
+                sent.append(request)
+                return Response()
+
+            return await middlewares[-1](request, send)
+
+    auth._session = Session()
+    code = "superseded" if changed == "authority" else "token-preparation-changed-endpoint"
+    with pytest.raises(RingJsonError, match=code) as error:
+        await RingJsonTransport(auth).request_write(
+            LOCATIONS_ENDPOINT, method="PUT", json={}, admission=admission
+        )
+    assert error.value.possibly_sent and not sent
+
+
+async def test_write_guard_preserves_session_middleware_and_blocks_its_replay():
+    auth, _, _ = fake_auth()
+    sent, marked = [], []
+
+    async def retry(request, handler):
+        await handler(request)
+        return await handler(request)
+
+    class Session:
+        _middlewares = (retry,)
+
+        async def request(self, method, url, *, middlewares, **_kwargs):
+            assert middlewares[0] is retry and len(middlewares) == 2
+            request = SimpleNamespace(url=url, method=method)
+
+            async def send(request):
+                sent.append(request)
+                return Response()
+
+            async def guarded(request):
+                return await middlewares[-1](request, send)
+
+            return await middlewares[0](request, guarded)
+
+    auth._session = Session()
+    with pytest.raises(RingJsonError, match="write-replay-blocked") as error:
+        await RingJsonTransport(auth).request_write(
+            LOCATIONS_ENDPOINT, method="POST", json={}, on_admitted=lambda: marked.append(True)
+        )
+    assert error.value.possibly_sent and len(sent) == len(marked) == 1
+    assert auth._session._middlewares == (retry,)

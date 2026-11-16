@@ -275,6 +275,31 @@ class RingJsonTransport:
                         # request to aiohttp. Connector work can still await.
                         remaining = max(0.001, deadline - asyncio.get_running_loop().time())
                         options = {"json": payload} if write else {}
+                        if write:
+                            attempted = False
+
+                            async def send_once(request, handler):
+                                nonlocal attempted
+                                # aiohttp can retry a submitted PUT after a
+                                # persistent connection drops its response.
+                                if attempted:
+                                    raise RingJsonError("write-replay-blocked")
+                                attempted = True
+                                if str(request.url) != url or request.method != method:
+                                    raise RingJsonError("token-preparation-changed-endpoint")
+                                self._check_auth()
+                                if admission is not None:
+                                    _callback(admission)
+                                return await handler(request)
+
+                            # The innermost guard also protects against a
+                            # session middleware invoking its handler twice.
+                            # Preserve the shared SDK session's middleware and
+                            # retry behavior for unrelated reads.
+                            options["middlewares"] = (
+                                *getattr(self._auth._session, "_middlewares", ()),
+                                send_once,
+                            )
                         response = await self._auth._session.request(
                             method,
                             URL(prepared, encoded=True),

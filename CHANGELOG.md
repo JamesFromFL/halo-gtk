@@ -83,6 +83,8 @@ This section tracks the work toward Halo GTK's first tagged release.
   compatibility contracts.
 
 ### Fixed
+- Device writes now prevent aiohttp or session middleware from replaying a
+  submitted request after a connection failure; ambiguous outcomes remain visible.
 - Updated dnspython to 2.9.2 and added a security floor for camera connection
   setup, with offline mDNS compatibility and malformed-input regression checks.
 - Live video backlog is bounded, source frame intervals and audio gaps are
