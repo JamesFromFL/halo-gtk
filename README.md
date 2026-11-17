@@ -1,389 +1,104 @@
 <p align="center">
-  <img src="data/icons/hicolor/256x256/apps/io.github.JamesFromFL.HaloGtk.png" width="128" alt="Halo app icon">
+  <img src="data/icons/hicolor/256x256/apps/io.github.JamesFromFL.HaloGtk.png" width="96" alt="Halo">
 </p>
 
 <h1 align="center">Halo</h1>
 
 <p align="center">
-  <strong>Your Ring cameras, at home on Linux.</strong><br>
-  A native GTK 4 desktop experience for watching live cameras, reviewing events,
-  and keeping an eye on the devices that matter.
+  <strong>Your home. In view.</strong><br>
+  Your Ring cameras, activity, and everyday controls.<br>
+  Beautifully at home on Linux.
 </p>
 
 <p align="center">
-  <a href="#install-halo">Install</a> &middot;
-  <a href="#meet-halo">Product Tour</a> &middot;
-  <a href="#requirements">Requirements</a> &middot;
-  <a href="#privacy-and-local-data">Privacy</a>
+  <a href="doc/guide.md#installation"><strong>Get Halo →</strong></a>
+  &nbsp; · &nbsp;
+  <a href="#a-clearer-view-of-home">Take a look</a>
+  &nbsp; · &nbsp;
+  <a href="doc/guide.md">Explore the guide</a>
+</p>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="doc/images/showcase/overview-dark.webp">
+  <source media="(prefers-color-scheme: light)" srcset="doc/images/showcase/overview-light.webp">
+  <img src="doc/images/showcase/overview-light.webp" width="100%" alt="Halo Overview with front door, driveway, and garden previews, reported Ring Alarm state, and recent activity">
+</picture>
+
+<p align="center"><sub>The Halo app, shown with fictional imagery and simulated device activity.</sub></p>
+
+<br>
+
+## A clearer view of home
+
+The front door. The driveway. The garden beyond the kitchen window.
+Halo brings the places you care about into a calm, considered desktop app.
+Camera previews, recent activity, and your reported security state come together
+in one welcoming overview.
+
+### Watch the whole picture. Or take a closer look.
+
+Keep several cameras in view with saved monitoring layouts. Open one camera
+for a generous, distraction-free view, listen in, or speak through compatible
+cameras. Zoom into the details and save a snapshot when a moment matters.
+
+![Halo's focused camera view with a large front porch image, listening and talk controls, and camera health](doc/images/showcase/focused-view.webp)
+
+<br>
+
+### Find the moment. Keep what matters.
+
+A doorbell ring, a delivery, a little movement in the garden. Browse activity
+by camera and event, revisit available recordings, and move through the day
+without losing your place. Keep useful moments in Favorites, download a clip,
+or share it with someone who needs to see it.
+
+![Halo Activity with a day-by-day event list and recording playback beside it](doc/images/showcase/activity.webp)
+
+<br>
+
+### More of your home, together.
+
+Check your Ring Alarm, see reported door and motion-sensor states, and keep
+supported lights, keypads, and Chimes within reach. Cameras and everyday
+controls feel like parts of the same home.
+
+![Halo Security showing Home mode, closed entry sensors, and reported motion and smoke-listener status](doc/images/showcase/security.webp)
+
+<br>
+
+## Fits your desktop. Follows your rhythm.
+
+- **Light or dark. Always Halo.** Follow your desktop's appearance or choose
+  your own. Spacious views adapt naturally when your window gets smaller.
+- **Awareness on your terms.** Per-device notifications, quiet hours, and snooze
+  help you decide when everyday activity deserves your attention.
+- **Privacy within reach.** Current camera views respect Ring's privacy settings,
+  with clear listening and microphone controls.
+- **Free to make your own.** Open source, thoughtfully designed, and built for
+  life on the Linux desktop.
+
+<br>
+
+<h2 align="center">Make room for Halo.</h2>
+
+<p align="center">
+  Bring your Ring home to your desktop.<br><br>
+  <a href="doc/guide.md#installation"><strong>Get started →</strong></a>
+  &nbsp; · &nbsp;
+  <a href="doc/guide.md#requirements">Find your setup</a>
+  &nbsp; · &nbsp;
+  <a href="doc/guide.md#device-controls-and-limits">Explore device support</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/JamesFromFL/halo-gtk/actions/workflows/ci.yml"><img src="https://github.com/JamesFromFL/halo-gtk/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
-  <img src="https://img.shields.io/badge/platform-Linux-1793D1?style=flat-square" alt="Linux">
-  <img src="https://img.shields.io/badge/interface-GTK%204%20%2B%20libadwaita-4A86CF?style=flat-square" alt="GTK 4 and libadwaita">
-  <img src="https://img.shields.io/badge/license-GPL--3.0--or--later-2F855A?style=flat-square" alt="GPL-3.0-or-later">
+  Looking for Apple Home integration?<br>
+  Meet <a href="https://github.com/JamesFromFL/halo-server"><strong>Halo Server</strong></a>, for your Apple Home.
 </p>
 
-> [!IMPORTANT]
-> Halo is an independent, unofficial project. It is not affiliated with,
-> endorsed by, or supported by Ring or Amazon. Ring service changes can affect
-> compatibility.
-
-<p align="center">
-  <img src="doc/images/halo-hero.webp" width="100%" alt="Previous Halo interface showing four Ring cameras in a native Linux desktop window">
-</p>
-
-<p align="center"><sub>Screenshots on this page show the previous interface, using real Halo production widgets with synthetic demonstration footage and account data. No private camera feeds or Ring account were used.</sub></p>
-
-## Home monitoring that belongs on the desktop
-
-Halo turns Ring camera access into a focused Linux application instead of
-another browser tab. The adaptive interface can follow your desktop theme, keeps
-camera state visible, and puts common monitoring workflows within one click.
-
-- **See the property at a glance.** Camera previews and reported security state
-  share the Overview; open Cameras for monitoring and device health.
-- **Build the monitoring wall you need.** Choose cameras, save layouts, and
-  move between flexible Small, Medium, and Large grid densities.
-- **Move from an event to the camera.** Review recorded activity, open focused
-  live view, and use supported camera controls without losing your place.
-- **Keep useful media close.** Save screenshots, download available recordings,
-  and archive important events as local Favorites.
-
-## Meet Halo
-
-Halo has five main views: **Overview**, **Cameras**, **Activity**, **Devices**, and
-**Security**. Navigation moves from the header to a bottom bar in narrow windows.
-
-### Overview
-
-Your home at a glance. Overview combines reported security state, camera snapshots
-with freshness labels, and recent events received while the view
-is open. Open a camera or continue to Activity for the full event history.
-
-![Previous Halo Dashboard with camera snapshots and device health information](doc/images/halo-dashboard.webp)
-
-### Cameras
-
-Turn selected cameras into a scrollable monitoring wall. Start or stop the
-wall together, save reusable layouts, filter the cameras on screen, and choose
-Balanced `4 / 2 / 1` or Dense `5 / 3 / 2` grid behavior. The camera inspector
-keeps audio, talk, light, siren, history, and settings controls nearby when the
-connected device supports them.
-
-Halo limits monitoring to four simultaneous streams by default. An optional
-six-stream mode is available as an experimental setting because reliability
-depends on Ring, the devices, and the local network.
-
-![Previous Halo Live Monitoring wall with a selected-camera inspector](doc/images/halo-live-monitoring.webp)
-
-### Focused Live View
-
-Give one camera the full canvas. Halo shows the latest still while live video
-connects, then provides playback, volume, two-way talk, screenshots, and
-zoom-and-pan inspection from 100% to 250%. Light and siren actions appear only
-for devices that expose those capabilities.
-
-![Previous Halo Focused Live View with camera controls and health status](doc/images/halo-focused-live.webp)
-
-### Activity
-
-Filter Ring activity by camera and event type, then review it in an adaptive
-list-and-detail workspace. Playback stays image-first: event identity and time
-sit below the video instead of covering it. Previous/next navigation, scrubbing,
-volume, fullscreen, screenshots, Favorites, sharing, downloads, and deletion
-are available where Ring provides the recording and action for the account.
-
-![Previous Halo Event History with an event list and unobstructed recording playback](doc/images/halo-event-history.webp)
-
-### Devices
-
-Browse connected devices by type, search their names and reported status, and
-open Cameras or Security from the same view. Chime cards open account-reported
-device details, volume controls, and explicit Ring or Motion sound tests for
-recognized legacy models. These controls
-are experimental until checked against a real device; unrecognized models and
-accounts without positive ownership evidence remain read-only. Light Groups has
-a separate location selector, reported group/member details, explicit timed On
-and Off requests, and fresh report verification. Group controls are experimental;
-an aggregate report does not establish every lamp's physical state. Intercom Audio
-and Video devices have reported status, incoming call/unlock observations and
-explicit entrance release with an expiring confirmation. Acceptance never proves
-a physical door opened or relocked. Qualified Intercom Video devices also offer
-an explicit experimental live session with listening and hold-to-talk; audio-only
-Intercom calling remains in the Ring app. See
-[Intercom support and limits](doc/intercom-support.md).
-
-Recognized Beams lights offer finite On and return-to-automatic controls,
-including bridge-only locations. Keypads offer qualified brightness controls,
-a local brightness lock and observed proximity. Camera lights distinguish
-pending requests from fresh reported outcomes. Read the [Beams](doc/beams-support.md),
-[keypad](doc/keypad-support.md) and [camera lighting](doc/camera-lighting.md) guides
-for device requirements and hardware acceptance limits.
-
-Volume changes require Apply and a fresh Ring report before Halo confirms them.
-After a sound request, confirm **The sound has stopped** before changing another
-setting. Request acceptance cannot establish that the device played a sound.
-See [Chime support and limits](doc/chime-support.md).
-
-Qualified Chimes also expose snooze/resume and automatic-nightlight settings.
-
-Light Groups offers 1-, 5- and 15-minute On requests, with a one-minute default.
-These are Halo duration choices; actual shutoff behavior requires hardware
-validation. Off does not disable Ring motion rules or schedules. Group and camera
-light actions share a bounded no-queue guard, while streams and other device
-controls remain independent. See [Light Groups support and limits](doc/light-groups-support.md).
-
-![Previous Halo Devices page showing discovered cameras and planned device families](doc/images/halo-devices.webp)
-
-### Security
-
-Check reported Ring Alarm modes, sensor status, and connection health by location.
-Mode requests retain their confirmation and reported-outcome checks. See
-[Experimental Ring Alarm](#experimental-ring-alarm) for capabilities and limits.
-
-### Settings
-
-Settings are organized around real tasks: **General**, **Live View**,
-**Events**, **Storage**, **Account**, and **Advanced**. Configure grid density,
-background behavior, notifications, media folders, stream preferences, account
-actions, and diagnostics from an adaptive Adwaita layout.
-
-![Previous Halo Settings showing the General category and camera grid options](doc/images/halo-settings.webp)
-
-## Made for Linux monitoring
-
-- **Native GTK 4 and libadwaita.** Five views use a header switcher on wide windows
-  and bottom navigation on narrow windows, with familiar symbolic icons.
-- **Your preferred appearance.** Choose Follow system, Light, or Dark from the
-  header's Appearance menu. Halo saves the choice locally for future launches.
-- **Desktop event awareness.** Optional notifications can include Ring-provided
-  descriptions and preview images, with actions that return to the relevant
-  camera or event. Quiet hours, timed snooze and per-device rules let you choose
-  when routine notifications appear.
-- **Current Ring privacy.** Camera live media and previews honor fresh settings
-  from Ring, with clear feedback when permission is unknown, stale or disabled.
-- **Thoughtful stream ownership.** The monitoring wall and focused view reuse
-  compatible live sessions while keeping audio and talkback state explicit.
-- **Local media tools.** Screenshots, downloaded recordings, Favorites, cache,
-  and diagnostics use predictable XDG and user media locations.
-- **Desktop credential storage.** Halo stores its Ring session through a
-  Secret Service provider such as GNOME Keyring or KeePassXC.
-
-## Install Halo
-
-Halo is currently an alpha source release for Linux. The supported installation
-path installs Halo for the current user from a checkout that remains on disk.
-
-### Arch Linux prerequisites
-
-```bash
-sudo pacman -S curl python-gobject gtk4 libadwaita libnotify libsecret \
-  gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly \
-  gst-libav gst-plugin-gtk4 gst-plugin-pipewire
-```
-
-Install the project-pinned `uv` release with its official standalone installer:
-
-```bash
-curl -LsSf https://astral.sh/uv/0.11.24/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-Halo requires exactly `uv 0.11.24` so dependency and artifact behavior match
-the checked-in lockfile. You can inspect the installer URL before running it.
-
-### Install and launch
-
-```bash
-git clone https://github.com/JamesFromFL/halo-gtk
-cd halo-gtk
-./scripts/install.sh
-halo-gtk
-```
-
-The installer creates `.venv` with access to system GObject libraries, installs
-the locked production dependencies, and adds the launcher, desktop entry,
-icons, and settings schema under your user directories. The launcher points to
-this checkout, so keep it at the same path while Halo is installed.
-
-For staged releases and local rollback, use the optional
-[managed installer](doc/staged-install-design.md). An experimental x86_64
-[GNOME 50 Flatpak](doc/flatpak-packaging.md) provides a bundled runtime candidate
-with its own qualification and desktop-integration limits.
-
-If `halo-gtk` is not found after installation, add `$HOME/.local/bin` to your
-`PATH` or start it with `$HOME/.local/bin/halo-gtk`.
-
-### Update
-
-From the checkout:
-
-```bash
-./scripts/update.sh
-```
-
-The update script requires a clean worktree, pulls with fast-forward only, and
-reruns the installer.
-
-### Uninstall desktop integration
-
-```bash
-./scripts/uninstall.sh
-```
-
-This removes the user-local launcher, desktop entry, icons, autostart entry, and
-settings schema. It intentionally preserves the checkout, virtual environment,
-Ring session, settings, cache, logs, Favorites, and saved media so they are not
-silently destroyed.
-
-## Requirements
-
-- Linux with GTK 4 and **libadwaita 1.5 or newer**
-- Python 3.11 through 3.14
-- `uv` 0.11.24
-- PyGObject, GdkPixbuf, GioUnix, Graphene, libnotify, and libsecret
-- GStreamer 1.20 or newer with common codecs and `gtk4paintablesink`
-- PulseAudio or PipeWire-compatible audio output
-- A PulseAudio-compatible microphone source for the current two-way-talk path
-- A desktop Secret Service provider for session storage
-
-PyGObject and the GNOME introspection libraries must come from distribution
-packages; pip cannot provide the complete native runtime. Package names vary by
-distribution. Systems whose base repositories ship libadwaita older than 1.5,
-including Debian 12, need a newer supported package source or distribution
-release.
-
-The wheel built in CI validates the Python package and bundled application icon.
-It does not install the desktop file, GSettings schema, or hicolor icons, so
-`scripts/install.sh` remains the supported desktop installation path.
-
-The media stack is validated against aiortc 1.15.0 and PyAV 17.1.0. Run
-`uv sync --frozen` after updating the checkout; an older environment does not
-support the explicit conversion-thread setting. Python 3.11 remains supported.
-
-Recording previews use verified HTTPS and a bounded child process for fetching,
-decoding, and image conversion. A slow, oversized, unsupported or canceled
-preview falls back to an available bounded snapshot. Previews accept at most
-8 MiB of recording body data and 4 MiB of image input, and return at most a
-1280×720 PNG. Full recording saves have a separate 512 MiB limit and a one-hour
-job budget; save jobs can continue across navigation and expose cancellation.
-Native codec process limits supplement these policies; they are not a complete
-security sandbox. Actual Ring/CDN compatibility and physical audio still need
-live regression testing.
-
-## Privacy and local data
-
-Halo is a Ring cloud client, not an offline or cloud-free security system. It
-communicates with Ring services and uses Google Firebase Cloud Messaging for
-live Ring events. Halo keeps its own settings and saved media locally and stores
-the authenticated Ring session through the desktop Secret Service.
-
-Diagnostic exports are redacted before packaging, but users should still review
-an archive before sharing it. Notification previews and descriptions can expose
-camera activity on a lock screen, so they remain configurable.
-
-<details>
-<summary><strong>Default local paths</strong></summary>
-
-| Data | Default path |
-| --- | --- |
-| Settings | `~/.config/halo-gtk/settings.json` |
-| Camera monitoring layouts | `~/.config/halo-gtk/live-monitoring-layouts.json` |
-| Camera nicknames | `~/.config/halo-gtk/device-nicknames.json` |
-| Local Favorites | `~/.local/share/halo-gtk/favorites/` |
-| Preview cache | `~/.cache/halo-gtk/` |
-| Logs | `~/.local/state/halo-gtk/halo-gtk.log` |
-| Screenshots | `~/Pictures/halo-gtk` |
-| Recording downloads | `~/Videos/halo-gtk` |
-
-Screenshot and recording folders can be changed in Settings.
-
-</details>
-
-## Experimental Ring Alarm
-
-Halo's native Alarm backend shares its authenticated Ring session with cameras.
-The Security view shows reported modes, transition state, sensor supervision and
-health, with location selection and a real inventory refresh. Offline sensor
-values remain last-known even while the hub is online. Reported hub battery
-power and siren state are read-only.
-
-Disarmed, Home and Away requests require fresh inventory and discovery evidence,
-a time-limited confirmation, and a separate review of any supported faulted
-sensors to bypass. Halo sends a request once and waits for an explicit panel
-update. It shows an uncertain outcome when confirmation is lost; navigating away
-does not cancel a request that may have reached Ring. Pending and terminal
-outcomes are retained by the service while the application runs.
-
-Activity has a separate **experimental Alarm cloud history** view.
-It labels unsupported fields and uncertain coverage. Optional local copies are
-off by default, with 7- or 30-day retention after retrieval and an explicit clear
-action. Saved copies are scoped to the signed-in account and require recent
-location permission verification; they are not a complete archive or current
-Alarm state. See [local history](doc/local-history-design.md) and
-[cloud coverage](doc/alarm-history-coverage.md).
-
-Recognized current Alarm signals can produce desktop alerts. Routine mode,
-sensor and health notifications are opt-in. Alarm notification details are off
-by default; enabling them can expose location/device names on a lock screen.
-These are observations while Halo is running, with gaps during outages—not a
-replacement for Ring's monitoring or emergency notifications.
-
-The integration uses undocumented Ring CLAP interfaces, with contracts checked
-against the maintained [`ring-client-api` reference](https://github.com/dgreif/ring/tree/3bcc624acc35b6f97c391089a12bff582bb6ed4a/packages/ring-client-api).
-It has **not** been validated against live Alarm hardware. Unknown authorization,
-active alarm/life-safety conditions, cellular backup and incomplete status remain
-read-only. Current shared-role permissions are not guessed from camera access.
-
-Halo is not an emergency-monitoring service. Panic/dispatch, Alarm siren,
-generic lock/switch/valve controls beyond the qualified Beams actions, schedules,
-access codes and other device configuration remain outside this scope. Keep the
-official Ring app or keypad available for
-setup, mode control and critical response. See [Alarm implementation notes](doc/alarm-implementation-2026-10-26.md)
-for architecture, bounds and the live validation checklist.
-
-## Current status
-
-Halo is currently **0.1.0 Alpha**. Camera, live-view, history, notification, and
-desktop workflows are implemented. Ring Alarm visibility and mode controls are
-experimental and have not been validated against live hardware. Ring APIs are
-private and evolving, and availability varies by device, account permissions,
-region, subscription, and Ring service behavior. Keep the official Ring app
-available for setup, account management, and critical security workflows.
-
-The [implementation report](doc/backlog-completion-2026-11-16.md) records the
-latest development and verification. Remaining hardware/protocol acceptance is
-tracked in the [improvement backlog](doc/improvement-backlog.md) and
-[integration research notes](doc/backlog-research-gates-2026-11-16.md).
-
-<details>
-<summary><strong>Development</strong></summary>
-
-```bash
-uv venv --system-site-packages
-uv lock --check
-uv sync --frozen --no-group audit
-.venv/bin/halo-gtk
-.venv/bin/ruff check --no-cache src tests scripts
-.venv/bin/ruff format --check --no-cache src tests scripts
-.venv/bin/pytest -q -p no:cacheprovider
-uv build --out-dir dist
-```
-
-`--system-site-packages` lets the virtual environment use `gi` and the GObject
-introspection libraries installed by the distribution.
-
-See [SECURITY.md](SECURITY.md) for dependency maintenance and the scoped upstream
-OAuthlib advisory exception. The [October 2026 audit](doc/audit-2026-10-25.md)
-records fixes, validation boundaries, unfinished features, and proposed larger changes.
-
-</details>
-
-## License
-
-Halo is licensed under **GPL-3.0-or-later**. See [LICENSE](LICENSE).
-
-Ring and Amazon are trademarks of their respective owners. Their names are used
-only to describe compatibility. Halo is an independent open-source project and
-is provided without affiliation, endorsement, or support from Ring or Amazon.
+---
+
+<p align="center"><sub>
+  Free and open source · <a href="LICENSE">GPL-3.0-or-later</a> · <a href="doc/guide.md">Halo Guide</a><br>
+  Halo is an independent project, not affiliated with or endorsed by Ring or Amazon.<br>
+  Screenshots use fictional scenes and demonstration device data, never private camera feeds.
+</sub></p>
