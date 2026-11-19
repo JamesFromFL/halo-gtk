@@ -138,6 +138,7 @@ def test_stage_failure_preserves_active_release_and_keeps_candidate_diagnostics(
     def fail(*args, **kwargs):
         raise managed.InstallError("synthetic qualification failure")
 
+    git(repository, "commit", "--allow-empty", "-qm", "Candidate with a new revision")
     monkeypatch.setattr(manager, "_build" if failure == "build" else "_health", fail)
     with pytest.raises(managed.InstallError):
         stage(manager, repository)
@@ -703,3 +704,65 @@ def test_uninstall_does_not_follow_replaced_asset_parent(manager, repository, tm
         manager.uninstall()
     assert (moved / "halo-gtk").read_bytes() == before
     assert manager.pointer("current") == name
+
+
+@pytest.mark.parametrize("action", ["install", "update", "uninstall"])
+@pytest.mark.parametrize("profile", ["active", "changed-xdg", "interrupted"])
+def test_plain_wrappers_preserve_managed_assets(manager, repository, action, profile, tmp_path):
+    name = stage(manager, repository)
+    activate(manager, name)
+    data = manager.root.parent.parent
+    if profile == "changed-xdg":
+        data = tmp_path / "new data"
+    elif profile == "interrupted":
+        manager.installation.rename(manager.journal)
+        manager.assets["launcher"].unlink()
+    before = snapshots(manager)
+    current = manager.pointer("current")
+    result = subprocess.run(
+        [SCRIPT.parent / f"{action}.sh"],
+        env={**os.environ, "HOME": str(manager.home), "XDG_DATA_HOME": str(data)},
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert "managed installer owns" in result.stderr
+    assert str(manager.root) in result.stderr
+    assert snapshots(manager) == before and manager.pointer("current") == current
+
+
+def test_repeated_stage_and_prune_preserve_active_previous_and_leased(manager, repository):
+    first, second = two_releases(manager, repository)
+    activate(manager, second)
+    assert stage(manager, repository) == second
+    git(repository, "commit", "--allow-empty", "-qm", "Unactivated candidate")
+    extra = stage(manager, repository)
+    with manager.lease(extra, shared=True):
+        assert manager.prune() == []
+    assert manager.prune() == [extra]
+    assert manager.pointer("current") == second and manager.pointer("previous") == first
+
+
+def test_active_launcher_available_while_building(manager, repository, monkeypatch, tmp_path):
+    first = stage(manager, repository)
+    activate(manager, first)
+    git(repository, "commit", "--allow-empty", "-qm", "Stage a new revision")
+    result = tmp_path / "launch.json"
+
+    def build_during_launch(release, *, uv, python):
+        subprocess.run(
+            [manager.assets["launcher"]],
+            check=True,
+            timeout=5,
+            env={**os.environ, "HALO_TEST_RESULT": str(result)},
+        )
+        assert json.loads(result.read_text())["schema"] == str(
+            manager.release(first) / "assets/schemas"
+        )
+        fake_build(manager, release, uv=uv, python=python)
+
+    monkeypatch.setattr(manager, "_build", build_during_launch)
+    monkeypatch.setattr(managed, "Manager", lambda root: manager)
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "stage", "--repository", str(repository)])
+    managed.main()

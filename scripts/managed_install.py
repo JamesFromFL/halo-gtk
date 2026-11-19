@@ -1,7 +1,7 @@
 """Opt-in staged Halo releases; no account access, app stopping or Git mutation.
 
 Only this module's managed paths and two explicitly owned desktop files are
-published. The checkout installer remains a separate, unchanged default.
+published. The checkout installer checks profile ownership before publishing its desktop files.
 """
 
 from __future__ import annotations
@@ -285,6 +285,45 @@ def default_root() -> Path:
     return (value if value.is_absolute() else home / ".local/share") / "halo-gtk/managed"
 
 
+def launcher_managed_root(launcher: Path) -> Path | None:
+    # Older launchers include the root, even after XDG_DATA_HOME changes.
+    if launcher.is_symlink() or not launcher.is_file() or launcher.stat().st_size > MAX_FILE:
+        return None
+    lines = launcher.read_bytes().decode(errors="replace").splitlines()
+    if len(lines) != 2 or not lines[1].startswith("exec "):
+        return None
+    try:
+        args = shlex.split(lines[1])
+    except ValueError:
+        return None
+    if (
+        len(args) == 9
+        and args[2] == "-I"
+        and args[4] == "--root"
+        and args[6:] == ["launch", "--", "$@"]
+    ):
+        owner = Path(args[5])
+        if owner.is_absolute() and Path(args[3]).parent == owner:
+            return owner
+    return None
+
+
+def checkout_guard(action: str) -> None:
+    owner = launcher_managed_root(Path.home() / ".local/bin/halo-gtk")
+    root = owner or default_root()
+    if owner or any(
+        os.path.lexists(root / marker)
+        for marker in ("current", "installation.json", "transaction.json")
+    ):
+        manager = Path(__file__).resolve()
+        command = ["python3", str(manager), "--root", str(root), action]
+        if action != "uninstall":
+            command += ["--repository", str(manager.parents[1])]
+        raise InstallError(
+            "The managed installer owns this desktop integration. Use " + shlex.join(command)
+        )
+
+
 class Manager:
     def __init__(self, root: Path, *, home: Path | None = None):
         self.root = root
@@ -308,8 +347,9 @@ class Manager:
         self.autostart = config / "autostart" / f"{APP_ID}.desktop"
 
     @contextlib.contextmanager
-    def lock(self, *, shared: bool = False):
-        fd = os.open(self.root / "install.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    def lock(self, *, shared: bool = False, staging: bool = False):
+        filename = "stage.lock" if staging else "install.lock"
+        fd = os.open(self.root / filename, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
@@ -442,7 +482,6 @@ class Manager:
     def stage(
         self, repository: Path, ref: str, *, uv: str = "uv", python: str = sys.executable
     ) -> str:
-        self.recover()
         temporary = self.root / ("stage-" + uuid.uuid4().hex)
         safe_directory(temporary)
         completed = False
@@ -498,29 +537,54 @@ class Manager:
             if project.get("project", {}).get("name") != "halo-gtk":
                 raise InstallError("Source is not a Halo GTK project")
             lock = digest(read_regular(source / "uv.lock", limit=16 * 1024 * 1024))
+            interpreter = shutil.which(python)
+            if not interpreter:
+                raise InstallError("The requested Python interpreter is unavailable")
+            executable = Path(interpreter).resolve()
+            info = executable.stat()
+            builder = [str(executable), info.st_size, info.st_mtime_ns, UV_VERSION]
+            for candidate in sorted(
+                (self.root / "releases").glob(f"{revision[:12]}-{lock[:12]}-*")
+            ):
+                if not RELEASE_ID.fullmatch(candidate.name) or candidate.is_symlink():
+                    continue
+                try:
+                    metadata = self.manifest(candidate.name)
+                    if (
+                        metadata.get("revision") == revision
+                        and metadata.get("lock") == lock
+                        and metadata.get("builder") == builder
+                        and self._health(candidate) == metadata["health"]
+                    ):
+                        completed = True
+                        return candidate.name
+                except (InstallError, OSError, KeyError):
+                    continue
             name = f"{revision[:12]}-{lock[:12]}-{uuid.uuid4().hex[:12]}"
             release = self.release(name)
-            json_write(release / "candidate.json", {"format": FORMAT, "release": name})
-            os.rename(source, release / "source")
-            # No environment exists until source is at its final absolute path.
-            self._build(release, uv=uv, python=python)
-            health = self._health(release)
-            json_write(
-                release / "release.json",
-                {
-                    "format": FORMAT,
-                    "data_format": 1,
-                    "validated": True,
-                    "release": name,
-                    "revision": revision,
-                    "lock": lock,
-                    "uv": UV_VERSION,
-                    "health": health,
-                    "created": time.time(),
-                },
-            )
-            self.manifest(name)
-            self.checkpoint("staged")
+            with self.lease(name):
+                json_write(release / "candidate.json", {"format": FORMAT, "release": name})
+                os.rename(source, release / "source")
+                # No environment exists until source is at its final absolute path.
+                self._build(release, uv=uv, python=python)
+                health = self._health(release)
+                json_write(
+                    release / "release.json",
+                    {
+                        "format": FORMAT,
+                        "data_format": 1,
+                        "validated": True,
+                        "release": name,
+                        "revision": revision,
+                        "lock": lock,
+                        "uv": UV_VERSION,
+                        "builder": builder,
+                        "health": health,
+                        "created": time.time(),
+                    },
+                )
+                self.manifest(name)
+                self.checkpoint("staged")
             completed = True
             return name
         finally:
@@ -716,6 +780,20 @@ class Manager:
         marker = json_read(self.release(name) / "candidate.json")
         if marker != {"format": FORMAT, "release": name}:
             raise InstallError("Release was not created by this installer")
+
+    def prune(self) -> list[str]:
+        self.recover()
+        protected = {self.pointer("current"), self.pointer("previous")}
+        removed = []
+        for path in sorted((self.root / "releases").iterdir()):
+            if path.name in protected or not RELEASE_ID.fullmatch(path.name) or path.is_symlink():
+                continue
+            try:
+                self._remove_releases([path.name])
+            except Busy:
+                continue
+            removed.append(path.name)
+        return removed
 
     def activate(self, name: str, *, replace_checkout: bool = False) -> None:
         self.recover()
@@ -916,39 +994,53 @@ def main():
         sub.add_argument("--uv", default="uv")
         sub.add_argument("--python", default=sys.executable)
         sub.add_argument("--replace-checkout", action="store_true")
+    sub = commands.add_parser("checkout-guard")
+    sub.add_argument("operation", choices=("install", "update", "uninstall"))
     sub = commands.add_parser("activate")
     sub.add_argument("release")
     sub.add_argument("--replace-checkout", action="store_true")
-    for action in ("status", "rollback", "uninstall"):
+    for action in ("status", "rollback", "uninstall", "prune"):
         commands.add_parser(action)
     sub = commands.add_parser("launch")
     sub.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     try:
+        if args.action == "checkout-guard":
+            checkout_guard(args.operation)
+            return
         manager = Manager(args.root)
         if args.action == "launch":
             manager.launch(args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments)
             return
-        with manager.lock():
+        # Stage/build operations serialize with all writers. Launchers only use
+        # install.lock to resolve the current pointer and acquire a release lease.
+        with manager.lock(staging=True):
             if args.action in {"install", "stage", "update"}:
-                if args.action == "update" and manager.pointer("current") is None:
-                    raise InstallError("No managed installation exists; use install first")
+                with manager.lock():
+                    manager.recover()
+                    if args.action == "update" and manager.pointer("current") is None:
+                        raise InstallError("No managed installation exists; use install first")
                 name = manager.stage(args.repository, args.ref, uv=args.uv, python=args.python)
                 print("Validated staged release:", name, flush=True)
                 if args.action != "stage":
-                    manager.activate(name, replace_checkout=args.replace_checkout)
+                    with manager.lock():
+                        manager.activate(name, replace_checkout=args.replace_checkout)
                     print("Activated:", name)
-            elif args.action == "activate":
-                manager.activate(args.release, replace_checkout=args.replace_checkout)
-                print("Activated:", args.release)
-            elif args.action == "status":
-                print(json.dumps(manager.status(), indent=2))
-            elif args.action == "rollback":
-                manager.rollback()
-                print("Activated:", manager.pointer("current"))
-            else:
-                manager.uninstall()
-                print("Managed releases removed; settings, media and credentials preserved.")
+                return
+            with manager.lock():
+                if args.action == "activate":
+                    manager.activate(args.release, replace_checkout=args.replace_checkout)
+                    print("Activated:", args.release)
+                elif args.action == "status":
+                    print(json.dumps(manager.status(), indent=2))
+                elif args.action == "rollback":
+                    manager.rollback()
+                    print("Activated:", manager.pointer("current"))
+                elif args.action == "prune":
+                    print("Removed inactive releases:", ", ".join(manager.prune()) or "none")
+                else:
+                    manager.uninstall()
+                    print("Managed releases removed; settings, media and credentials preserved.")
     except (InstallError, OSError, subprocess.TimeoutExpired) as exc:
         print(f"Managed installation: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

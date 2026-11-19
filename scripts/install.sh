@@ -8,6 +8,7 @@ if [[ "${1:-}" == "--managed" ]]; then
   shift
   exec python3 "$REPO_ROOT/scripts/managed_install.py" install --repository "$REPO_ROOT" "$@"
 fi
+python3 -I "$REPO_ROOT/scripts/managed_install.py" checkout-guard install
 DATA_HOME="${XDG_DATA_HOME:-}"
 [[ "$DATA_HOME" = /* ]] || DATA_HOME="$HOME/.local/share"
 BIN_DIR="$HOME/.local/bin"

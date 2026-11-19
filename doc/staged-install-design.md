@@ -31,6 +31,9 @@ scripts/update.sh --managed
 # Revalidate and switch to the previous release; repeating switches back.
 python3 scripts/managed_install.py rollback
 
+# Remove unused staged builds, keeping the current and previous releases and running copies.
+python3 scripts/managed_install.py prune
+
 # Restore backed-up checkout integration, or remove managed integration.
 scripts/uninstall.sh --managed
 ```
@@ -95,7 +98,7 @@ second environment and the dependency cache.
 
 ## Activation and failure recovery
 
-The installer serializes operations with a file lock. A managed launch resolves
+A staging lock serializes installer operations. A separate activation lock protects desktop publication and the handoff to a running release. The active application can launch while dependencies for another release are being built. Matching builds are reused after their interpreter identity, dependency lock and runtime health are checked. A managed launch resolves
 `current` once, validates that release, acquires its shared lease and then executes
 its concrete Python and package. Activation and uninstall require exclusive
 leases. If Halo is running from an affected release, activation is deferred; the
@@ -152,8 +155,7 @@ did not predate managed installation, and no original launcher is being restored
 Custom or pre-existing autostart entries are preserved. Only release directories
 with installer ownership markers are deleted. User data and credentials remain.
 The private lock, versioned bootstraps and dependency cache remain to preserve
-concurrent-operation safety and allow a later reinstall; there is no automatic
-release garbage collection while installed.
+concurrent-operation safety and allow a later reinstall. Use the explicit `prune` command to reclaim unused release directories. The plain install, update and uninstall scripts detect managed ownership and print the command for that installation before changing any files.
 
 ## Qualification
 

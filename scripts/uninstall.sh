@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ "${1:-}" == "--managed" ]]; then
   shift
-  REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
   exec python3 "$REPO_ROOT/scripts/managed_install.py" uninstall "$@"
 fi
+python3 -I "$REPO_ROOT/scripts/managed_install.py" checkout-guard uninstall
 
 APP_ID="io.github.JamesFromFL.HaloGtk"
 APP_NAME="halo-gtk"
