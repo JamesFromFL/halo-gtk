@@ -123,6 +123,7 @@ _LISTENER_RECONNECT_MIN = 5
 _LISTENER_RECONNECT_MAX = 120
 _RING_LOCATIONS_ENDPOINT = "https://api.ring.com/devices/v1/locations"
 _ALARM_LOCATION_DISCOVERY_TIMEOUT = 10
+_ALARM_HUB_FAMILIES = frozenset({"base_stations", "beams_bridges"})
 _LOCAL_HISTORY_ACCESS_TTL = 300
 _LOCAL_HISTORY_WORKERS = threading.BoundedSemaphore(2)
 _PREVIEW_CALL_SLOTS = threading.BoundedSemaphore(2)
@@ -280,7 +281,7 @@ def _install_device_inventory_refresh(ring) -> None:
         response = await ring.async_query(SDK_DEVICES_ENDPOINT)
         raw = response.json()
         ring._halo_alarm_hubs = {
-            family: raw[family] for family in ("base_stations", "beams_bridges") if family in raw
+            family: raw[family] for family in _ALARM_HUB_FAMILIES if family in raw
         }
         device_data = {}
         for family, records in raw.items():
@@ -674,6 +675,8 @@ class RingClient:
         self._ancillary_task = None
         self._alarm_reconcile_lock = asyncio.Lock()
         self._alarm_inventory_version = 0
+        self._nonempty_hub_families: set[str] = set()
+        self._history_inventory_locations: frozenset[str] | None = None
         self._authenticated = False
         self._token_updater = token_updater or _save_token
         self._pending_auth_token: dict | None = None
@@ -971,6 +974,28 @@ class RingClient:
         await self._ring.auth.async_refresh_tokens()
         await self._async_refresh_devices(None, -1)
 
+    def _record_alarm_membership(self, devices, seeds):
+        # Providers may omit an unused family. A family observed with hubs must
+        # be explicitly read before a later observation can remove its locations.
+        if seeds is not None and isinstance(devices, Mapping):
+            if self._nonempty_hub_families - devices.keys():
+                seeds = None
+            else:
+                self._nonempty_hub_families = {
+                    family for family in _ALARM_HUB_FAMILIES if devices.get(family)
+                }
+        # Saved locations can predate this session. Cleanup needs both families
+        # and a snapshot matching this specific complete observation.
+        with self._alarm_snapshot_lock:
+            self._history_inventory_locations = (
+                frozenset(seed.location_id for seed in seeds)
+                if seeds is not None
+                and isinstance(devices, Mapping)
+                and devices.keys() >= _ALARM_HUB_FAMILIES
+                else None
+            )
+        return seeds
+
     async def _async_reconcile_alarm_discovery(self, version, *, read_failed=False) -> None:
         service = self._alarm_service
         if service is None:
@@ -980,9 +1005,14 @@ class RingClient:
                 return
             seeds = None if read_failed else await self._async_alarm_location_seeds()
             if version == self._alarm_inventory_version and service is self._alarm_service:
+                devices = getattr(self._ring, "_halo_alarm_hubs", None)
+                seeds = self._record_alarm_membership(devices, seeds)
                 if seeds is None:
                     service.beams.update_owners(None)
                 await service.reconcile(seeds)
+                self._queue_history_reconciliation(
+                    self.get_alarm_snapshot(), self._published_generation
+                )
 
     def _alarm_location_seeds(
         self,
@@ -1124,10 +1154,10 @@ class RingClient:
             AlarmServiceStatus.NO_SYSTEM,
         }:
             return None
-        return (
-            frozenset(location.location_id for location in snapshot.locations)
-            - self._history_denied_locations
-        )
+        locations = frozenset(location.location_id for location in snapshot.locations)
+        if locations != self._history_inventory_locations:
+            return None
+        return locations - self._history_denied_locations
 
     def _history_location_allowed(self, location_id):
         snapshot = self._alarm_snapshot
@@ -1270,6 +1300,7 @@ class RingClient:
                 or {location.location_id for location in self._alarm_snapshot.locations}
                 != {location.location_id for location in snapshot.locations}
                 or self._local_alarm_history is None
+                or self._history_membership() is None
             ):
                 return
             locations = {location.location_id for location in snapshot.locations}
@@ -1405,6 +1436,7 @@ class RingClient:
         self._alarm_inventory_version += 1
         version = self._alarm_inventory_version
         self._alarm_discovery_at = None
+        devices = None
         service.beams.update_owners(None)
         try:
             async with asyncio.timeout(12):
@@ -1423,7 +1455,9 @@ class RingClient:
                 or service is not self._alarm_service
             ):
                 return False
+            seeds = self._record_alarm_membership(devices, seeds)
             await service.reconcile(seeds)
+            self._queue_history_reconciliation(self.get_alarm_snapshot(), generation)
             if (
                 seeds is None
                 or version != self._alarm_inventory_version
@@ -1551,7 +1585,7 @@ class RingClient:
     def _create_alarm_service(
         self,
         generation: int,
-        locations: Iterable[AlarmLocationSeed] | None = None,
+        locations: Iterable[AlarmLocationSeed] | None,
     ):
         from halo_gtk.alarm.service import RingAlarmService
 
@@ -1560,7 +1594,7 @@ class RingClient:
             raise RuntimeError("Not signed in to Ring")
         return RingAlarmService(
             self._get_alarm_gateway(),
-            locations if locations is not None else self._alarm_location_seeds(),
+            locations,
             self._on_alarm_snapshot,
             generation=generation,
             command_admission=partial(self._alarm_command_admission, generation),
@@ -1586,6 +1620,9 @@ class RingClient:
             locations = await self._async_alarm_location_seeds()
             if not _is_active_client_generation(self, generation) or self._stop_event.is_set():
                 return
+            locations = self._record_alarm_membership(
+                getattr(self._ring, "_halo_alarm_hubs", None), locations
+            )
             service = self._create_alarm_service(generation, locations)
             self._alarm_service = service
             await service.run(stop_event)

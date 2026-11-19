@@ -48,6 +48,7 @@ def active(monkeypatch, tmp_path):
     client = rc.RingClient()
     client._published_generation = 1
     client._alarm_snapshot = snapshot()
+    client._history_inventory_locations = frozenset({"home"})
     client._history_access_receipts["home"] = rc.alarm_monotonic_time()
     client._local_alarm_history = LocalAlarmHistory("a" * 32, root=tmp_path / "saved")
     monkeypatch.setattr(rc, "_client", client)
@@ -322,6 +323,9 @@ def test_ordinary_sensor_snapshots_do_not_repeat_disk_reconciliation(active, mon
     current = snapshot(locations=())
     active._alarm_snapshot = current
     active._reconcile_local_history(current, 1)
+    assert calls == [frozenset({"home"})]
+    active._record_alarm_membership({"base_stations": [], "beams_bridges": []}, ())
+    active._reconcile_local_history(current, 1)
     assert calls[-1] == frozenset()
 
 
@@ -580,7 +584,7 @@ async def test_partial_and_malformed_routine_discovery_suspend_history_until_res
     from tests.test_ring_alarm_service import _panel, _StreamingTransport, _wait_until
 
     locations = [{"id": 1, "location_id": "home"}, {"id": 2, "location_id": "work"}]
-    payload = {"base_stations": locations}
+    payload = {"base_stations": locations, "beams_bridges": []}
     ring = Ring(object())
     ring.session = {}
     ring.async_query = AsyncMock(side_effect=lambda *_: SimpleNamespace(json=lambda: payload))
@@ -620,6 +624,20 @@ async def test_partial_and_malformed_routine_discovery_suspend_history_until_res
         for location in ("home", "work"):
             active._save_local_history_result(page(location), 1)
             assert active.saved_alarm_history(location).events
+
+        # A new session cannot know all families represented on disk. Live
+        # discovery from one reported family leaves the older saved copy alone.
+        store.save(page("previous-session"))
+        del payload["beams_bridges"]
+        await refresh()
+        assert store.load("previous-session").events
+        payload["beams_bridges"] = [{"id": 7, "location_id": "work"}]
+        await refresh()
+        del payload["beams_bridges"]
+        await refresh()
+        assert service.snapshot.error_code == "discovery-unavailable"
+        assert store.load("work").events
+        payload["beams_bridges"] = []
 
         for malformed in ([*locations[:1], {"id": 1}], {}, None):
             payload["base_stations"] = malformed
