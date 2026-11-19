@@ -50,7 +50,9 @@ def test_ci_checks_lock_freshness_and_the_installed_wheel():
     workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     setup_count = workflow.count("uses: astral-sh/setup-uv@")
 
-    assert setup_count == 4
+    assert setup_count == 6
+    assert "scripts/ci_native_tests.sh" in workflow
+    assert 'python: ["3.11", "3.14"]' in workflow
     assert workflow.count('version: "0.11.24"') == setup_count
     assert workflow.count("uv lock --check") == setup_count
     assert "uv build --out-dir dist" in workflow

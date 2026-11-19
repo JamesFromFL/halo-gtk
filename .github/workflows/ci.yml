@@ -93,6 +93,42 @@ jobs:
       - run: uv sync --frozen --no-group audit
       - run: .venv/bin/pytest -q -p no:cacheprovider
 
+  native-desktop:
+    runs-on: ubuntu-latest
+    container: archlinux:base
+    timeout-minutes: 25
+    steps:
+      - name: Install the desktop and media runtime
+        run: |
+          pacman -Syu --noconfirm --needed git python python-gobject gtk4 libadwaita \
+            libnotify libsecret gst-plugin-gtk4 gst-plugins-good gst-libav
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.24"
+      - run: uv lock --check
+      - run: uv venv --python /usr/bin/python3 --system-site-packages
+      - run: uv sync --frozen --no-group audit
+      - run: scripts/ci_native_tests.sh
+
+  python-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.24"
+      - run: uv lock --check
+      - run: uv sync --frozen --no-group audit --python ${{ matrix.python }}
+      - name: Check the supported Python endpoints
+        run: |
+          .venv/bin/python -m compileall -q src scripts
+          .venv/bin/pytest -q -p no:cacheprovider tests/test_alarm_models.py tests/test_log_redaction.py tests/test_alarm_protocol.py
+
   package:
     runs-on: ubuntu-latest
     timeout-minutes: 20
