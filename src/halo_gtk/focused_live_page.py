@@ -50,6 +50,7 @@ class FocusedLivePage(Gtk.Box):
         self._session = None
         self._intercom_supported = False
         self._volume = 0.0
+        self._screenshot_pending = False
         self._previous_volume = 1.0
         self._zoom = 1.0
         self._drag_start_x = 0.0
@@ -86,6 +87,8 @@ class FocusedLivePage(Gtk.Box):
         title_copy.append(self._model_label)
         self._privacy_label = Gtk.Label(xalign=0, wrap=True, css_classes=["caption"])
         title_copy.append(self._privacy_label)
+        self._stream_status_label = Gtk.Label(xalign=0, wrap=True, visible=False)
+        title_copy.append(self._stream_status_label)
         self._lighting_label = Gtk.Label(
             xalign=0, wrap=True, css_classes=["caption", "dim-label"], visible=False
         )
@@ -183,11 +186,9 @@ class FocusedLivePage(Gtk.Box):
         self._volume_scale.connect("value-changed", self._on_volume_changed)
         transport_controls.append(self._volume_scale)
 
-        self._mic_btn = Gtk.ToggleButton(
-            icon_name="microphone-disabled-symbolic",
-            tooltip_text="Microphone off",
-        )
-        self._mic_btn.connect("toggled", self._on_mic_toggled)
+        from halo_gtk.talk_button import HoldToTalkButton
+
+        self._mic_btn = HoldToTalkButton(lambda: self._session, compact=True)
         transport_controls.append(self._mic_btn)
 
         screenshot_btn = self._screenshot_btn = Gtk.Button(
@@ -329,7 +330,6 @@ class FocusedLivePage(Gtk.Box):
             self._stop_talking()
             get_live_session_manager().release(self._device.id, owner=FOCUSED_OWNER)
         self._session = None
-        self._reset_microphone_control()
         self._set_controls_sensitive(False)
         self._cancel_live_ready_poll()
         self._clear_video_box()
@@ -354,10 +354,10 @@ class FocusedLivePage(Gtk.Box):
         except Exception as exc:
             _log.warning("Focused live view could not start: %s", exc)
             self._session = None
-            self._reset_microphone_control()
+            self._stop_talking()
             self._set_controls_sensitive(False)
             return
-        if self._session.get_current_frame_png() is not None:
+        if self._session.has_current_frame():
             self._show_session_paintable()
         else:
             self._wait_for_live_frame()
@@ -369,12 +369,15 @@ class FocusedLivePage(Gtk.Box):
             return
         self._cancel_live_ready_poll()
         if self._session is not None:
-            png = self._session.get_current_frame_png()
-            if png:
-                self._still_privacy_lease = camera_privacy.acquire_current(self._device, "preview")
-                self._set_still_paintable(png)
-            elif self._still_paintable is not None:
+            lease = camera_privacy.acquire_current(self._device, "preview")
+            paintable = self._session.get_paintable()
+            if lease is not None and paintable is not None and self._session.has_current_frame():
+                self._still_paintable = paintable.get_current_image()
+                self._still_privacy_lease = lease
+            if camera_privacy.lease_is_current(self._still_privacy_lease):
                 self._video_view.set_paintable(self._still_paintable)
+            else:
+                self._clear_video_box()
         # Release only this view's ownership; if Live Monitoring still owns the
         # session the underlying stream keeps running (don't stop_device()).
         self._stop_talking()
@@ -410,6 +413,13 @@ class FocusedLivePage(Gtk.Box):
         session = self._session
         if session is not None and session.get_paintable() is None:
             self._video_view.set_paintable(None)
+        stream_status = {
+            "waiting": "Waiting for the previous camera to close…",
+            "recovering": "Waiting for the camera to resume video…",
+            "failed": "Camera video unavailable. Select Play to try again.",
+        }.get(session.state if session is not None else None)
+        self._stream_status_label.set_label(stream_status or "")
+        self._stream_status_label.set_visible(stream_status is not None)
         self._set_controls_sensitive(session is not None and session.active)
 
     def _show_session_paintable(self) -> None:
@@ -471,7 +481,7 @@ class FocusedLivePage(Gtk.Box):
         ):
             return GLib.SOURCE_REMOVE
         # Do not overwrite a live stream that already has its first frame.
-        if self._session is not None and self._session.get_current_frame_png() is not None:
+        if self._session is not None and self._session.has_current_frame():
             return GLib.SOURCE_REMOVE
         self._still_privacy_lease = lease
         self._set_still_paintable(png_bytes)
@@ -491,7 +501,7 @@ class FocusedLivePage(Gtk.Box):
             self._stop_talking()
             self._set_controls_sensitive(False)
             return GLib.SOURCE_REMOVE
-        if self._session.get_current_frame_png() is None:
+        if not self._session.has_current_frame():
             return GLib.SOURCE_CONTINUE
         self._show_session_paintable()
         self._live_ready_source_id = None
@@ -540,7 +550,7 @@ class FocusedLivePage(Gtk.Box):
         has_siren = device_commands.has_capability(self._device, "siren")
         self._intercom_supported = supports_ring_camera_intercom(self._device)
         self._mic_btn.set_visible(self._intercom_supported)
-        self._reset_microphone_control()
+        self._stop_talking()
         self._light_btn.set_visible(has_light)
         self._siren_btn.set_visible(has_siren)
         if has_light:
@@ -575,64 +585,56 @@ class FocusedLivePage(Gtk.Box):
     def _on_volume_changed(self, scale: Gtk.Scale) -> None:
         self._set_volume_state(scale.get_value())
 
-    def _on_mic_toggled(self, btn: Gtk.ToggleButton) -> None:
-        import weakref
-
-        from halo_gtk.ui_feedback import microphone_state, show_toast
-
-        if self._session is None:
-            return
-        if btn.get_active():
-            session = self._session
-            page_ref = weakref.ref(self)
-
-            def on_state(state):
-                page = page_ref()
-                if page is not None and page._session is session:
-                    microphone_state(page._mic_btn, page._on_mic_toggled, state)
-                    if state == "failed":
-                        show_toast(page, "Microphone unavailable. Check your input device.")
-
-            session.start_talking(on_state_changed=on_state)
-        else:
-            btn.set_icon_name("microphone-disabled-symbolic")
-            btn.set_tooltip_text("Microphone off")
-            self._session.stop_talking()
-
     def _on_screenshot(self, *_args) -> None:
         from halo_gtk.ui_feedback import show_toast
 
-        if self._session is None:
+        session = self._session
+        if session is None or self._screenshot_pending:
             return
         lease = camera_privacy.acquire_current(self._device, "preview")
         if lease is None:
             return
-        png = self._session.get_current_frame_png()
-        if png is None:
-            return
-        zoomed_png = self._video_view.zoomed_frame_png(png)
-        if zoomed_png is not None:
-            png = zoomed_png
-        camera_name = device_names.display_name(self._device) if self._device is not None else None
-        if not camera_privacy.lease_is_current(lease):
-            return
-        try:
-            dest = media_paths.snapshot_dir(camera_name)
-            media_paths.write_unique_bytes(
-                dest,
-                datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
-                ".png",
-                png,
-            )
-        except OSError:
-            show_toast(self, "Could not save screenshot. Check free space and folder permissions.")
-            return
-        show_toast(self, "Screenshot saved")
-        if media_paths.should_open_after_save():
+        viewport = None
+        if self._zoom > 1.0:
+            paintable = session.get_paintable()
+            width, height = paintable.get_intrinsic_width(), paintable.get_intrinsic_height()
+            if width > 0 and height > 0:
+                left, top, right, bottom = self._video_view.source_viewport(width, height)
+                viewport = left / width, top / height, right / width, bottom / height
+        camera_name = device_names.display_name(self._device)
+        generation = self._view_generation
+        self._screenshot_pending = True
+
+        def finish(message, folder=None):
+            self._screenshot_pending = False
+            if generation != self._view_generation or not camera_privacy.lease_is_current(lease):
+                return GLib.SOURCE_REMOVE
+            if message:
+                show_toast(self, message)
+            if folder is not None and media_paths.should_open_after_save():
+                try:
+                    media_paths.open_folder(folder)
+                except Exception:
+                    show_toast(self, "Screenshot saved, but the folder could not be opened.")
+            return GLib.SOURCE_REMOVE
+
+        def save():
+            message, folder = None, None
             try:
-                media_paths.open_folder(dest)
-            except Exception:
-                show_toast(self, "Screenshot saved, but the folder could not be opened.")
+                if camera_privacy.lease_is_current(lease):
+                    png = session.get_current_frame_png(viewport)
+                    if png and camera_privacy.lease_is_current(lease):
+                        dest = media_paths.snapshot_dir(camera_name)
+                        media_paths.write_unique_bytes(
+                            dest, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"), ".png", png
+                        )
+                        message, folder = "Screenshot saved", dest
+            except OSError:
+                message = "Could not save screenshot. Check free space and folder permissions."
+            finally:
+                GLib.idle_add(finish, message, folder)
+
+        threading.Thread(target=save, daemon=True, name="halo-screenshot").start()
 
     def _on_play(self, *_args) -> None:
         self._start_session()
@@ -835,24 +837,9 @@ class FocusedLivePage(Gtk.Box):
             return
         self._video_view.set_pan(self._drag_start_x + offset_x, self._drag_start_y + offset_y)
 
-    def _reset_microphone_control(self) -> None:
-        if not hasattr(self, "_mic_btn"):
-            return
-        self._mic_btn.handler_block_by_func(self._on_mic_toggled)
-        self._mic_btn.set_active(False)
-        self._mic_btn.handler_unblock_by_func(self._on_mic_toggled)
-        self._mic_btn.set_icon_name("microphone-disabled-symbolic")
-        self._mic_btn.set_tooltip_text("Microphone off")
-
     def _stop_talking(self) -> None:
-        if not hasattr(self, "_mic_btn"):
-            return
-        if self._mic_btn.get_active() and self._session is not None:
-            try:
-                self._session.stop_talking()
-            except Exception as exc:
-                _log.debug("Failed to stop focused talkback: %s", exc)
-        self._reset_microphone_control()
+        if hasattr(self, "_mic_btn"):
+            self._mic_btn.release()
 
     def _refresh_lighting(self) -> None:
         supported = device_commands.has_capability(self._device, "light")

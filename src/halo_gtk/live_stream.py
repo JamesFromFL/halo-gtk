@@ -1,5 +1,5 @@
 """Live stream viewer — WebRTC negotiation via ring-doorbell + aiortc, rendered
-through a dual-chain GStreamer pipeline:
+through independent GStreamer video and audio pipelines:
 
   Video: appsrc → videoconvert → gtk4paintablesink
   Audio: appsrc → audioconvert → audioresample → volume → autoaudiosink
@@ -14,6 +14,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -39,6 +40,11 @@ from halo_gtk.ring_media import (  # noqa: E402
 )
 
 _log = logging.getLogger(__name__)
+
+_FIRST_FRAME_TIMEOUT = 25.0
+_VIDEO_STALL_TIMEOUT = 8.0
+_VIDEO_RECOVERY_TIMEOUT = 8.0
+_RING_CLOSE_TIMEOUT = 3.0
 
 # A nonblocking producer must bound/drop backlog explicitly. The byte threshold
 # alone only emits enough-data; it does not stop this asyncio producer.
@@ -70,6 +76,10 @@ class _StreamResources:
     cleanup_started: bool = False
     cleanup_failed: bool = False
     cleanup_complete: asyncio.Event = field(default_factory=asyncio.Event)
+    closed: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
+    admitted_at: float = field(default_factory=time.monotonic)
+    last_frame_at: float | None = None
+    recovery_at: float | None = None
     terminal_notified: bool = False
     connected: bool = False
     talkback_generation: int = 0
@@ -116,25 +126,36 @@ class _StreamResources:
             )
         self.tasks.clear()
 
-        if self.ring_session_started:
-            await run_step(
-                self.device.close_webrtc_stream(self.session_id),
-                "Ring WebRTC session",
-            )
         if self.pc is not None:
             await run_step(self.pc.close(), "RTCPeerConnection")
+        if self.ring_session_started:
+            await run_step(self._close_ring_session(), "Ring WebRTC session")
 
         if self.privacy_lease is not None:
             release_policy = getattr(self.privacy_lease.policy, "release", None)
             if release_policy is not None:
                 release_policy(self.privacy_lease, resources_closed=not self.cleanup_failed)
         self.cleanup_complete.set()
+        self.closed.set_result(None)
         release = getattr(self.client, "release_media_resources", None)
         if release is not None:
             release(self)
 
         if cancellation_requested:
             raise asyncio.CancelledError
+
+    async def _close_ring_session(self) -> None:
+        # The pinned SDK removes the session from its registry before awaiting
+        # websocket closure. Retain the local transport for a bounded fallback.
+        stream = getattr(self.device, "_webrtc_streams", {}).get(self.session_id)
+        transport = getattr(getattr(stream, "websocket", None), "transport", None)
+        try:
+            async with asyncio.timeout(_RING_CLOSE_TIMEOUT):
+                await self.device.close_webrtc_stream(self.session_id)
+        except (Exception, asyncio.CancelledError):
+            if transport is not None:
+                transport.abort()
+            raise
 
     async def close_for_client(self):
         await self.cleanup()
@@ -167,11 +188,14 @@ class LiveStreamView(Gtk.Box):
         self._media_authority = media_authority
         self._device = None
         self._resources: _StreamResources | None = None
+        self._transport_closed: concurrent.futures.Future | None = None
         self._pipeline: Gst.Pipeline | None = None
         self._video_appsrc: Gst.Element | None = None
         self._audio_appsrc: Gst.Element | None = None
         self._vol_element: Gst.Element | None = None
-        self._audio_sink: Gst.Element | None = None
+        self._audio_pipeline = None
+        self._audio_watch = None
+        self._requested_volume = 0.0
         self._bus: Gst.Bus | None = None
         self._bus_handlers: list[int] = []
         self._closing = False
@@ -194,25 +218,11 @@ class LiveStreamView(Gtk.Box):
     # ------------------------------------------------------------------
 
     def _build_pipeline(self) -> None:
-        audio_sink = _audio_sink_description()
         self._pipeline = Gst.parse_launch(
-            f"{VIDEO_SOURCE}"
-            "! videoconvert "
-            "! gtk4paintablesink name=vsink sync=false  "
-            f"{AUDIO_SOURCE}"
-            "! queue max-size-time=500000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream "
-            "! audioconvert "
-            "! audioresample "
-            "! volume name=vol "
-            f"! {audio_sink}"
+            f"{VIDEO_SOURCE}! videoconvert ! gtk4paintablesink name=vsink sync=false"
         )
         self._video_appsrc = self._pipeline.get_by_name("vsrc")
-        self._audio_appsrc = self._pipeline.get_by_name("asrc")
-        self._vol_element = self._pipeline.get_by_name("vol")
-        self._audio_sink = self._pipeline.get_by_name("asink")
         self._paintable = self._pipeline.get_by_name("vsink").get_property("paintable")
-        _log.debug("Live audio sink: %s", self._audio_sink.get_factory().get_name())
-
         self._bus = self._pipeline.get_bus()
         self._attach_bus_watch()
 
@@ -325,6 +335,8 @@ class LiveStreamView(Gtk.Box):
                 release(lease)
             raise
         self._resources = resources
+        self._transport_closed = resources.closed
+        self.set_volume(self._requested_volume)
         self._video_picture.set_paintable(self._paintable)
         resources.privacy_callback = lambda: self._privacy_changed(resources)
         lease.policy.subscribe(resources.privacy_callback)
@@ -343,6 +355,7 @@ class LiveStreamView(Gtk.Box):
             client.release_media_resources(resources)
             resources.cleanup_started = True
             resources.cleanup_complete.set()
+            resources.closed.set_result(None)
             self._resources = None
             GLib.idle_add(
                 self._on_stream_terminal,
@@ -351,8 +364,8 @@ class LiveStreamView(Gtk.Box):
                 "Could not start the Ring worker",
             )
 
-    def stop(self) -> None:
-        """Stop WebRTC and GStreamer.  Safe to call from GTK thread."""
+    def stop(self) -> concurrent.futures.Future | None:
+        """Detach immediately and report when this generation finishes transport cleanup."""
         self._closing = True
         self._last_frame_rgb = None
         self._stream_token += 1
@@ -364,19 +377,77 @@ class LiveStreamView(Gtk.Box):
             self._schedule_cleanup(resources)
         if self._pipeline is not None:
             self._pipeline.set_state(Gst.State.NULL)
+        self._stop_audio_output()
         self._detach_bus_watch()
+        # Natural termination clears _resources before its async cleanup finishes.
+        if resources is not None:
+            return resources.closed
+        return getattr(self, "_transport_closed", None)
 
     def set_volume(self, value: float) -> None:
-        volume = max(0.0, min(1.0, value))
+        self._requested_volume = max(0.0, min(1.0, value))
         resources = self._resources
-        if resources is not None and not self._privacy_current(resources, "audio"):
-            volume = 0.0
-        if self._vol_element is not None:
-            self._vol_element.set_property("volume", volume)
-        if self._audio_sink is not None and self._audio_sink.find_property("mute") is not None:
-            self._audio_sink.set_property("mute", volume <= 0)
-        if self._audio_sink is not None and self._audio_sink.find_property("volume") is not None:
-            self._audio_sink.set_property("volume", volume)
+        if (
+            self._requested_volume == 0
+            or resources is None
+            or not self._privacy_current(resources, "audio")
+        ):
+            self._stop_audio_output()
+            return
+        try:
+            if self._audio_pipeline is None:
+                pipeline = Gst.parse_launch(
+                    f"{AUDIO_SOURCE}! queue max-size-time=500000000 max-size-buffers=0 "
+                    "max-size-bytes=0 leaky=downstream ! audioconvert ! audioresample "
+                    f"! volume name=vol ! {_audio_sink_description()}"
+                )
+                self._audio_pipeline = pipeline
+                self._vol_element = pipeline.get_by_name("vol")
+                self._vol_element.set_property("volume", self._requested_volume)
+                bus = pipeline.get_bus()
+                bus.add_signal_watch()
+                self._audio_watch = (
+                    bus,
+                    bus.connect("message::error", self._on_audio_error, resources.token),
+                )
+                if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+                    raise RuntimeError("Audio output could not start")
+                self._audio_appsrc = pipeline.get_by_name("asrc")
+            else:
+                self._vol_element.set_property("volume", self._requested_volume)
+        except (GLib.Error, RuntimeError) as exc:
+            _log.warning("Local audio output failed: %s", exc)
+            self._audio_unavailable()
+
+    def _stop_audio_output(self):
+        pipeline = getattr(self, "_audio_pipeline", None)
+        self._audio_appsrc = None
+        self._vol_element = None
+        self._audio_pipeline = None
+        if pipeline is not None:
+            if self._audio_watch is not None:
+                bus, handler = self._audio_watch
+                self._audio_watch = None
+                bus.disconnect(handler)
+                bus.remove_signal_watch()
+            pipeline.set_state(Gst.State.NULL)
+
+    def _on_audio_error(self, bus, message, token):
+        if token != self._stream_token or self._audio_watch is None or bus != self._audio_watch[0]:
+            return
+        _log.warning("Local audio output failed: %s", message.parse_error()[0])
+        self._audio_unavailable()
+
+    def _audio_push_failed(self, token, output):
+        if token == self._stream_token and output is self._audio_appsrc:
+            self._audio_unavailable()
+        return GLib.SOURCE_REMOVE
+
+    def _audio_unavailable(self):
+        from halo_gtk.ui_feedback import show_toast
+
+        self._stop_audio_output()
+        show_toast(self, "Camera audio output is unavailable. Mute and unmute to retry.")
 
     def get_paintable(self):
         """Return the GTK paintable backing the live video sink."""
@@ -486,7 +557,15 @@ class LiveStreamView(Gtk.Box):
             and resources.talkback_generation == generation
         )
 
-    def get_current_frame_png(self) -> bytes | None:
+    def has_current_frame(self) -> bool:
+        resources = self._resources
+        return (
+            resources is not None
+            and self._last_frame_rgb is not None
+            and self._privacy_current(resources)
+        )
+
+    def get_current_frame_png(self, viewport=None) -> bytes | None:
         """Return the most recently decoded video frame as PNG bytes, or None."""
         arr = self._last_frame_rgb
         resources = self._resources
@@ -497,7 +576,18 @@ class LiveStreamView(Gtk.Box):
 
             from PIL import Image
 
-            img = Image.fromarray(arr, "RGB")
+            img = Image.fromarray(arr)
+            if viewport is not None:
+                width, height = img.size
+                left, top, right, bottom = viewport
+                box = (
+                    round(left * width),
+                    round(top * height),
+                    round(right * width),
+                    round(bottom * height),
+                )
+                if box[2] > box[0] and box[3] > box[1]:
+                    img = img.crop(box).resize(img.size, Image.Resampling.LANCZOS)
             buf = io.BytesIO()
             img.save(buf, format="PNG")
             return buf.getvalue() if self._privacy_current(resources) else None
@@ -748,6 +838,9 @@ class LiveStreamView(Gtk.Box):
             if self._pipeline is not None:
                 self._pipeline.set_state(Gst.State.NULL)
             resources.talkback_requested = False
+            audio = getattr(self, "_audio_pipeline", None)
+            if audio is not None:
+                audio.set_state(Gst.State.NULL)
             GLib.idle_add(self._hide_private_frame, resources.token)
             if getattr(resources.client, "_stopped", False):
                 # RingClient._async_close owns the retained resource teardown.
@@ -771,11 +864,52 @@ class LiveStreamView(Gtk.Box):
         try:
             while self._is_current_resources(resources):
                 self._privacy_changed(resources)
+                if self._privacy_current(resources):
+                    await self._check_video_deadline(resources, time.monotonic())
                 await asyncio.sleep(0.1)
         finally:
             if not self._privacy_current(resources):
                 with contextlib.suppress(asyncio.CancelledError):
                     await resources.cleanup()
+
+    async def _check_video_deadline(self, resources, now: float):
+        if resources.recovery_at is not None:
+            if now - resources.recovery_at >= _VIDEO_RECOVERY_TIMEOUT:
+                await self._terminate_resources(
+                    resources, "failed", "Camera video timed out. Start the stream to try again."
+                )
+            return
+        deadline = (
+            resources.admitted_at + _FIRST_FRAME_TIMEOUT
+            if resources.last_frame_at is None
+            else resources.last_frame_at + _VIDEO_STALL_TIMEOUT
+        )
+        if now < deadline:
+            return
+
+        resources.recovery_at = now
+        GLib.idle_add(self._on_recovering, resources)
+        # The pinned aiortc receiver routes a Picture Loss Indication to a recently
+        # observed video source. No new Ring session or automatic reconnect is needed.
+        if resources.pc is None:
+            return
+        try:
+            for receiver in resources.pc.getReceivers():
+                if getattr(receiver.track, "kind", None) == "video":
+                    sources = receiver.getSynchronizationSources()
+                    if sources:
+                        async with asyncio.timeout(1):
+                            await receiver._send_rtcp_pli(sources[0].source)
+                        break
+        except Exception as exc:
+            _log.debug("Video keyframe request failed: %s", exc)
+
+    def _on_recovering(self, resources) -> bool:
+        if self._is_current_resources(resources) and resources.recovery_at is not None:
+            self._set_status("Waiting for the camera to resume video…")
+            if self._on_stream_state_changed_cb is not None:
+                self._on_stream_state_changed_cb("recovering")
+        return GLib.SOURCE_REMOVE
 
     async def _receive_frames(self, track, resources: _StreamResources) -> None:
         import numpy as np
@@ -842,7 +976,9 @@ class LiveStreamView(Gtk.Box):
                     terminal_state = "failed"
                     terminal_message = "Video pipeline stopped accepting frames"
                     break
-                if not resources.connected:
+                resources.last_frame_at = time.monotonic()
+                if not resources.connected or resources.recovery_at is not None:
+                    resources.recovery_at = None
                     resources.connected = True
                     GLib.idle_add(self._on_connected, resources.token)
 
@@ -873,6 +1009,7 @@ class LiveStreamView(Gtk.Box):
         audio_format = None
         clock = FrameClock()
         audio_push_logged = False
+        failed_output = None
         try:
             while self._is_current_resources(resources) and self._privacy_current(resources):
                 frame = await track.recv()
@@ -880,15 +1017,18 @@ class LiveStreamView(Gtk.Box):
                     break
                 if not self._privacy_current(resources, "audio"):
                     continue
+                output = self._audio_appsrc
+                if output is None or output is failed_output:
+                    continue
                 raw, channels, rate, samples = audio_frame_to_s16le_interleaved(frame)
 
-                if audio_format != (channels, rate):
+                if audio_format != (output, channels, rate):
                     caps_str = (
                         "audio/x-raw,format=S16LE,layout=interleaved,"
                         f"channels={channels},rate={rate}"
                     )
-                    self._audio_appsrc.set_property("caps", Gst.Caps.from_string(caps_str))
-                    audio_format = (channels, rate)
+                    output.set_property("caps", Gst.Caps.from_string(caps_str))
+                    audio_format = (output, channels, rate)
                     _log.debug("Ring audio stream: S16LE interleaved %dch %dHz", channels, rate)
 
                 duration = samples * Gst.SECOND // rate if rate > 0 else Gst.SECOND // 50
@@ -901,18 +1041,20 @@ class LiveStreamView(Gtk.Box):
                     buffer.set_flags(Gst.BufferFlags.DISCONT)
                 result = None
 
-                def push(buffer=buffer):
+                def push(buffer=buffer, output=output):
                     nonlocal result
-                    result = self._audio_appsrc.emit("push-buffer", buffer)
+                    result = output.emit("push-buffer", buffer)
 
                 if not resources.privacy_lease.policy.apply(resources.privacy_lease, push):
                     break
+                if self._audio_appsrc is not output:
+                    continue
                 if not audio_push_logged:
                     _log.debug("Ring audio push result: %s", result.value_nick)
                     audio_push_logged = True
                 if not gst_push_succeeded(result):
-                    _log.debug("Stopping audio receiver after appsrc push result: %s", result)
-                    break
+                    failed_output = output
+                    GLib.idle_add(self._audio_push_failed, resources.token, output)
 
         except MediaStreamError:
             _log.debug("Audio track ended")
@@ -1043,6 +1185,7 @@ class LiveStreamView(Gtk.Box):
             return GLib.SOURCE_REMOVE
         if self._pipeline is not None:
             self._pipeline.set_state(Gst.State.NULL)
+        self._stop_audio_output()
         self._set_status(message)
         if self._on_stream_state_changed_cb is not None:
             self._on_stream_state_changed_cb(state)

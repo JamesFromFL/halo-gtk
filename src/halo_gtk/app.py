@@ -38,7 +38,6 @@ class RingApplication(Adw.Application):
         self._start_background = start_background
         self._suppress_initial_activate = start_background
         self._quitting = False
-        self._settings_window: SettingsWindow | None = None
         self._restore_thread: threading.Thread | None = None
         self._setup_actions()
 
@@ -251,13 +250,13 @@ class RingApplication(Adw.Application):
             self.activate()
             main_window = self.get_main_window()
 
-        if self._settings_window is None:
-            self._settings_window = SettingsWindow(application=self)
-
+        window = next((win for win in self.get_windows() if isinstance(win, SettingsWindow)), None)
+        if window is None:
+            window = SettingsWindow(application=self)
         if main_window is not None:
-            self._settings_window.set_transient_for(main_window)
-        self._settings_window.refresh()
-        self._settings_window.present()
+            window.set_transient_for(main_window)
+        window.refresh()
+        window.present()
 
     def request_quit(self) -> None:
         self._quitting = True

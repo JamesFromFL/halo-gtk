@@ -243,7 +243,7 @@ async def test_active_live_session_uses_frame_or_cached_snapshot_without_wake(mo
     monkeypatch.setattr(
         live_sessions,
         "active_session_for_device",
-        lambda _device: SimpleNamespace(get_current_frame_png=lambda: frame),
+        lambda target: SimpleNamespace(device=target, get_current_frame_png=lambda: frame),
     )
     cached = AsyncMock(return_value=b"cached frame")
     monkeypatch.setattr(client, "_async_cached_snapshot_bytes", cached)

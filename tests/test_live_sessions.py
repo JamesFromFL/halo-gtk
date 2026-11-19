@@ -255,3 +255,78 @@ def test_startup_error_is_preserved_when_partial_cleanup_also_fails():
         manager.acquire(SimpleNamespace(id=1), owner="live-monitoring")
 
     assert manager.session_for(1) is None
+
+
+@pytest.mark.parametrize("remote_outcome", ["success", "failed", "timeout"])
+@pytest.mark.asyncio
+async def test_pending_switch_waits_for_cleanup_and_cancels_superseded_camera(
+    monkeypatch, remote_outcome
+):
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+
+    from halo_gtk import live_sessions, live_stream
+
+    open_peers = []
+    events = []
+    release = asyncio.Event()
+    entered = asyncio.Event()
+    monkeypatch.setattr(live_sessions.GLib, "idle_add", lambda callback, *args: callback(*args))
+    monkeypatch.setattr(live_stream, "_RING_CLOSE_TIMEOUT", 0.05)
+
+    async def remote_close(session_id):
+        events.append(("remote", session_id))
+        entered.set()
+        await release.wait()
+        if remote_outcome == "failed":
+            raise RuntimeError("fixture close rejected")
+
+    class DelayedView(FakeView):
+        def start_for_device(self, device):
+            super().start_for_device(device)
+            assert not open_peers
+            open_peers.append(self)
+            self.resources = live_stream._StreamResources(
+                token=1,
+                client=None,
+                device=device,
+                session_id=str(device.id),
+                ring_session_started=True,
+                pc=SimpleNamespace(close=AsyncMock(side_effect=lambda: open_peers.remove(self))),
+            )
+
+        def stop(self):
+            super().stop()
+            self.cleanup = asyncio.create_task(self.resources.cleanup())
+            return self.resources.closed
+
+    manager = live_sessions.LiveSessionManager(
+        view_factory=DelayedView, max_streams_factory=lambda: 1
+    )
+    a, b = (SimpleNamespace(id=key, close_webrtc_stream=remote_close) for key in (1, 2))
+    abort = Mock()
+    a._webrtc_streams = {
+        "1": SimpleNamespace(websocket=SimpleNamespace(transport=SimpleNamespace(abort=abort)))
+    }
+    first = manager.acquire(a, owner="focused")
+    manager.release(1, owner="focused")
+    await entered.wait()
+    assert not open_peers and manager.active_count() == 1
+    assert manager.preview_session_for(a) is first
+    pending_b = manager.acquire(b, owner="focused")
+    assert pending_b.state == live_sessions.StreamState.WAITING and pending_b.view.starts == 0
+    manager.release(2, owner="focused")
+    pending_a = manager.acquire(a, owner="focused")
+    assert pending_a.state == live_sessions.StreamState.WAITING and pending_a.view.starts == 0
+    if remote_outcome != "timeout":
+        release.set()
+    await asyncio.wait_for(first.view.cleanup, 1)
+    assert first.view.resources.cleanup_failed is (remote_outcome != "success")
+    assert open_peers == [pending_a.view]
+    assert events == [("remote", "1")]
+    assert abort.call_count == (0 if remote_outcome == "success" else 1)
+    assert pending_b.view.starts == 0 and manager.active_count() == 1
+    release.set()
+    manager.stop_all()
+    await pending_a.view.cleanup
+    assert not open_peers and manager.active_count() == 0

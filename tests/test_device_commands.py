@@ -310,7 +310,7 @@ def test_focused_capability_refresh_uses_intercom_helper(monkeypatch):
     page._light_btn = _Button()
     page._siren_btn = _Button()
     page._siren_icon = object()
-    page._on_mic_toggled = lambda *_args: None
+    page._mic_btn.release = lambda: page._mic_btn.set_active(False)
     page._on_light_toggled = lambda *_args: None
     page._refresh_light_icon = lambda: None
     page._load_icon = lambda *_args: None

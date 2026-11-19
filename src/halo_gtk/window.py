@@ -58,7 +58,7 @@ class RingWindow(Adw.ApplicationWindow):
         # size_request gives GTK a floor so it never allocates zero pixels
         # to widgets.
         self.set_size_request(360, 480)
-        self._resume_after_hide = False
+        self._resume_after_hide = True
         self.connect("close-request", self._on_close_request)
         self.connect("map", self._on_map)
         self._build_ui()
@@ -225,7 +225,7 @@ class RingWindow(Adw.ApplicationWindow):
             "title" if self._compact or focused else "navigation"
         )
         self._bottom_navigation.set_reveal(self._compact and not focused)
-        self._brand.set_visible(not focused)
+        self._brand.set_visible(not focused and not self._compact)
 
     def _on_view_changed(self, stack, _property) -> None:
         name = stack.get_visible_child_name()
@@ -554,7 +554,8 @@ class RingWindow(Adw.ApplicationWindow):
             # Closing ended this stream. Reopen its source, not a frozen player
             # or an automatically restarted camera connection.
             self._on_back_clicked()
-        self.refresh()
+        else:
+            self.refresh()
 
     def stop_runtime_streams(self) -> None:
         """Stop any camera stream that could otherwise survive window teardown."""
@@ -575,6 +576,9 @@ class RingWindow(Adw.ApplicationWindow):
     # ------------------------------------------------------------------
 
     def refresh(self) -> None:
+        if not self.get_mapped():
+            self._resume_after_hide = True
+            return
         self._sync_appearance()
         client = get_client()
         if client is None or not client.is_authenticated:
@@ -589,21 +593,18 @@ class RingWindow(Adw.ApplicationWindow):
 
         self._banner.set_revealed(False)
         self._update_events_banner(listener_state())
-        # Only refresh the page that's actually visible — navigating to a page
-        # refreshes it via _show_page, so refreshing a hidden page just burns
-        # snapshot fetches. (Non-visible cameras still enforce stream caps.)
+        if self._active_page_name != "cameras":
+            self._cameras_page.enforce_live_monitoring_limits()
         if self._active_page_name == "dashboard":
             self._dashboard_page.refresh()
-        if self._active_page_name == "cameras":
+        elif self._active_page_name == "cameras":
             self._cameras_page.refresh()
-        else:
-            self._cameras_page.enforce_live_monitoring_limits()
-        if self._active_page_name == "devices":
-            shown = getattr(self._devices_page, "on_page_shown", self._devices_page.refresh)
-            shown()
-        else:
-            self._devices_page.refresh()
-        self._alarm_page.refresh()
+        elif self._active_page_name == "history":
+            self._history_page.refresh()
+        elif self._active_page_name == "devices":
+            self._devices_page.on_page_shown()
+        elif self._active_page_name == "alarm":
+            self._alarm_page.refresh()
 
     def _on_listener_state(self, state: str) -> None:
         self._update_events_banner(state)

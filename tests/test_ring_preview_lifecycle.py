@@ -190,3 +190,59 @@ def test_explicit_preview_wrapper_deadline_cancels_underlying_work(monkeypatch):
         assert finished.wait(1)
     finally:
         client.stop()
+
+
+@pytest.mark.parametrize("admit_during", ["first_request", "delay", "second_request"])
+async def test_live_admission_stops_all_further_fresh_capture_requests(monkeypatch, admit_during):
+    from halo_gtk import live_sessions
+
+    current = []
+    device = SimpleNamespace(id=123, name="fixture")
+    session = SimpleNamespace(device=device, get_current_frame_png=lambda: b"existing live frame")
+    monkeypatch.setattr(
+        live_sessions, "active_session_for_device", lambda _device: next(iter(current), None)
+    )
+
+    requests = []
+
+    async def query(_endpoint, **_kwargs):
+        assert not current, "fresh request submitted after live admission"
+        requests.append(True)
+        if (admit_during == "first_request" and len(requests) == 1) or (
+            admit_during == "second_request" and len(requests) == 2
+        ):
+            current.append(session)
+        return SimpleNamespace(json=lambda: {"timestamps": [{"timestamp": 10**20}]})
+
+    async def delay(_delay):
+        if admit_during == "delay":
+            current.append(session)
+
+    monkeypatch.setattr(ring_client.asyncio, "sleep", delay)
+    monkeypatch.setattr(
+        ring_client, "_bounded_snapshot_bytes", AsyncMock(side_effect=AssertionError)
+    )
+    client = RingClient()
+    client._ring = SimpleNamespace(auth=object(), async_query=query)
+    grant(client, device)
+    assert await client._async_snapshot_bytes(device) == b"existing live frame"
+    assert len(requests) == (2 if admit_during == "second_request" else 1)
+
+
+async def test_reused_camera_id_during_close_cannot_return_the_retired_account_frame(monkeypatch):
+    from halo_gtk import live_sessions
+
+    client = RingClient()
+    old = SimpleNamespace(id=123)
+    current = SimpleNamespace(id=123, name="current")
+    grant(client, current)
+    client._ring = SimpleNamespace(async_query=AsyncMock())
+    session = SimpleNamespace(
+        device=old, get_current_frame_png=lambda: pytest.fail("old account frame accessed")
+    )
+    monkeypatch.setattr(live_sessions, "active_session_for_device", lambda _device: session)
+    cached = AsyncMock(return_value=b"current account cached frame")
+    monkeypatch.setattr(client, "_async_cached_snapshot_bytes", cached)
+    assert await client._async_snapshot_bytes(current) == b"current account cached frame"
+    cached.assert_awaited_once_with(current.id, device_name=current.name)
+    client._ring.async_query.assert_not_awaited()

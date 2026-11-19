@@ -2377,14 +2377,20 @@ class RingClient:
     async def _async_snapshot_bytes(self, device) -> bytes | None:
         from halo_gtk.live_sessions import active_session_for_device
 
+        async def stream_preview(session):
+            if not self._preview_is_current():
+                return None
+            # An old wrapper or account can still be closing with the same API
+            # ID. Suppress its camera wake, but never reuse its displayed frame.
+            if session.device is device:
+                frame = session.get_current_frame_png()
+                if frame is not None and self._preview_is_current():
+                    return frame
+            return await self._async_cached_snapshot_bytes(device.id, device_name=device.name)
+
         session = active_session_for_device(device)
         if session is not None:
-            # Requesting a fresh Ring snapshot can interrupt an active camera
-            # stream. Reuse its frame, or ask only for Ring's cached snapshot.
-            frame = session.get_current_frame_png()
-            if frame is not None and self._preview_is_current():
-                return frame
-            return await self._async_cached_snapshot_bytes(device.id, device_name=device.name)
+            return await stream_preview(session)
         try:
             from ring_doorbell.const import SNAPSHOT_ENDPOINT, SNAPSHOT_TIMESTAMP_ENDPOINT
 
@@ -2395,14 +2401,23 @@ class RingClient:
                 await self._ring.async_query(
                     SNAPSHOT_TIMESTAMP_ENDPOINT, method="POST", json=payload
                 )
+                session = active_session_for_device(device)
+                if session is not None:
+                    return await stream_preview(session)
                 requested = time.time()
                 for _attempt in range(2):
                     await asyncio.sleep(1)
                     if not self._preview_is_current():
                         return None
+                    session = active_session_for_device(device)
+                    if session is not None:
+                        return await stream_preview(session)
                     response = await self._ring.async_query(
                         SNAPSHOT_TIMESTAMP_ENDPOINT, method="POST", json=payload
                     )
+                    session = active_session_for_device(device)
+                    if session is not None:
+                        return await stream_preview(session)
                     if response.json()["timestamps"][0]["timestamp"] / 1000 > requested:
                         if not self._preview_is_current():
                             return None

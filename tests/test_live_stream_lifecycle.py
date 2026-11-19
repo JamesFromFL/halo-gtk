@@ -413,7 +413,8 @@ async def test_natural_video_end_cleans_resources_and_notifies_once(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_stream_becomes_active_only_after_first_video_buffer(monkeypatch):
+@pytest.mark.parametrize("recovering", [False, True])
+async def test_stream_becomes_active_only_after_first_video_buffer(monkeypatch, recovering):
     import numpy as np
 
     import halo_gtk.live_stream as live_stream
@@ -450,6 +451,8 @@ async def test_stream_becomes_active_only_after_first_video_buffer(monkeypatch):
         device=FakeDevice(),
         client=object(),
         session_id="session-10",
+        recovery_at=1 if recovering else None,
+        connected=recovering,
         pc=FakePeerConnection(),
     )
     view = make_bare_view(resources)
@@ -463,6 +466,7 @@ async def test_stream_becomes_active_only_after_first_video_buffer(monkeypatch):
         "_on_stream_terminal",
     ]
     assert resources.connected is True
+    assert resources.recovery_at is None and resources.last_frame_at is not None
 
 
 @pytest.mark.asyncio
@@ -604,3 +608,47 @@ async def test_stop_during_offer_cleans_only_stopped_generation(monkeypatch):
     assert peers[0].close_calls == 1
     assert device.closed_sessions == []
     assert idle_calls == []
+
+
+@pytest.mark.parametrize("had_video", [False, True])
+async def test_video_watchdog_requests_one_keyframe_then_releases_transport(monkeypatch, had_video):
+    from unittest.mock import AsyncMock
+
+    from halo_gtk import live_stream
+
+    device = FakeDevice()
+    peer = FakePeerConnection()
+    request_keyframe = AsyncMock()
+    peer.getReceivers = lambda: [
+        SimpleNamespace(
+            track=SimpleNamespace(kind="video"),
+            getSynchronizationSources=lambda: [SimpleNamespace(source=123)],
+            _send_rtcp_pli=request_keyframe,
+        )
+    ]
+    resources = _StreamResources(
+        token=8,
+        client=object(),
+        device=device,
+        pc=peer,
+        ring_session_started=True,
+        session_id="fixture",
+        admitted_at=0,
+        last_frame_at=50 if had_video else None,
+    )
+    view = make_bare_view(resources)
+    calls = []
+    monkeypatch.setattr(live_stream.GLib, "idle_add", lambda *args: calls.append(args))
+    deadline = (
+        50 + live_stream._VIDEO_STALL_TIMEOUT if had_video else live_stream._FIRST_FRAME_TIMEOUT
+    )
+    await view._check_video_deadline(resources, deadline - 0.01)
+    assert not calls
+    await view._check_video_deadline(resources, deadline)
+    await view._check_video_deadline(resources, deadline + 1)
+    request_keyframe.assert_awaited_once_with(123)
+    assert [entry[0].__name__ for entry in calls] == ["_on_recovering"]
+    await view._check_video_deadline(resources, deadline + live_stream._VIDEO_RECOVERY_TIMEOUT)
+    assert calls[-1][2] == "failed" and "timed out" in calls[-1][3]
+    assert resources.closed.done() and peer.close_calls == 1
+    assert device.closed_sessions == ["fixture"]

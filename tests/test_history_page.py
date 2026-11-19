@@ -220,6 +220,8 @@ def test_selecting_an_event_stops_the_previous_recording_before_requesting_url(m
     page = SimpleNamespace(
         _current_event=None,
         _playback_request_generation=3,
+        _history_client=None,
+        _save_ui_generation=0,
         _player=SimpleNamespace(stop=lambda: calls.append("stop")),
         _update_favorite_button=lambda: None,
         _update_event_details=lambda _event: calls.append("details"),
@@ -233,6 +235,7 @@ def test_selecting_an_event_stops_the_previous_recording_before_requesting_url(m
         lambda **_kwargs: SimpleNamespace(start=lambda: calls.append("fetch")),
     )
 
+    page._retry_current_recording = lambda: HistoryPage._retry_current_recording(page)
     HistoryPage._on_event_selected(page, None, SimpleNamespace(_event_data=event))
 
     assert calls == ["stop", "details", "fetch"]

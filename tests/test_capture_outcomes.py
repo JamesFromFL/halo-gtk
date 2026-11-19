@@ -166,45 +166,37 @@ def test_native_audio_source_keeps_its_separate_latency_budget():
         pipeline.set_state(Gst.State.NULL)
 
 
-@pytest.mark.parametrize("focused", [False, True])
-def test_ui_start_failure_resets_actual_microphone_control(focused):
-    from halo_gtk.cameras_page import CameraTile
-    from halo_gtk.focused_live_page import FocusedLivePage
+def test_talk_control_tracks_capture_until_release_and_drops_late_callbacks(monkeypatch):
+    from halo_gtk import talk_button
 
+    calls, states, callbacks = [], [], []
+
+    class Control:
+        _held_session = None
+        _press_revision = 0
+        release = talk_button.HoldToTalkButton.release
+
+        def _get_session(self):
+            return SimpleNamespace(
+                start_talking=lambda **kwargs: callbacks.append(kwargs["on_state_changed"]),
+                stop_talking=lambda: calls.append("stop"),
+            )
+
+        def is_sensitive(self):
+            return True
+
+        def _show_state(self, state):
+            states.append(state)
+
+    button = Control()
     messages = []
-
-    class Button:
-        active = True
-
-        def get_active(self):
-            return self.active
-
-        def set_active(self, active):
-            self.active = active
-
-        def handler_block_by_func(self, _):
-            pass
-
-        def handler_unblock_by_func(self, _):
-            pass
-
-        def set_icon_name(self, _):
-            assert focused, "Tile feedback replaced its custom Talk button child"
-
-        def set_tooltip_text(self, text):
-            self.tooltip = text
-
-    class Page:
-        _on_mic_toggled = (FocusedLivePage if focused else CameraTile)._on_mic_toggled
-
-        def get_root(self):
-            return SimpleNamespace(show_toast=messages.append)
-
-    page = Page()
-    button = page._mic_btn = Button()
-    session = SimpleNamespace(start_talking=lambda **kwargs: kwargs["on_state_changed"]("failed"))
-    page._session = page._live_session = session
-    page._on_mic_toggled(button)
-    assert button.active is False
-    assert "unavailable" in button.tooltip
+    monkeypatch.setattr(talk_button, "show_toast", lambda _, text: messages.append(text))
+    for outcome in ("active", "failed"):
+        talk_button.HoldToTalkButton._press(button)
+        talk_button.HoldToTalkButton._press(button)
+        callbacks[-1](outcome)
+        button.release()
+        callbacks[-1]("active")
+    assert len(callbacks) == 2 and calls == ["stop", "stop"]
+    assert states == ["starting", "active", "stopped", "starting", "stopped"]
     assert messages == ["Microphone unavailable. Check your input device."]

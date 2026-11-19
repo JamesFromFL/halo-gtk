@@ -220,11 +220,15 @@ class _VideoPlayer(Gtk.Box):
         on_previous=None,
         on_next=None,
         on_finished=None,
+        on_retry=None,
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, hexpand=True, vexpand=True)
         self._on_previous = on_previous
         self._on_next = on_next
         self._on_finished = on_finished
+        self._on_retry = on_retry
+        self._loaded_uri = None
+        self._updating_position = False
         self._duration_ns: int = -1
         self._playback_generation = 0
         self._poll_id: int | None = None
@@ -313,7 +317,17 @@ class _VideoPlayer(Gtk.Box):
             halign=Gtk.Align.CENTER,
             valign=Gtk.Align.CENTER,
         )
-        overlay.add_overlay(self._placeholder)
+        message_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=8,
+            halign=Gtk.Align.CENTER,
+            valign=Gtk.Align.CENTER,
+        )
+        message_box.append(self._placeholder)
+        self._retry_btn = Gtk.Button(label="Retry", visible=False, halign=Gtk.Align.CENTER)
+        self._retry_btn.connect("clicked", self._retry_recording)
+        message_box.append(self._retry_btn)
+        overlay.add_overlay(message_box)
 
         # Playback progress.
         progress_row = Gtk.Box(
@@ -334,10 +348,13 @@ class _VideoPlayer(Gtk.Box):
         )
         # GTK4: use GestureClick instead of the removed button-press/release-event signals.
         press_gesture = Gtk.GestureClick.new()
+        press_gesture.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         press_gesture.connect("pressed", lambda *_: setattr(self, "_seeking", True))
         press_gesture.connect("released", lambda *_: self._on_scrubber_released())
+        press_gesture.connect("cancel", lambda *_: setattr(self, "_seeking", False))
         self._scrubber.add_controller(press_gesture)
-        self._scrubber.connect("change-value", self._on_scrubber_changed)
+        self._scrubber.connect("value-changed", self._on_scrubber_changed)
+        self._scrubber.set_sensitive(False)
         progress_row.append(self._scrubber)
 
         self._time_label = Gtk.Label(
@@ -365,6 +382,7 @@ class _VideoPlayer(Gtk.Box):
 
         _btn("media-skip-backward-symbolic", "Previous event", self._on_previous_clicked)
         self._play_btn = _btn("media-playback-start-symbolic", "Play / Pause", self._on_play_pause)
+        self._play_btn.set_sensitive(False)
         _btn("media-skip-forward-symbolic", "Next event", self._on_next_clicked)
 
         # Viewing controls wrap into two lines on compact windows.
@@ -442,32 +460,52 @@ class _VideoPlayer(Gtk.Box):
 
     def load_uri(self, uri: str) -> None:
         """Load and begin playing *uri*."""
-        self._playback_generation += 1
-        self._stop_poll()
-        self._duration_ns = -1
-        self._scrubber.set_value(0)
-        self._update_time_label(0)
-
+        self.stop()
+        self._loaded_uri = uri
         if self._player is None:
+            self.show_error("Recording playback is unavailable.")
             return
-
-        self._player.set_state(Gst.State.NULL)
         self._player.set_property("uri", uri)
-        self._player.set_state(Gst.State.PLAYING)
+        if self._player.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            self.show_error()
+            return
         self._play_btn.set_icon_name("media-playback-pause-symbolic")
+        self._play_btn.set_sensitive(True)
+        self._scrubber.set_sensitive(True)
         self._placeholder.set_visible(False)
-        # Poll position every 500 ms to drive the scrubber during playback.
         self._start_poll()
 
     def stop(self) -> None:
+        self._loaded_uri = None
         self._playback_generation += 1
         self._stop_poll()
         if self._player is not None:
             self._player.set_state(Gst.State.NULL)
+        self._duration_ns = -1
+        self._seeking = False
         self._play_btn.set_icon_name("media-playback-start-symbolic")
+        self._play_btn.set_sensitive(False)
+        self._scrubber.set_sensitive(False)
         self._scrubber.set_value(0)
         self._update_time_label(0)
+        self._retry_btn.set_visible(False)
+        self._placeholder.set_label("Select an event to begin playback")
         self._placeholder.set_visible(True)
+
+    def show_error(self, message="Could not play this recording.") -> None:
+        uri = self._loaded_uri
+        self.stop()
+        self._loaded_uri = uri
+        self._placeholder.set_label(message)
+        self._retry_btn.set_visible(self._on_retry is not None or uri is not None)
+
+    def _retry_recording(self, *_args) -> None:
+        uri = self._loaded_uri
+        self.stop()
+        if self._on_retry is not None:
+            self._on_retry()
+        elif uri is not None:
+            self.load_uri(uri)
 
     def deactivate(self) -> None:
         """Stop playback and close any detached fullscreen presentation."""
@@ -661,8 +699,16 @@ class _VideoPlayer(Gtk.Box):
         ok, pos = self._player.query_position(Gst.Format.TIME)
         return pos if ok else 0
 
-    def _on_scrubber_changed(self, scale, scroll, value) -> bool:
-        return False
+    def _on_scrubber_changed(self, scale) -> None:
+        if not self._updating_position and not self._seeking and self._duration_ns > 0:
+            self._seek_to_ns(int(scale.get_value() * self._duration_ns))
+
+    def _display_position(self, fraction) -> None:
+        self._updating_position = True
+        try:
+            self._scrubber.set_value(fraction)
+        finally:
+            self._updating_position = False
 
     def _on_scrubber_released(self) -> None:
         self._seeking = False
@@ -681,7 +727,7 @@ class _VideoPlayer(Gtk.Box):
         if generation != self._playback_generation:
             return GLib.SOURCE_REMOVE
         self._stop_poll()
-        self._scrubber.set_value(1.0)
+        self._display_position(1.0)
         self._update_time_label(self._duration_ns if self._duration_ns > 0 else 0)
         self._play_btn.set_icon_name("media-playback-start-symbolic")
         if self._on_finished is not None:
@@ -689,8 +735,10 @@ class _VideoPlayer(Gtk.Box):
         return GLib.SOURCE_REMOVE
 
     def _on_bus_error(self, bus, msg) -> None:
-        err, _ = msg.parse_error()
-        _log.warning("GStreamer player error: %s", err)
+        if self._loaded_uri is not None and not self._retry_btn.get_visible():
+            err, _ = msg.parse_error()
+            _log.warning("GStreamer recording playback failed (code %s)", err.code)
+            self.show_error()
 
     def _on_duration_changed(self, *_) -> None:
         if self._player is None:
@@ -729,7 +777,7 @@ class _VideoPlayer(Gtk.Box):
 
         ok, pos = self._player.query_position(Gst.Format.TIME)
         if ok and self._duration_ns > 0:
-            self._scrubber.set_value(pos / self._duration_ns)
+            self._display_position(pos / self._duration_ns)
             self._update_time_label(pos)
 
         return GLib.SOURCE_CONTINUE
@@ -961,6 +1009,7 @@ class HistoryPage(Gtk.Box):
             on_previous=self._on_previous_event,
             on_next=self._on_next_event,
             on_finished=self._on_playback_finished,
+            on_retry=self._retry_current_recording,
         )
         self._player.set_vexpand(False)
         content_box.append(self._player)
@@ -1584,20 +1633,32 @@ class HistoryPage(Gtk.Box):
             )
             self._on_title_change(camera_name)
 
+        self._retry_current_recording()
+
+    def _retry_current_recording(self) -> None:
+        if self._current_event is None:
+            return
         self._playback_request_generation += 1
         generation = self._playback_request_generation
         threading.Thread(
             target=self._load_and_play,
-            args=(event, generation),
+            args=(self._current_event, generation, self._history_client, self._save_ui_generation),
             daemon=True,
         ).start()
 
-    def _load_and_play(self, event: dict, generation: int) -> None:
-        client = get_client()
-        ui_generation = getattr(self, "_save_ui_generation", 0)
+    def _load_and_play(self, event: dict, generation: int, client, ui_generation: int) -> None:
+        if get_client() is not client or generation != self._playback_request_generation:
+            return
         local_path = event.get("_local_video_path")
         if local_path:
-            GLib.idle_add(self._load_file_if_current, Path(local_path), generation)
+            self._queue_history_result(
+                client,
+                ui_generation,
+                "_load_file_if_current",
+                Path(local_path),
+                generation,
+                playback_generation=generation,
+            )
             return
 
         device = event.get("_device")
@@ -1606,7 +1667,7 @@ class HistoryPage(Gtk.Box):
             self._queue_history_result(
                 client,
                 ui_generation,
-                "_show_save_toast",
+                "_show_recording_error",
                 "No recording is available",
                 playback_generation=generation,
             )
@@ -1626,7 +1687,7 @@ class HistoryPage(Gtk.Box):
                 self._queue_history_result(
                     client,
                     ui_generation,
-                    "_show_save_toast",
+                    "_show_recording_error",
                     "No recording is available",
                     playback_generation=generation,
                 )
@@ -1635,10 +1696,13 @@ class HistoryPage(Gtk.Box):
             self._queue_history_result(
                 client,
                 ui_generation,
-                "_show_save_toast",
+                "_show_recording_error",
                 "Could not load the recording. Try again.",
                 playback_generation=generation,
             )
+
+    def _show_recording_error(self, message: str) -> None:
+        self._player.show_error(message)
 
     def _queue_history_result(
         self, client, generation, method, *args, playback_generation=None

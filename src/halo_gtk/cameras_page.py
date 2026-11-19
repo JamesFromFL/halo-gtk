@@ -320,6 +320,7 @@ class CameraTile(Gtk.Frame):
         is_layout_editing,
         *,
         live_monitoring: bool = False,
+        move_by=None,
         on_light_toggle=None,
         on_siren_toggle=None,
         on_stream_status_changed=None,
@@ -327,6 +328,7 @@ class CameraTile(Gtk.Frame):
         super().__init__()
         self.device = device
         self._on_reorder = on_reorder
+        self._move_by = move_by
         self._on_activate = on_activate
         self._on_camera_settings = on_camera_settings
         self._is_layout_editing = is_layout_editing
@@ -705,16 +707,13 @@ class CameraTile(Gtk.Frame):
             halign=Gtk.Align.FILL,
         )
 
-        mic_content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=7)
-        mic_content.set_halign(Gtk.Align.CENTER)
-        mic_content.append(Gtk.Image.new_from_icon_name("audio-input-microphone-symbolic"))
-        mic_content.append(Gtk.Label(label="Talk"))
-        self._mic_btn = Gtk.ToggleButton(child=mic_content, tooltip_text="Talk through camera")
+        from halo_gtk.talk_button import HoldToTalkButton
+
+        self._mic_btn = HoldToTalkButton(lambda: self._live_session)
         self._mic_btn.add_css_class("command-button")
         self._mic_btn.set_hexpand(True)
         self._mic_btn.set_sensitive(False)
         self._mic_btn.set_visible(self._intercom_supported)
-        self._mic_btn.connect("toggled", self._on_mic_toggled)
         controls.append(self._mic_btn)
 
         self._volume_btn = Gtk.ToggleButton(
@@ -841,17 +840,8 @@ class CameraTile(Gtk.Frame):
 
     def stop_talking(self) -> None:
         """Stop talkback owned by this tile before its control is hidden or released."""
-        if not hasattr(self, "_mic_btn"):
-            return
-        was_active = self._mic_btn.get_active()
-        if was_active and self._live_session is not None:
-            try:
-                self._live_session.stop_talking()
-            except Exception as exc:
-                _log.debug("Failed to stop camera talkback: %s", exc)
-        self._mic_btn.handler_block_by_func(self._on_mic_toggled)
-        self._mic_btn.set_active(False)
-        self._mic_btn.handler_unblock_by_func(self._on_mic_toggled)
+        if hasattr(self, "_mic_btn"):
+            self._mic_btn.release()
 
     def _set_stream_controls_sensitive(self, sensitive: bool) -> None:
         if not hasattr(self, "_mic_btn"):
@@ -877,28 +867,6 @@ class CameraTile(Gtk.Frame):
         self._volume_scale.set_value(volume)
         if self._live_session is not None:
             self._live_session.set_volume(volume)
-
-    def _on_mic_toggled(self, btn: Gtk.ToggleButton) -> None:
-        import weakref
-
-        from halo_gtk.ui_feedback import microphone_state, show_toast
-
-        if self._live_session is None:
-            return
-        if btn.get_active():
-            session = self._live_session
-            tile_ref = weakref.ref(self)
-
-            def on_state(state):
-                tile = tile_ref()
-                if tile is not None and tile._live_session is session:
-                    microphone_state(tile._mic_btn, tile._on_mic_toggled, state, update_icon=False)
-                    if state == "failed":
-                        show_toast(tile, "Microphone unavailable. Check your input device.")
-
-            session.start_talking(on_state_changed=on_state)
-        else:
-            self._live_session.stop_talking()
 
     def _on_volume_toggled(self, btn: Gtk.ToggleButton) -> None:
         if btn.get_active():
@@ -980,7 +948,13 @@ class CameraTile(Gtk.Frame):
         owned = session is not None and LIVE_MONITORING_OWNER in session.owners
         if owned and session.active:
             state = getattr(session.state, "value", str(session.state))
-            if state == "active":
+            if state == "waiting":
+                self._set_stream_state(
+                    "Waiting for camera to close", "content-loading-symbolic", "live"
+                )
+            elif state == "recovering":
+                self._set_stream_state("Waiting for video", "content-loading-symbolic", "live")
+            elif state == "active":
                 self._set_stream_state("Live", "media-record-symbolic", "live")
             else:
                 self._set_stream_state("Connecting", "media-record-symbolic", "live")
@@ -1037,6 +1011,11 @@ class CameraTile(Gtk.Frame):
             self._on_activate(self.device)
 
     def _on_key_pressed(self, _controller, keyval: int, _keycode: int, _state) -> bool:
+        if self._is_layout_editing() and self._move_by is not None:
+            offsets = {Gdk.KEY_Left: -1, Gdk.KEY_Up: -1, Gdk.KEY_Right: 1, Gdk.KEY_Down: 1}
+            if keyval in offsets:
+                self._move_by(self.device.id, offsets[keyval])
+                return True
         if keyval in {Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_space}:
             if not self._is_layout_editing():
                 self._on_activate(self.device)
@@ -1777,7 +1756,7 @@ class CamerasPage(Gtk.Box):
         if existing is not None and existing.active:
             active_ids.add(device_id)
             return True
-        if manager.active_count() >= max_streams:
+        if manager.reservation_count() >= max_streams:
             return False
         active_ids.add(device_id)
         return True
@@ -2163,7 +2142,9 @@ class CamerasPage(Gtk.Box):
 
         for tile in self._cards.values():
             tile.set_tooltip_text(
-                "Drag to reorder camera layout" if self._layout_editing else "Open live view"
+                "Drag or use arrow keys to move this camera"
+                if self._layout_editing
+                else "Open live view"
             )
 
     def _apply_size_mode_layout(self, mode: str) -> None:
@@ -2178,6 +2159,13 @@ class CamerasPage(Gtk.Box):
         """Move the tile for *src_id* to the position of *dst_id*."""
         self._order = _reorder_ids(self._order, set(self._cards), src_id, dst_id)
         self._rebuild_grid()
+
+    def _move_camera_by(self, device_id: int, offset: int) -> None:
+        visible = [identity for identity in self._order if identity in self._cards]
+        target = visible.index(device_id) + offset
+        if 0 <= target < len(visible):
+            self._on_reorder(device_id, visible[target])
+            self._cards[device_id].grab_focus()
 
     def _save_camera_order(self) -> None:
         if getattr(self, "_embedded", False):
@@ -2303,6 +2291,7 @@ class CamerasPage(Gtk.Box):
             tile = CameraTile(
                 device,
                 on_reorder=self._on_reorder,
+                move_by=self._move_camera_by,
                 on_activate=self._on_tile_activated,
                 on_camera_settings=self._show_camera_settings,
                 is_layout_editing=lambda: self._layout_editing,
@@ -2312,7 +2301,9 @@ class CamerasPage(Gtk.Box):
                 on_stream_status_changed=self._on_tile_stream_status_changed,
             )
             tile.set_tooltip_text(
-                "Drag to reorder camera layout" if self._layout_editing else "Open live view"
+                "Drag or use arrow keys to move this camera"
+                if self._layout_editing
+                else "Open live view"
             )
             tile.update_ratio(self._size_mode)
             self._cards[device.id] = tile

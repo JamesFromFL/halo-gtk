@@ -164,3 +164,78 @@ def test_native_history_decodes_advances_pauses_and_cleans_up(tmp_path, monkeypa
         window.destroy()
     assert not view._bus_handlers
     assert ring_client.get_client() is None
+
+
+def test_native_recording_error_stops_and_retry_reopens_selected_recording(tmp_path):
+    Adw.init()
+    Gst.init(None)
+    missing = tmp_path / "unavailable.mp4"
+    clip = tmp_path / "restored.mp4"
+    _write_synthetic_clip(clip)
+    view = _VideoPlayer(on_retry=lambda: view.load_file(clip))
+    window = Adw.Window(content=view)
+    view._player.set_property("audio-sink", Gst.ElementFactory.make("fakesink"))
+    try:
+        window.present()
+        view.load_file(missing)
+        _wait_until(view._retry_btn.get_visible)
+        assert view._player.get_state(Gst.SECOND)[1] == Gst.State.NULL
+        assert view._poll_id is None and not view._play_btn.get_sensitive()
+        assert view._placeholder.get_label() == "Could not play this recording."
+        view._retry_btn.emit("clicked")
+        _wait_until(lambda: view._get_position_ns() > 0 and view._duration_ns > 0)
+        assert not view._retry_btn.get_visible()
+        view._on_play_pause()
+        sought = []
+        seek = view._seek_to_ns
+        view._seek_to_ns = lambda value: (sought.append(value), seek(value))
+        from gi.repository import Gtk
+
+        view._scrubber.emit("move-slider", Gtk.ScrollType.STEP_FORWARD)
+        assert len(sought) == 1 and sought[0] > 0
+        view._display_position(0.3)
+        assert len(sought) == 1
+    finally:
+        view.deactivate()
+        window.destroy()
+
+
+def test_native_live_audio_failure_preserves_video_and_can_reopen_output(monkeypatch):
+    from types import SimpleNamespace
+
+    from halo_gtk import live_stream
+
+    Adw.init()
+    Gst.init(None)
+    monkeypatch.setattr(
+        live_stream, "_audio_sink_description", lambda: "fakesink name=asink sync=false"
+    )
+    view = live_stream.LiveStreamView()
+    view._resources = SimpleNamespace(token=view._stream_token)
+    monkeypatch.setattr(view, "_privacy_current", lambda *_: True)
+    try:
+        view._pipeline.set_state(Gst.State.PLAYING)
+        view.set_volume(0)
+        assert view._audio_pipeline is None
+        view.set_volume(0.5)
+        old_bus = view._audio_watch[0]
+        message = Gst.Message.new_error(
+            view._audio_pipeline, GLib.Error("synthetic output failure"), ""
+        )
+        old_bus.post(message)
+        _wait_until(lambda: view._audio_pipeline is None)
+        caps = Gst.Caps.from_string("video/x-raw,format=RGB,width=16,height=16,framerate=10/1")
+        view._video_appsrc.set_property("caps", caps)
+        assert (
+            view._video_appsrc.emit("push-buffer", Gst.Buffer.new_wrapped(bytes(16 * 16 * 3)))
+            == Gst.FlowReturn.OK
+        )
+        _wait_until(lambda: view._paintable.get_intrinsic_width() == 16)
+        view.set_volume(0.5)
+        assert view._audio_watch[0] != old_bus
+        view._on_audio_error(old_bus, message, view._stream_token)
+        assert view._audio_pipeline is not None
+    finally:
+        view._stop_audio_output()
+        view._pipeline.set_state(Gst.State.NULL)
+        view._detach_bus_watch()

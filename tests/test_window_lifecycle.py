@@ -293,7 +293,7 @@ def test_compact_navigation_is_hidden_while_focused():
     states.clear()
     page._active_page_name = "cameras"
     RingWindow._sync_navigation(page)
-    assert states == ["title", True, True]
+    assert states == ["title", True, False]
     states.clear()
     page._compact = False
     RingWindow._sync_navigation(page)
@@ -399,7 +399,7 @@ def test_reopening_hidden_focused_player_returns_to_source_before_refresh():
         refresh=lambda: calls.append("refresh"),
     )
     RingWindow._on_map(page)
-    assert calls == ["back", "refresh"]
+    assert calls == ["back"]
 
 
 @pytest.mark.parametrize("source", ["devices", "alarm"])
@@ -419,3 +419,66 @@ def test_camera_notification_retires_device_or_security_page(source):
     RingWindow._open_focused_live(page, SimpleNamespace(name="Camera"), source)
     assert hidden == [source]
     assert page._page_history == [source]
+
+
+def test_hidden_refresh_waits_for_map_and_restores_only_visible_activity(monkeypatch):
+    calls = []
+    mapped = False
+    page = SimpleNamespace(
+        get_mapped=lambda: mapped,
+        _resume_after_hide=False,
+        _active_page_name="history",
+        _banner=SimpleNamespace(set_revealed=lambda _: None),
+        _sync_appearance=lambda: None,
+        _update_events_banner=lambda _: None,
+        _cameras_page=SimpleNamespace(
+            enforce_live_monitoring_limits=lambda: calls.append("limits")
+        ),
+        _history_page=SimpleNamespace(refresh=lambda: calls.append("history")),
+    )
+    monkeypatch.setattr(window_module, "get_client", lambda: SimpleNamespace(is_authenticated=True))
+    page.refresh = lambda: RingWindow.refresh(page)
+    page.refresh()
+    page.refresh()
+    assert page._resume_after_hide and calls == []
+    mapped = True
+    RingWindow._on_map(page)
+    RingWindow._on_map(page)
+    assert calls == ["limits", "history"]
+
+
+def test_close_before_restore_does_not_reopen_camera_work(monkeypatch):
+    from halo_gtk.app import RingApplication
+
+    calls = []
+    mapped = True
+
+    def visible(value):
+        nonlocal mapped
+        mapped = value
+
+    page = SimpleNamespace(
+        _active_page_name="cameras",
+        _resume_after_hide=False,
+        get_root=lambda: page,
+        get_mapped=lambda: mapped,
+        get_application=lambda: app,
+        set_visible=visible,
+        stop_runtime_streams=lambda: calls.append("stop"),
+        _sync_appearance=lambda: None,
+        _update_events_banner=lambda _: None,
+        _banner=SimpleNamespace(set_revealed=lambda _: None),
+        _cameras_page=SimpleNamespace(refresh=lambda: calls.append("camera work")),
+    )
+    app = SimpleNamespace(
+        should_hide_on_close=lambda: True, get_main_window=lambda: page, _quitting=False
+    )
+    monkeypatch.setattr(window_module, "get_client", lambda: SimpleNamespace(is_authenticated=True))
+    page.refresh = lambda: RingWindow.refresh(page)
+    assert RingWindow._on_close_request(page)
+    RingApplication._finish_session_restore(app, True)
+    page.refresh()
+    assert calls == ["stop"]
+    visible(True)
+    RingWindow._on_map(page)
+    assert calls == ["stop", "camera work"]

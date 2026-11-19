@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol
@@ -17,7 +18,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import Gtk  # noqa: E402
+from gi.repository import GLib, Gtk  # noqa: E402
 
 _log = logging.getLogger(__name__)
 
@@ -33,7 +34,9 @@ class StreamState(StrEnum):
     """Lifecycle state for one GUI live stream."""
 
     STOPPED = "stopped"
+    WAITING = "waiting"
     CONNECTING = "connecting"
+    RECOVERING = "recovering"
     ACTIVE = "active"
     FAILED = "failed"
     STOPPING = "stopping"
@@ -44,7 +47,7 @@ class LiveStreamViewProtocol(Protocol):
 
     def start_for_device(self, device: object) -> None: ...
 
-    def stop(self) -> None: ...
+    def stop(self) -> Future | None: ...
 
     def get_parent(self) -> Any: ...
 
@@ -54,7 +57,9 @@ class LiveStreamViewProtocol(Protocol):
 
     def stop_talking(self) -> None: ...
 
-    def get_current_frame_png(self) -> bytes | None: ...
+    def has_current_frame(self) -> bool: ...
+
+    def get_current_frame_png(self, viewport=None) -> bytes | None: ...
 
     def get_paintable(self) -> Any: ...
 
@@ -70,6 +75,7 @@ class LiveStreamSession:
     owners: set[str] = field(default_factory=set)
     state: StreamState = StreamState.STOPPED
     volume: float = 0.0
+    limit: int = 4
 
     @property
     def device_id(self) -> int:
@@ -77,13 +83,16 @@ class LiveStreamSession:
 
     @property
     def active(self) -> bool:
-        """Return whether this session currently occupies a stream-cap slot."""
-        return self.state in {StreamState.CONNECTING, StreamState.ACTIVE}
+        """Return whether owners have requested or are using this stream."""
+        return self.state in {
+            StreamState.WAITING,
+            StreamState.CONNECTING,
+            StreamState.ACTIVE,
+            StreamState.RECOVERING,
+        }
 
     def start(self, *, volume: float = 0.0) -> None:
         self.set_volume(volume)
-        if self.active:
-            return
         self.state = StreamState.CONNECTING
         try:
             self.view.start_for_device(self.device)
@@ -91,14 +100,15 @@ class LiveStreamSession:
             self.state = StreamState.FAILED
             raise
 
-    def stop(self) -> None:
-        if self.state is StreamState.STOPPED:
+    def stop(self) -> Future | None:
+        if self.state in {StreamState.STOPPED, StreamState.WAITING}:
+            self.state = StreamState.STOPPED
             self.owners.clear()
             self.detach()
             return
         self.state = StreamState.STOPPING
         try:
-            self.view.stop()
+            return self.view.stop()
         finally:
             self.state = StreamState.STOPPED
             self.owners.clear()
@@ -132,8 +142,11 @@ class LiveStreamSession:
     def stop_talking(self) -> None:
         self.view.stop_talking()
 
-    def get_current_frame_png(self) -> bytes | None:
-        return self.view.get_current_frame_png()
+    def has_current_frame(self) -> bool:
+        return self.view.has_current_frame()
+
+    def get_current_frame_png(self, viewport=None) -> bytes | None:
+        return self.view.get_current_frame_png(viewport)
 
     def get_paintable(self):
         return self.view.get_paintable()
@@ -149,14 +162,28 @@ class LiveSessionManager:
         max_streams_factory: Callable[[], int] | None = None,
     ) -> None:
         self._sessions: dict[int, LiveStreamSession] = {}
+        self._closing: dict[int, LiveStreamSession] = {}
         self._view_factory = view_factory
         self._max_streams_factory = max_streams_factory
 
     def active_count(self) -> int:
-        return sum(1 for session in self._sessions.values() if session.active)
+        """Count transports during startup, playback and cleanup."""
+        return len(self._closing) + sum(
+            session.active and session.state != StreamState.WAITING
+            for session in self._sessions.values()
+        )
+
+    def reservation_count(self) -> int:
+        return sum(session.active for session in self._sessions.values())
 
     def session_for(self, device_id: int) -> LiveStreamSession | None:
         return self._sessions.get(int(device_id))
+
+    def preview_session_for(self, device) -> LiveStreamSession | None:
+        session = self.session_for(device.id)
+        if session is not None and session.active:
+            return session
+        return self._closing.get(int(device.id))
 
     def acquire(
         self,
@@ -171,34 +198,79 @@ class LiveSessionManager:
         if session is not None and session.device is not device:
             # An inventory replacement or another account may reuse an API id.
             # Its old view and owners cannot be transferred to the new wrapper.
-            self._sessions.pop(device_id, None)
-            session.stop()
+            self._stop_session(session)
             session = None
         created = session is None
-        # Connecting and active sessions occupy a slot. Failed/stopped sessions
-        # can restart only when another slot is available.
-        if session is None or not session.active:
-            limit = self._max_streams() if max_streams is None else max_streams
-            if self.active_count() >= limit:
-                raise StreamLimitExceeded(f"maximum live streams reached ({limit})")
-            if session is None:
-                session = LiveStreamSession(device=device, view=self._make_view())
-                self._sessions[device_id] = session
-                self._wire_stream_ended(session)
+        if session is not None and session.active:
+            session.owners.add(owner)
+            session.set_volume(volume)
+            return session
 
+        limit = self._max_streams() if max_streams is None else max_streams
+        if self.reservation_count() >= limit:
+            raise StreamLimitExceeded(f"maximum live streams reached ({limit})")
+        if session is None:
+            session = LiveStreamSession(device=device, view=self._make_view())
+            self._sessions[device_id] = session
+            self._wire_stream_ended(session)
+        session.limit = limit
         session.owners.add(owner)
+        if self._must_wait(session):
+            session.state = StreamState.WAITING
+            session.set_volume(volume)
+            return session
         try:
             session.start(volume=volume)
         except Exception:
             session.owners.discard(owner)
             if created or not session.owners:
-                self._sessions.pop(device_id, None)
                 try:
-                    session.stop()
+                    self._stop_session(session)
                 except Exception:
                     _log.exception("Failed to clean up live session %s after startup", device_id)
             raise
         return session
+
+    def _must_wait(self, session: LiveStreamSession) -> bool:
+        return self.active_count() >= session.limit or session.device_id in self._closing
+
+    def _stop_session(self, session: LiveStreamSession) -> None:
+        device_id = session.device_id
+        # Publish closing ownership before detaching the GTK view. A preview
+        # can inspect this registry from the Ring thread during GStreamer stop.
+        occupied = session.state not in {StreamState.STOPPED, StreamState.WAITING}
+        if occupied:
+            self._closing[device_id] = session
+        self._sessions.pop(device_id, None)
+        try:
+            closing = session.stop()
+        except Exception:
+            if occupied:
+                self._closing.pop(device_id, None)
+            raise
+        if occupied:
+            if closing is None or closing.done():
+                self._closing.pop(device_id, None)
+            else:
+                closing.add_done_callback(lambda _done: GLib.idle_add(self._finish_close, session))
+
+    def _finish_close(self, retired: LiveStreamSession) -> bool:
+        if self._closing.get(retired.device_id) is retired:
+            self._closing.pop(retired.device_id)
+            self._admit_waiters()
+        return GLib.SOURCE_REMOVE
+
+    def _admit_waiters(self) -> None:
+        for session in tuple(self._sessions.values()):
+            if session.state == StreamState.WAITING and not self._must_wait(session):
+                try:
+                    session.start(volume=session.volume)
+                except Exception:
+                    _log.exception("Could not start waiting camera %s", session.device_id)
+                    try:
+                        self._stop_session(session)
+                    except Exception:
+                        _log.exception("Could not clean up waiting camera %s", session.device_id)
 
     def _wire_stream_ended(self, session: LiveStreamSession) -> None:
         """Let the view report lifecycle transitions so cap accounting stays exact."""
@@ -212,6 +284,8 @@ class LiveSessionManager:
             return
         try:
             session.state = StreamState(state)
+            if not session.active:
+                self._admit_waiters()
         except ValueError:
             _log.warning("Ignoring unknown live stream state for %s: %s", device_id, state)
 
@@ -221,15 +295,14 @@ class LiveSessionManager:
             return
         session.owners.discard(owner)
         if not session.owners:
-            self._sessions.pop(int(device_id), None)
-            session.stop()
+            self._stop_session(session)
+            self._admit_waiters()
 
     def stop_all(self) -> None:
         sessions = list(self._sessions.values())
-        self._sessions.clear()
         for session in sessions:
             try:
-                session.stop()
+                self._stop_session(session)
             except Exception:
                 _log.exception("Failed to stop live session %s", session.device_id)
 
@@ -263,7 +336,4 @@ def get_live_session_manager() -> LiveSessionManager:
 
 
 def active_session_for_device(device) -> LiveStreamSession | None:
-    session = _MANAGER.session_for(device.id)
-    if session is not None and session.device is device and session.active:
-        return session
-    return None
+    return _MANAGER.preview_session_for(device)

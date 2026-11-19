@@ -44,6 +44,7 @@ class Window:
 class Page:
     _submit_save_job = HistoryPage._submit_save_job
     _show_save_toast = HistoryPage._show_save_toast
+    _show_recording_error = HistoryPage._show_recording_error
     _queue_history_result = HistoryPage._queue_history_result
     _copy_url_to_clipboard = HistoryPage._copy_url_to_clipboard
     _load_and_play = HistoryPage._load_and_play
@@ -174,24 +175,28 @@ def test_operation_failures_are_visible_and_stale_callbacks_are_dropped(
     monkeypatch.setattr(history_page, "get_client", lambda: client)
     window = Window()
     page = Page(window)
+    errors = []
+    page._player = SimpleNamespace(show_error=errors.append)
     event = {"id": 1, "_device": object()}
     if operation == "play":
-        page._load_and_play(event, 2)
+        page._load_and_play(event, 2, client, page._save_ui_generation)
     elif operation == "share":
         page._copy_url_to_clipboard(event)
     else:
         page._do_delete(event)
     for callback in pending:
         callback()
-    assert window.toasts
+    messages = errors if operation == "play" else [toast.title for toast in window.toasts]
+    assert messages
     if operation == "delete" and failure == "timeout":
         assert "may have completed" in window.toasts[-1].title
-    assert "private URL" not in window.toasts[-1].title
+    assert "private URL" not in messages[-1]
     page._save_ui_generation += 1
     window.toasts.clear()
+    errors.clear()
     for callback in pending:
         callback()
-    assert window.toasts == []
+    assert window.toasts == [] and errors == []
 
 
 def test_deletion_does_not_start_after_account_changed(monkeypatch):
@@ -199,3 +204,11 @@ def test_deletion_does_not_start_after_account_changed(monkeypatch):
     monkeypatch.setattr(history_page, "get_client", lambda: object())
     monkeypatch.setattr(history_page.GLib, "idle_add", lambda callback: None)
     Page(Window())._do_delete({"id": 1, "_device": object()}, 3, old)
+
+
+def test_recording_retry_drops_worker_after_account_replacement(monkeypatch):
+    old = SimpleNamespace(recording_url=lambda *_: pytest.fail("stale recording URL fetch"))
+    monkeypatch.setattr(history_page, "get_client", lambda: object())
+    page = Page(Window())
+    page._load_and_play({"id": 1, "_device": object()}, 2, old, page._save_ui_generation)
+    assert not page.actions

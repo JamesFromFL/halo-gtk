@@ -23,7 +23,6 @@ class SettingsWindow(Adw.ApplicationWindow):
             **kwargs,
         )
         self.set_size_request(360, 480)
-        self.connect("close-request", self._on_close_request)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -42,7 +41,3 @@ class SettingsWindow(Adw.ApplicationWindow):
 
     def refresh(self) -> None:
         self._settings_page.refresh()
-
-    def _on_close_request(self, *_) -> bool:
-        self.set_visible(False)
-        return True

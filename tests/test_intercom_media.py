@@ -280,7 +280,7 @@ async def test_startup_cancellation_closes_stream_and_releases_only_after_resour
 
 
 @pytest.mark.asyncio
-async def test_resource_cleanup_stops_microphone_then_stream_peer_and_owner(streams):
+async def test_resource_cleanup_stops_microphone_then_peer_before_remote_close(streams):
     client, _, _, policy = authority()
     policy.set_enabled(True)
     lease = policy.acquire(policy.adapter, "live")
@@ -309,7 +309,7 @@ async def test_resource_cleanup_stops_microphone_then_stream_peer_and_owner(stre
         pc=SimpleNamespace(close=peer),
     )
     await resources.cleanup()
-    assert order == ["mic", "stream", "peer"] and policy._lease is None
+    assert order == ["mic", "peer", "stream"] and policy._lease is None
 
 
 @pytest.mark.asyncio
@@ -465,6 +465,7 @@ def test_worker_submission_failure_releases_unused_intercom_admission(monkeypatc
     policy.set_enabled(True)
     view = LiveStreamView.__new__(LiveStreamView)
     view._stream_token, view._resources, view._pipeline = 0, None, None
+    view._requested_volume = 0
     view._media_authority = policy
     view._paintable = None
     view._video_picture = SimpleNamespace(set_paintable=lambda *_: None)

@@ -11,7 +11,7 @@ import gi
 gi.require_version("Graphene", "1.0")
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import Graphene, Gtk  # noqa: E402
+from gi.repository import Gdk, Graphene, Gtk  # noqa: E402
 
 _log = logging.getLogger(__name__)
 
@@ -30,6 +30,24 @@ class ZoomPaintableView(Gtk.Widget):
         self._zoom = 1.0
         self._pan_x = 0.0
         self._pan_y = 0.0
+        self.set_tooltip_text("Use the arrow keys to pan while zoomed in")
+        self.update_property([Gtk.AccessibleProperty.LABEL], ["Zoomed video. Arrow keys pan."])
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self._pan_key)
+        self.add_controller(keys)
+
+    def _pan_key(self, _controller, keyval, _keycode, _state):
+        directions = {
+            Gdk.KEY_Left: (1, 0),
+            Gdk.KEY_Right: (-1, 0),
+            Gdk.KEY_Up: (0, 1),
+            Gdk.KEY_Down: (0, -1),
+        }
+        if self._zoom <= 1 or keyval not in directions:
+            return False
+        dx, dy = directions[keyval]
+        self.set_pan(self._pan_x + dx * 32, self._pan_y + dy * 32)
+        return True
 
     def set_paintable(self, paintable) -> None:
         self._disconnect_paintable()
@@ -44,6 +62,7 @@ class ZoomPaintableView(Gtk.Widget):
 
     def set_zoom(self, zoom: float) -> None:
         self._zoom = max(ZOOM_MIN, min(ZOOM_MAX, zoom))
+        self.set_focusable(self._zoom > 1.0)
         self._clamp_pan()
         self.queue_draw()
 

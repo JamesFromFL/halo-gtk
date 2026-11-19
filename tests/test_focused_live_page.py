@@ -44,7 +44,6 @@ def test_leaving_focus_cancels_pending_preview(monkeypatch):
         _view_generation=1,
         _device=None,
         _session=None,
-        _reset_microphone_control=lambda: None,
         _set_controls_sensitive=lambda _: None,
         _cancel_live_ready_poll=lambda: None,
         _clear_video_box=lambda: None,
@@ -72,8 +71,15 @@ def test_screenshot_distinguishes_save_and_folder_failures(monkeypatch, tmp_path
     monkeypatch.setattr(focused_live_page.media_paths, "write_unique_bytes", write)
     monkeypatch.setattr(focused_live_page.media_paths, "should_open_after_save", lambda: True)
     monkeypatch.setattr(focused_live_page.media_paths, "open_folder", folder)
+    monkeypatch.setattr(
+        focused_live_page.threading, "Thread", lambda *, target, **_: SimpleNamespace(start=target)
+    )
+    monkeypatch.setattr(focused_live_page.GLib, "idle_add", lambda callback, *args: callback(*args))
     page = SimpleNamespace(
-        _session=SimpleNamespace(get_current_frame_png=lambda: b"png"),
+        _zoom=1.0,
+        _view_generation=1,
+        _screenshot_pending=False,
+        _session=SimpleNamespace(get_current_frame_png=lambda viewport: b"png"),
         _video_view=SimpleNamespace(zoomed_frame_png=lambda _: None),
         _device=SimpleNamespace(id=1),
         get_root=lambda: SimpleNamespace(show_toast=messages.append),
@@ -87,46 +93,11 @@ def test_screenshot_distinguishes_save_and_folder_failures(monkeypatch, tmp_path
         assert len(messages) == (2 if failure == "folder" else 1)
 
 
-class _FakeToggle:
-    def __init__(self, active: bool):
-        self.active = active
-        self.icon_name = None
-        self.tooltip = None
-
-    def get_active(self):
-        return self.active
-
-    def set_active(self, active):
-        self.active = active
-
-    def handler_block_by_func(self, _callback):
-        pass
-
-    def handler_unblock_by_func(self, _callback):
-        pass
-
-    def set_icon_name(self, icon_name):
-        self.icon_name = icon_name
-
-    def set_tooltip_text(self, tooltip):
-        self.tooltip = tooltip
-
-
-def test_stop_talking_ends_active_shared_session_before_reset():
+def test_stop_talking_releases_the_held_control():
     calls = []
-    toggle = _FakeToggle(active=True)
-    page = SimpleNamespace(
-        _mic_btn=toggle,
-        _session=SimpleNamespace(stop_talking=lambda: calls.append("stop")),
-        _on_mic_toggled=lambda *_: None,
-        _reset_microphone_control=lambda: FocusedLivePage._reset_microphone_control(page),
-    )
-
+    page = SimpleNamespace(_mic_btn=SimpleNamespace(release=lambda: calls.append("stop")))
     FocusedLivePage._stop_talking(page)
-
     assert calls == ["stop"]
-    assert toggle.active is False
-    assert toggle.icon_name == "microphone-disabled-symbolic"
 
 
 def test_failed_session_stops_live_frame_poll():
@@ -156,7 +127,6 @@ def test_leaving_rejects_a_delayed_still_for_the_previous_camera(monkeypatch):
         _view_generation=3,
         _session=None,
         _stop_talking=lambda: None,
-        _reset_microphone_control=lambda: None,
         _set_controls_sensitive=lambda _value: None,
         _cancel_live_ready_poll=lambda: None,
         _clear_video_box=lambda: calls.append("clear"),

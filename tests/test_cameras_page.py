@@ -148,17 +148,9 @@ def test_camera_tile_keyboard_activation_selects_camera():
 
 def test_camera_tile_stops_active_talkback_before_releasing_owner():
     calls = []
-    toggle = _FakeToggle(active=True)
-    tile = SimpleNamespace(
-        _mic_btn=toggle,
-        _live_session=SimpleNamespace(stop_talking=lambda: calls.append("stop")),
-        _on_mic_toggled=lambda *_: None,
-    )
-
+    tile = SimpleNamespace(_mic_btn=SimpleNamespace(release=lambda: calls.append("stop")))
     CameraTile.stop_talking(tile)
-
     assert calls == ["stop"]
-    assert toggle.active is False
 
 
 def test_camera_tile_reports_immediate_stream_start_failure(monkeypatch):
@@ -362,7 +354,7 @@ def test_live_monitoring_stream_gate_denies_above_max(monkeypatch):
         def session_for(self, device_id):
             return self.sessions.get(device_id)
 
-        def active_count(self):
+        def reservation_count(self):
             return 4
 
     page = CamerasPage.__new__(CamerasPage)
@@ -388,7 +380,7 @@ def test_live_monitoring_stream_gate_drops_failed_manager_session(monkeypatch):
         def session_for(self, device_id):
             return self.sessions.get(device_id)
 
-        def active_count(self):
+        def reservation_count(self):
             return sum(session.active for session in self.sessions.values())
 
     page = CamerasPage.__new__(CamerasPage)
@@ -619,3 +611,22 @@ def test_leaving_monitoring_stops_talkback_even_when_video_continues(monkeypatch
     page.on_page_hidden()
 
     assert calls == ["deactivate-snapshots", "stop-talking"]
+
+
+def test_camera_layout_arrow_keys_move_focused_camera_one_visible_position():
+    from gi.repository import Gdk
+
+    from halo_gtk.cameras_page import CamerasPage
+
+    moved, focused = [], []
+    device = SimpleNamespace(id=7)
+    tile = SimpleNamespace(device=device, _is_layout_editing=lambda: True)
+    page = SimpleNamespace(
+        _order=[1, 3, 7, 9],
+        _cards={1: object(), 7: SimpleNamespace(grab_focus=lambda: focused.append(7)), 9: object()},
+        _on_reorder=lambda src, dst: moved.append((src, dst)),
+    )
+    tile._move_by = lambda identity, offset: CamerasPage._move_camera_by(page, identity, offset)
+    assert CameraTile._on_key_pressed(tile, None, Gdk.KEY_Left, 0, 0)
+    assert CameraTile._on_key_pressed(tile, None, Gdk.KEY_Right, 0, 0)
+    assert moved == [(7, 1), (7, 9)] and focused == [7, 7]
