@@ -322,7 +322,9 @@ patch_ring_doorbell_webrtc_close()
 
 MIC_SAMPLE_RATE = 48000
 MIC_SAMPLES = 960  # 20 ms at 48 kHz — matches aiortc's AUDIO_PTIME
-MIC_PULL_TIMEOUT_NS = 25 * Gst.MSECOND
+MIC_PULL_TIMEOUT_NS = 20 * Gst.MSECOND
+MIC_FRAME_BYTES = MIC_SAMPLES * 2  # mono S16LE
+MIC_BUFFER_BYTES = 4 * MIC_FRAME_BYTES
 
 
 def gst_push_succeeded(result) -> bool:
@@ -412,6 +414,7 @@ class MicrophoneTrack(AudioStreamTrack):
         self._active = False
         self._mic_pipeline: Gst.Pipeline | None = None
         self._mic_appsink: Gst.Element | None = None
+        self._pending_pcm = bytearray()
         self._start: float | None = None
         self._timestamp: int = 0
         self._capture_monitor: asyncio.Task | None = None
@@ -432,7 +435,7 @@ class MicrophoneTrack(AudioStreamTrack):
             "! audioconvert "
             "! audioresample "
             "! capsfilter caps=audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved "
-            "! appsink name=sink emit-signals=false max-buffers=1 drop=true"
+            "! appsink name=sink emit-signals=false max-buffers=4 drop=true"
         )
         try:
             appsink = pipeline.get_by_name("sink")
@@ -477,6 +480,7 @@ class MicrophoneTrack(AudioStreamTrack):
     async def stop_capture(self) -> None:
         """Stop mic capture and revert to silence."""
         self._active = False
+        self._pending_pcm.clear()
         pipeline = self._mic_pipeline
         self._mic_pipeline = None
         self._mic_appsink = None
@@ -490,18 +494,21 @@ class MicrophoneTrack(AudioStreamTrack):
             pipeline.set_state(Gst.State.NULL)
         _log.debug("Microphone capture stopped")
 
-    def _pull_sample_blocking(self, appsink: Gst.Element) -> bytes | None:
+    def _pull_sample_blocking(
+        self, appsink: Gst.Element, timeout_ns=MIC_PULL_TIMEOUT_NS
+    ) -> bytes | None:
         """Pull one buffer with a native timeout, intended for run_in_executor."""
-        sample = appsink.emit("try-pull-sample", MIC_PULL_TIMEOUT_NS)
+        sample = appsink.emit("try-pull-sample", timeout_ns)
         if sample is None:
             return None
         buf = sample.get_buffer()
         ok, info = buf.map(Gst.MapFlags.READ)
         if not ok:
             return None
-        data = bytes(info.data)
-        buf.unmap(info)
-        return data
+        try:
+            return bytes(memoryview(info.data)[-MIC_BUFFER_BYTES:])
+        finally:
+            buf.unmap(info)
 
     async def recv(self) -> AudioFrame:  # type: ignore[override]
         if self.readyState != "live":
@@ -526,18 +533,35 @@ class MicrophoneTrack(AudioStreamTrack):
         if self._active and appsink is not None and self._capture_allowed():
             loop = asyncio.get_running_loop()
             try:
-                raw = await loop.run_in_executor(None, self._pull_sample_blocking, appsink)
+                deadline = time.monotonic() + MIC_PULL_TIMEOUT_NS / Gst.SECOND
+                while len(self._pending_pcm) < MIC_FRAME_BYTES:
+                    remaining = int((deadline - time.monotonic()) * Gst.SECOND)
+                    if remaining <= 0:
+                        break
+                    raw = await loop.run_in_executor(
+                        None, self._pull_sample_blocking, appsink, remaining
+                    )
+                    if (
+                        self._mic_appsink is not appsink
+                        or not self._active
+                        or self.readyState != "live"
+                        or not self._capture_allowed()
+                    ):
+                        break
+                    if not raw:
+                        break
+                    self._pending_pcm.extend(raw[: len(raw) // 2 * 2])
+                    if len(self._pending_pcm) > MIC_BUFFER_BYTES:
+                        del self._pending_pcm[:-MIC_BUFFER_BYTES]
                 if (
-                    raw
+                    self._mic_appsink is appsink
                     and self._active
-                    and self._mic_appsink is appsink
                     and self.readyState == "live"
                     and self._capture_allowed()
+                    and len(self._pending_pcm) >= MIC_FRAME_BYTES
                 ):
-                    # Pad or trim to exactly the expected frame size.
-                    needed = MIC_SAMPLES * 2  # S16LE = 2 bytes per sample
-                    raw = raw[:needed].ljust(needed, b"\x00")
-                    frame.planes[0].update(raw)
+                    frame.planes[0].update(bytes(self._pending_pcm[:MIC_FRAME_BYTES]))
+                    del self._pending_pcm[:MIC_FRAME_BYTES]
                     return frame
             except Exception as exc:  # noqa: BLE001
                 _log.debug("Mic pull error: %s", exc)
@@ -547,6 +571,8 @@ class MicrophoneTrack(AudioStreamTrack):
                     if callback is not None:
                         callback()
 
+        if not self._capture_allowed():
+            self._pending_pcm.clear()
         # Silence fallback — zeroed plane.
         for p in frame.planes:
             p.update(bytes(p.buffer_size))

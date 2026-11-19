@@ -162,7 +162,7 @@ async def test_microphone_capture_uses_one_buffer_leaky_queue(monkeypatch):
     await track.start_capture()
     await track.stop_capture()
 
-    assert "max-buffers=1 drop=true" in descriptions[0]
+    assert "max-buffers=4 drop=true" in descriptions[0]
 
 
 @pytest.mark.asyncio
@@ -212,7 +212,7 @@ async def test_microphone_discards_sample_captured_before_talkback_release(monke
     track._mic_appsink = sink
 
     class FakeLoop:
-        async def run_in_executor(self, _executor, _function, _sink):
+        async def run_in_executor(self, _executor, _function, _sink, _timeout):
             await track.stop_capture()
             return b"\x10\x10" * ring_media.MIC_SAMPLES
 
@@ -293,3 +293,31 @@ async def test_aiortc_connect_task_is_retained_for_matching_peer_only():
     peer_task.cancel()
     other_task.cancel()
     await asyncio.gather(peer_task, other_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("samples", [480, 960, 1920])
+async def test_microphone_packetizes_variable_capture_without_padding_or_loss(monkeypatch, samples):
+    track = ring_media.MicrophoneTrack()
+    track._active = True
+    track._mic_appsink = object()
+    pcm = b"".join(i.to_bytes(2, "little") for i in range(3840))
+    chunks = iter(pcm[i : i + samples * 2] for i in range(0, len(pcm), samples * 2))
+    monkeypatch.setattr(track, "_pull_sample_blocking", lambda *_: next(chunks))
+    frames = [await track.recv() for _ in range(4)]
+    assert [frame.pts for frame in frames] == [0, 960, 1920, 2880]
+    assert b"".join(bytes(frame.planes[0]) for frame in frames) == pcm
+    await track.stop_capture()
+
+
+@pytest.mark.asyncio
+async def test_stopping_microphone_discards_remainder(monkeypatch):
+    track = ring_media.MicrophoneTrack()
+    track._active = True
+    track._mic_appsink = object()
+    monkeypatch.setattr(track, "_pull_sample_blocking", lambda *_: b"ab" * 1920)
+    assert any(bytes((await track.recv()).planes[0]))
+    assert track._pending_pcm
+    await track.stop_capture()
+    assert not track._pending_pcm
+    assert not any(bytes((await track.recv()).planes[0]))
