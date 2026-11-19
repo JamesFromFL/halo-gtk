@@ -18,7 +18,7 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
 from ring_doorbell.exceptions import RingTimeout  # noqa: E402
 
-from halo_gtk import device_names  # noqa: E402
+from halo_gtk import camera_privacy, device_names  # noqa: E402
 from halo_gtk.camera_info import CameraInfoContent  # noqa: E402
 from halo_gtk.ring_client import get_client  # noqa: E402
 
@@ -137,9 +137,8 @@ class _SettingQueue:
                     accepted = getattr(exc, "accepted", False) is True
                     uncertain = accepted or isinstance(exc, TimeoutError | RingTimeout)
                     request.finished(
-                        "Ring accepted this change, but its privacy settings "
-                        "could not be verified. "
-                        "Media stays hidden until Ring settings refresh."
+                        "Ring accepted this change, but its motion setting is unknown. "
+                        "Previews stay hidden until Ring verifies motion detection."
                         if accepted
                         else "Ring timed out; the change may have been applied. "
                         "Check the camera before trying again."
@@ -252,14 +251,73 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
         )
         self.set_size_request(500, 420)
         self.device = device
+        self._owner = get_client()
+        self._generation = getattr(self._owner, "_published_generation", None)
+        self._device_id = device.id
+        self._family = device.family
+        self._privacy_watch = None
+        self._motion_row = None
+        self._motion_switch = None
         self._on_nickname_changed = on_nickname_changed
         self._loading = False
         self._closed = False
         self._setting_serial = 0
         self._status_row: Adw.ActionRow | None = None
         self.connect("close-request", self._on_close_request)
+        if self._current_device() is not device:
+            self._retire()
+            return
         self._build_ui()
         self._show_settings()
+        self._privacy_watch = camera_privacy.PrivacyWatch(self._refresh_camera)
+
+    def _session_current(self) -> bool:
+        return (
+            self._owner is not None
+            and self._generation is not None
+            and get_client() is self._owner
+            and self._owner._published_generation == self._generation
+            and not self._owner._stopped
+        )
+
+    def _current_device(self):
+        if self._session_current():
+            device = self._owner.get_device_by_id(self._device_id)
+            if device is not None and device.family == self._family:
+                return device
+        return None
+
+    def _retire(self):
+        if not self._closed:
+            self._closed = True
+            GLib.idle_add(self.close)
+
+    def _refresh_camera(self):
+        if self._closed:
+            return
+        device = self._current_device()
+        if device is None:
+            self._retire()
+            return
+        self.device = device
+        self._render_motion(device)
+
+    def _render_motion(self, device):
+        if self._motion_switch is None:
+            return
+        observed = self._owner.camera_privacy.view(device).motion_allowed
+        self._motion_row.set_subtitle(
+            "Waiting for Ring to verify motion detection."
+            if observed is None
+            else f"Ring reports motion detection is {'on' if observed else 'off'}."
+        )
+        self._motion_switch.set_visible(observed is not None)
+        if observed is not None:
+            self._motion_switch.handler_block(self._motion_handler)
+            try:
+                self._motion_switch.set_active(observed)
+            finally:
+                self._motion_switch.handler_unblock(self._motion_handler)
 
     def _build_ui(self) -> None:
         toolbar_view = Adw.ToolbarView()
@@ -389,10 +447,15 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
             row.set_activatable_widget(entry)
             return row
         if spec.key == "motion_detection":
-            row = Adw.SwitchRow(title=spec.title, subtitle=spec.description)
-            row.set_active(bool(_safe_getattr(self.device, "motion_detection")))
-            row.connect("notify::active", self._on_motion_detection_changed)
-            return row
+            self._motion_row = Adw.ActionRow(title=spec.title)
+            self._motion_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+            self._motion_row.add_suffix(self._motion_switch)
+            self._motion_row.set_activatable_widget(self._motion_switch)
+            self._motion_handler = self._motion_switch.connect(
+                "notify::active", self._on_motion_detection_changed
+            )
+            self._render_motion(self.device)
+            return self._motion_row
         if spec.key == "doorbell_volume":
             return self._spin_row(
                 spec,
@@ -447,19 +510,36 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
         row.set_activatable_widget(spin)
         return row
 
-    def _on_motion_detection_changed(self, row: Adw.SwitchRow, _param) -> None:
-        if not self._loading:
-            value = row.get_active()
-            self._apply_setting(
-                "Motion Detection",
-                lambda: self.device.async_set_motion_detection(value),
-                lambda: _set_nested_attr(
-                    self.device,
-                    ("settings", "motion_detection_enabled"),
-                    value,
-                ),
-                setting_key="motion_detection",
+    def _on_motion_detection_changed(self, switch: Gtk.Switch, _param) -> None:
+        if self._loading or self._closed:
+            return
+        device = self._current_device()
+        if device is None:
+            self._retire()
+            return
+        desired = switch.get_active()
+        previous = self._owner.camera_privacy.view(device).motion_allowed
+        self._render_motion(device)
+        if previous is None or desired is previous:
+            return
+        observed = None
+
+        async def write(device):
+            nonlocal observed
+            observed = await self._owner._async_camera_privacy_setting(
+                device, desired, wanted=lambda: not self._closed
             )
+
+        def display_result(device):
+            self._render_motion(device)
+            state = "on" if observed else "off"
+            if observed is desired:
+                return f"Ring confirmed motion detection is {state}."
+            return f"Ring accepted the request but reports motion detection is still {state}."
+
+        self._apply_setting(
+            "Motion Detection", write, display_result, setting_key="motion_detection"
+        )
 
     def _on_nickname_activate(self, entry: Gtk.Entry) -> None:
         self._save_nickname(entry.get_text())
@@ -472,8 +552,12 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
         self._save_nickname("")
 
     def _save_nickname(self, value: str) -> None:
+        device = self._current_device()
+        if self._closed or device is None:
+            self._retire()
+            return
         try:
-            device_names.set_nickname(self.device, value)
+            device_names.set_nickname(device, value)
         except Exception as exc:
             self._set_status(f"Device Nickname failed: {exc}")
             return
@@ -487,8 +571,8 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
             value = int(spin.get_value())
             self._apply_setting(
                 "Doorbell Volume",
-                lambda: self.device.async_set_volume(value),
-                lambda: _set_nested_attr(self.device, ("settings", "doorbell_volume"), value),
+                lambda device: device.async_set_volume(value),
+                lambda device: _set_nested_attr(device, ("settings", "doorbell_volume"), value),
                 setting_key="doorbell_volume",
             )
 
@@ -499,9 +583,9 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
             label = _CHIME_TYPES[value]
             self._apply_setting(
                 "In-Home Chime Type",
-                lambda: self.device.async_set_existing_doorbell_type(value),
-                lambda: _set_nested_attr(
-                    self.device, ("settings", "chime_settings", "type"), value
+                lambda device: device.async_set_existing_doorbell_type(value),
+                lambda device: _set_nested_attr(
+                    device, ("settings", "chime_settings", "type"), value
                 ),
                 refresh_settings=True,
                 success_detail=f"Saved: {label}",
@@ -513,9 +597,9 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
             value = row.get_active()
             self._apply_setting(
                 "In-Home Chime",
-                lambda: self.device.async_set_existing_doorbell_type_enabled(value),
-                lambda: _set_nested_attr(
-                    self.device,
+                lambda device: device.async_set_existing_doorbell_type_enabled(value),
+                lambda device: _set_nested_attr(
+                    device,
                     ("settings", "chime_settings", "enable"),
                     value,
                 ),
@@ -527,9 +611,9 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
             value = int(spin.get_value())
             self._apply_setting(
                 "Digital Chime Duration",
-                lambda: self.device.async_set_existing_doorbell_type_duration(value),
-                lambda: _set_nested_attr(
-                    self.device, ("settings", "chime_settings", "duration"), value
+                lambda device: device.async_set_existing_doorbell_type_duration(value),
+                lambda device: _set_nested_attr(
+                    device, ("settings", "chime_settings", "duration"), value
                 ),
                 setting_key="chime_duration",
             )
@@ -537,57 +621,52 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
     def _apply_setting(
         self,
         title: str,
-        coroutine_factory: Callable[[], Any],
-        local_update: Callable[[], None],
+        coroutine_factory: Callable[[Any], Any],
+        local_update: Callable[[Any], str | None],
         *,
         refresh_settings: bool = False,
         success_detail: str | None = None,
         setting_key: str | None = None,
     ) -> None:
-        client = get_client()
-        if client is None:
-            self._set_status(f"{title} was not saved: not signed in to Ring")
+        if self._closed or self._current_device() is None:
+            self._retire()
             return
-        generation = getattr(client, "_published_generation", None)
-        privacy_setting = getattr(client, "_async_camera_privacy_setting", None)
-        if setting_key == "motion_detection" and callable(privacy_setting):
-            invoke_setting = coroutine_factory
-
-            def coroutine_factory():
-                return privacy_setting(self.device, invoke_setting)
 
         self._setting_serial += 1
         serial = self._setting_serial
         self._set_status(f"Waiting to save {title}...")
 
-        def current() -> bool:
-            return (
-                get_client() is client
-                and getattr(client, "_published_generation", None) == generation
-                and not getattr(client, "_stopped", False)
-            )
+        async def invoke():
+            device = self._current_device()
+            if self._closed or device is None:
+                raise RuntimeError("The camera or Ring session changed")
+            return await coroutine_factory(device)
+
+        def update_display():
+            device = self._current_device()
+            return local_update(device) if device is not None else None
 
         def finished(error: str | None, uncertain: bool) -> None:
             GLib.idle_add(
                 self._finish_queued_setting,
                 serial,
-                current,
+                self._session_current,
                 title,
                 error,
                 uncertain,
-                local_update,
+                update_display,
                 refresh_settings,
                 success_detail,
             )
 
-        key = (id(client), generation, device_names.device_key(self.device) or id(self.device))
+        key = (id(self._owner), self._generation, self._family, self._device_id)
         _SettingQueue.enqueue(
             key,
-            client,
+            self._owner,
             _SettingRequest(
                 setting_key,
-                coroutine_factory,
-                current,
+                invoke,
+                self._session_current,
                 lambda: not self._closed,
                 finished,
             ),
@@ -608,7 +687,7 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
             return GLib.SOURCE_REMOVE
         if error is None:
             try:
-                local_update()
+                success_detail = local_update() or success_detail
             except Exception as exc:
                 _log.debug("Ring saved a setting but the local display could not refresh: %s", exc)
                 error = (
@@ -626,6 +705,9 @@ class CameraSettingsWindow(Adw.ApplicationWindow):
 
     def _on_close_request(self, *_args) -> bool:
         self._closed = True
+        if self._privacy_watch is not None:
+            self._privacy_watch.close()
+            self._privacy_watch = None
         return False
 
     def _finish_apply(

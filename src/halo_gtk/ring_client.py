@@ -64,7 +64,7 @@ from halo_gtk.alarm.provider import (
     AlarmModePreparation,
     AlarmRefreshResult,
     AlarmRefreshStatus,
-    location_seeds_from_hubs,
+    validated_alarm_seeds,
 )
 from halo_gtk.alarm.rest import DEVICES_ENDPOINT, LOCATIONS_ENDPOINT
 from halo_gtk.alarm.rest import RingAlarmRestGateway as _RingAlarmRestGateway
@@ -123,9 +123,6 @@ _LISTENER_RECONNECT_MIN = 5
 _LISTENER_RECONNECT_MAX = 120
 _RING_LOCATIONS_ENDPOINT = "https://api.ring.com/devices/v1/locations"
 _ALARM_LOCATION_DISCOVERY_TIMEOUT = 10
-_ALARM_DISCOVERY_RECORD_LIMIT = 1_024
-_ALARM_DISCOVERY_LOCATION_LIMIT = 128
-_ALARM_DISCOVERY_IDENTIFIER_LIMIT = 512
 _LOCAL_HISTORY_ACCESS_TTL = 300
 _LOCAL_HISTORY_WORKERS = threading.BoundedSemaphore(2)
 _PREVIEW_CALL_SLOTS = threading.BoundedSemaphore(2)
@@ -275,8 +272,27 @@ def _install_device_inventory_refresh(ring) -> None:
         )
 
     async def refresh_devices():
+        from ring_doorbell.const import DEVICES_ENDPOINT as SDK_DEVICES_ENDPOINT
+
+        # Keep the original hub rows. SDK indexing by ID loses malformed
+        # collections and can silently collapse two rows with the same ID.
         previous = inventory_signature()
-        await update_devices()
+        response = await ring.async_query(SDK_DEVICES_ENDPOINT)
+        raw = response.json()
+        ring._halo_alarm_hubs = {
+            family: raw[family] for family in ("base_stations", "beams_bridges") if family in raw
+        }
+        device_data = {}
+        for family, records in raw.items():
+            if family in ring._halo_alarm_hubs:
+                # Alarm discovery validates these separately. An unreadable hub
+                # row cannot withhold a newly observed camera privacy denial.
+                records = records if isinstance(records, list) else ()
+                records = (
+                    row for row in records if isinstance(row, dict) and type(row.get("id")) is int
+                )
+            device_data[family] = {row["id"]: row for row in records}
+        ring.devices_data = device_data
         if inventory_signature() != previous:
             ring._devices = None
 
@@ -588,7 +604,9 @@ def init_client(
     return client
 
 
-def init_client_from_cache() -> RingClient | None:
+def init_client_from_cache(
+    *, on_retryable_error: Callable[[], None] | None = None
+) -> RingClient | None:
     """Restore a RingClient from a cached token without re-authenticating.
 
     Returns None if no token cache exists or if the cached token is invalid.
@@ -614,11 +632,15 @@ def init_client_from_cache() -> RingClient | None:
         return client
     except Exception as exc:
         _stop_client_quietly(client)
-        if _should_clear_cached_token(exc):
-            _log.warning("Cache restore failed (%s) — will require fresh login", exc)
+        if is_ring_grant_rejected(exc):
+            _log.warning("Ring rejected the saved refresh token — will require fresh login")
             _clear_rejected_cache_if_current(generation)
         else:
-            _log.warning("Cache restore failed (%s) — keeping saved token", exc)
+            _log.warning("Cache restore failed (%s) — keeping saved token", type(exc).__name__)
+            with _session_lock:
+                current = generation == _session_generation and _client is None
+            if current and on_retryable_error is not None:
+                on_retryable_error()
         return None
 
 
@@ -649,6 +671,9 @@ class RingClient:
         self._media_resources = set()
         self._media_resources_lock = threading.Lock()
         self._inventory_refresh_lock = asyncio.Lock()
+        self._ancillary_task = None
+        self._alarm_reconcile_lock = asyncio.Lock()
+        self._alarm_inventory_version = 0
         self._authenticated = False
         self._token_updater = token_updater or _save_token
         self._pending_auth_token: dict | None = None
@@ -866,10 +891,9 @@ class RingClient:
                 auth.get_hardware_id(),
                 _APP_USER_AGENT,
             )
-            lighting_revision = self._lighting_actions.revision
-            await ring.async_update_data()
+            await self._async_read_devices(ring)
             self._finish_authentication(auth, ring)
-            self._record_camera_privacy_receipt(lighting_revision)
+            self._schedule_ancillary_refresh(ring)
             _log.info(
                 "Ring authenticated — %d device(s) found",
                 len(ring.devices().all_devices),
@@ -896,10 +920,9 @@ class RingClient:
             # A cached token that expired (and whose refresh failed) raises
             # AuthenticationError here — let it propagate so init_client_from_cache()
             # can delete the stale secret.
-            lighting_revision = self._lighting_actions.revision
-            await ring.async_update_data()
+            await self._async_read_devices(ring)
             self._finish_authentication(auth, ring)
-            self._record_camera_privacy_receipt(lighting_revision)
+            self._schedule_ancillary_refresh(ring)
         except BaseException:
             self._pending_auth_token = None
             await self._close_auth(auth)
@@ -948,36 +971,30 @@ class RingClient:
         await self._ring.auth.async_refresh_tokens()
         await self._async_refresh_devices(None, -1)
 
-    async def _async_reconcile_alarm_discovery(self) -> None:
+    async def _async_reconcile_alarm_discovery(self, version, *, read_failed=False) -> None:
         service = self._alarm_service
-        if service is not None:
-            try:
-                await service.reconcile(await self._async_alarm_location_seeds())
-            except Exception as exc:
-                _log.warning(
-                    "Ring Alarm discovery reconciliation failed after session refresh (%s)",
-                    type(exc).__name__,
-                )
+        if service is None:
+            return
+        async with self._alarm_reconcile_lock:
+            if version != self._alarm_inventory_version or service is not self._alarm_service:
+                return
+            seeds = None if read_failed else await self._async_alarm_location_seeds()
+            if version == self._alarm_inventory_version and service is self._alarm_service:
+                if seeds is None:
+                    service.beams.update_owners(None)
+                await service.reconcile(seeds)
 
     def _alarm_location_seeds(
         self,
         *,
         raw_locations: Mapping[object, object] | Iterable[object] | None = None,
-    ) -> tuple[AlarmLocationSeed, ...]:
-        ring = self._ring
-        if ring is None:
-            return ()
-        base_stations = getattr(ring, "devices_data", {}).get("base_stations", {})
-        return location_seeds_from_hubs(
-            base_stations,
-            getattr(ring, "devices_data", {}).get("beams_bridges", {}),
-            raw_locations=raw_locations,
-        )
+    ) -> tuple[AlarmLocationSeed, ...] | None:
+        return validated_alarm_seeds(getattr(self._ring, "_halo_alarm_hubs", None), raw_locations)
 
-    async def _async_alarm_location_seeds(self) -> tuple[AlarmLocationSeed, ...]:
+    async def _async_alarm_location_seeds(self) -> tuple[AlarmLocationSeed, ...] | None:
         seeds = self._alarm_location_seeds()
         if not seeds:
-            return ()
+            return seeds
         ring = self._ring
         auth = getattr(ring, "auth", None)
         if auth is None:
@@ -1385,6 +1402,9 @@ class RingClient:
         service = self._alarm_service
         if service is None or not _is_active_client_generation(self, generation):
             return False
+        self._alarm_inventory_version += 1
+        version = self._alarm_inventory_version
+        self._alarm_discovery_at = None
         service.beams.update_owners(None)
         try:
             async with asyncio.timeout(12):
@@ -1393,66 +1413,29 @@ class RingClient:
                     device_task = group.create_task(gateway.request_json(DEVICES_ENDPOINT))
                     location_task = group.create_task(gateway.request_json(LOCATIONS_ENDPOINT))
                 devices, locations = device_task.result(), location_task.result()
-                if "base_stations" not in devices and "beams_bridges" not in devices:
-                    return False
-                stations = devices.get("base_stations", [])
-                bridges = devices.get("beams_bridges", [])
-                if (
-                    not isinstance(stations, list)
-                    or not isinstance(bridges, list)
-                    or len(stations) + len(bridges) > _ALARM_DISCOVERY_RECORD_LIMIT
-                ):
-                    return False
-                location_ids = set()
-                for station in stations + bridges:
-                    if not isinstance(station, Mapping):
-                        return False
-                    # Match the provider's ordered field fallback and text
-                    # normalization, but reject any record it would drop.
-                    identity = None
-                    for key in ("location_id", "locationId"):
-                        value = station.get(key)
-                        if isinstance(value, int) and not isinstance(value, bool):
-                            value = str(value)
-                        if (
-                            isinstance(value, str)
-                            and value.strip()
-                            and len(value.strip()) <= _ALARM_DISCOVERY_IDENTIFIER_LIMIT
-                            and not any(ord(character) < 32 for character in value)
-                        ):
-                            identity = value.strip()
-                            break
-                    if identity is None:
-                        return False
-                    location_ids.add(identity)
-                    if len(location_ids) > _ALARM_DISCOVERY_LOCATION_LIMIT:
-                        return False
-                seeds = location_seeds_from_hubs(stations, bridges, raw_locations=locations)
-                # Forgiving normalization must never turn partial discovery
-                # into authoritative removal of other locations.
-                if {seed.location_id for seed in seeds} != location_ids:
-                    return False
-                if (
-                    not _is_active_client_generation(self, generation)
-                    or service is not self._alarm_service
-                ):
-                    return False
-                await service.reconcile(seeds)
-                if (
-                    not _is_active_client_generation(self, generation)
-                    or service is not self._alarm_service
-                ):
-                    return False
-                self._alarm_discovery_at = alarm_monotonic_time()
-                self._alarm_discovery_generation = generation
-                self._alarm_discovery_service = service
-                service.beams.update_owners(bridges)
-                return True
-        except asyncio.CancelledError:
-            raise
+                seeds = validated_alarm_seeds(devices, locations)
         except Exception:
-            # A failed/unsupported read must never mean every location vanished.
-            return False
+            seeds = None
+        async with self._alarm_reconcile_lock:
+            if (
+                version != self._alarm_inventory_version
+                or not _is_active_client_generation(self, generation)
+                or service is not self._alarm_service
+            ):
+                return False
+            await service.reconcile(seeds)
+            if (
+                seeds is None
+                or version != self._alarm_inventory_version
+                or not _is_active_client_generation(self, generation)
+                or service is not self._alarm_service
+            ):
+                return False
+            self._alarm_discovery_at = alarm_monotonic_time()
+            self._alarm_discovery_generation = generation
+            self._alarm_discovery_service = service
+            service.beams.update_owners(devices.get("beams_bridges", []))
+            return True
 
     def refresh_alarm(self, location_id=None):
         return self.submit(self._async_refresh_alarm(location_id))
@@ -1577,7 +1560,7 @@ class RingClient:
             raise RuntimeError("Not signed in to Ring")
         return RingAlarmService(
             self._get_alarm_gateway(),
-            tuple(locations) if locations is not None else self._alarm_location_seeds(),
+            locations if locations is not None else self._alarm_location_seeds(),
             self._on_alarm_snapshot,
             generation=generation,
             command_admission=partial(self._alarm_command_admission, generation),
@@ -1914,10 +1897,8 @@ class RingClient:
     ) -> list:
         async with self._inventory_refresh_lock:
             if privacy_time() - self._last_device_update_at > max_age_seconds:
-                lighting_revision = self._lighting_actions.revision
-                await self._ring.async_update_data()
-                self._record_camera_privacy_receipt(lighting_revision)
-                await self._async_reconcile_alarm_discovery()
+                await self._async_read_devices(self._ring)
+                self._schedule_ancillary_refresh(self._ring)
         devices = list(self._ring.devices().all_devices)
         if families is None:
             return devices
@@ -1925,16 +1906,45 @@ class RingClient:
             device for device in devices if (getattr(device, "family", None) or "other") in families
         ]
 
-    def _record_camera_privacy_receipt(self, lighting_revision=None) -> None:
+    async def _async_read_devices(self, ring) -> None:
+        lighting_revision = self._lighting_actions.revision
+        self._alarm_inventory_version += 1
+        version = self._alarm_inventory_version
+        self._alarm_discovery_at = None
+        try:
+            await ring.async_update_devices()
+            self._record_camera_privacy_receipt(lighting_revision, ring=ring)
+        except Exception:
+            await self._async_reconcile_alarm_discovery(version, read_failed=True)
+            raise
+        await self._async_reconcile_alarm_discovery(version)
+
+    def _schedule_ancillary_refresh(self, ring) -> None:
+        if self._ancillary_task is None or self._ancillary_task.done():
+            self._ancillary_task = asyncio.create_task(self._refresh_ancillary_data(ring))
+
+    async def _refresh_ancillary_data(self, ring) -> None:
+        async def refresh(name):
+            try:
+                async with asyncio.timeout(30):
+                    await getattr(ring, name)()
+            except Exception as exc:
+                _log.debug("Ancillary Ring data refresh failed (%s)", type(exc).__name__)
+
+        async with asyncio.TaskGroup() as group:
+            group.create_task(refresh("async_update_dings"))
+            group.create_task(refresh("async_update_groups"))
+
+    def _record_camera_privacy_receipt(self, lighting_revision=None, *, ring=None) -> None:
         # Called in the Ring loop immediately after a successful GET. A cached
         # inventory read must never extend the privacy freshness deadline.
-        self._last_device_update_at = privacy_time()
+        received_at = privacy_time()
+        devices = (self._ring if ring is None else ring).devices().all_devices
         cameras = [
-            device
-            for device in self.all_devices
-            if getattr(device, "family", None) in CAMERA_FAMILIES
+            device for device in devices if getattr(device, "family", None) in CAMERA_FAMILIES
         ]
-        self.camera_privacy.observe(ring_privacy_receipt(cameras, self._last_device_update_at))
+        self.camera_privacy.observe(ring_privacy_receipt(cameras, received_at))
+        self._last_device_update_at = received_at
         if type(lighting_revision) is int:
             from halo_gtk.camera_lighting import camera_lighting_receipt
 
@@ -1957,26 +1967,45 @@ class RingClient:
                 _log.debug("Camera privacy refresh failed: %s", exc)
             await asyncio.sleep(30)
 
-    async def _async_camera_privacy_setting(self, device, invoke):
+    async def _async_camera_privacy_setting(
+        self, device, desired: bool, *, wanted: Callable[[], bool] = lambda: True
+    ) -> bool:
         # Share the inventory admission lock so an older in-flight GET cannot
         # restore media after this setting has started changing.
         async with self._inventory_refresh_lock:
-            if not self._preview_is_current() or not any(d is device for d in self.all_devices):
+            if (
+                not wanted()
+                or not self._preview_is_current()
+                or self.get_device_by_id(device.id) is not device
+            ):
                 raise SessionSupersededError("The camera or Ring session changed")
+            # The SDK silently skips its PATCH when the raw motion setting is absent.
+            settings = device._attrs.get("settings")
+            if (
+                self.camera_privacy.view(device).motion_allowed is None
+                or not isinstance(settings, dict)
+                or type(settings.get("motion_detection_enabled")) is not bool
+            ):
+                raise RuntimeError("Motion detection is unknown for this camera")
             token = self.camera_privacy.begin_change(device)
             try:
-                await invoke()
+                await device.async_set_motion_detection(desired)
             finally:
                 self.camera_privacy.end_change(token)
             if self._preview_is_current():
                 try:
-                    lighting_revision = self._lighting_actions.revision
-                    await self._ring.async_update_data()
-                    self._record_camera_privacy_receipt(lighting_revision)
+                    await self._async_read_devices(self._ring)
                 except Exception as exc:
                     raise CameraPrivacyReadbackError(
                         "Ring accepted the change, but privacy could not be verified."
                     ) from exc
+                observed_device = self.get_device_by_id(device.id)
+                if observed_device is not None and observed_device.family == device.family:
+                    observed = self.camera_privacy.view(observed_device).motion_allowed
+                    if observed is not None:
+                        return observed
+                raise CameraPrivacyReadbackError("Ring did not report the motion setting.")
+            raise SessionSupersededError("The Ring session changed during the write")
 
     def retain_media_resources(self, resources) -> None:
         with self._media_resources_lock:
@@ -2133,53 +2162,64 @@ class RingClient:
         expires_in = float(getattr(event, "expires_in", 0) or 0)
         return time.time() < started_at + expires_in
 
-    def get_event_notification_context(self, event) -> dict[str, Any]:
-        """Return optional text/image context for a Ring push notification."""
-        if self._ring is None:
-            return {}
+    def camera_notification_current(self, generation, lease) -> bool:
+        return (
+            _is_active_client_generation(self, generation)
+            and self.is_authenticated
+            and not self._stopped
+            and (lease is None or self.camera_privacy.valid(lease))
+        )
 
-        device_id = getattr(event, "doorbot_id", None)
-        event_id = getattr(event, "id", None)
-        if device_id is None:
-            return {}
+    def apply_camera_notification(self, generation, lease, callback) -> None:
+        """Fence visible delivery or navigation against account and privacy retirement."""
+        # Publication and logout both use this admission lock. Keep the session
+        # state lock free for ordinary readers during the synchronous GTK handoff.
+        with _alarm_command_lock:
+            if not self.camera_notification_current(generation, lease):
+                return
+            if lease is None:
+                callback()
+            else:
+                self.camera_privacy.apply(lease, callback)
 
-        return self._run(self._async_event_notification_context(device_id, event_id, event))
+    def get_event_notification_context(
+        self, event, lease, *, include_image: bool, include_summary: bool
+    ) -> dict[str, Any]:
+        """Enrich only through the camera and grant captured on event receipt."""
+        if self._ring is None or not self.camera_privacy.valid(lease):
+            return {}
+        return self._run(
+            self._async_event_notification_context(
+                event, lease, include_image=include_image, include_summary=include_summary
+            )
+        )
 
     async def _async_event_notification_context(
-        self,
-        device_id: int,
-        event_id: int | None,
-        event,
+        self, event, lease, *, include_image: bool, include_summary: bool
     ) -> dict[str, Any]:
-        device = self.get_device_by_id(device_id)
-        if device is None:
-            return {}
-
-        lease = self.camera_privacy.acquire(device, "preview")
-        if lease is None or not self._preview_is_current():
-            return {}
-
-        history_event = None
-        description = None
-        if event_id is not None:
-            history_event = await self._async_find_history_event(device, event_id)
-            description = _extract_event_description(history_event)
-            if history_event is not None and description is None:
-                _log.debug(
-                    "No Ring video description found for event %s; history keys=%s",
-                    event_id,
-                    sorted(history_event.keys()),
-                )
-
-        image_bytes = await self._async_event_preview_bytes(device, event_id, event, history_event)
-
         if not self.camera_privacy.valid(lease) or not self._preview_is_current():
             return {}
+        token = _CAMERA_PREVIEW_LEASE.set((self, lease))
+        try:
+            device = lease.device
+            event_id = getattr(event, "id", None)
+            history_event = None
+            if event_id is not None:
+                history_event = await self._async_find_history_event(device, event_id)
+            if not self._preview_is_current():
+                return {}
 
-        return {
-            "description": description,
-            "image_bytes": image_bytes,
-        }
+            image = (
+                await self._async_event_preview_bytes(device, event_id, event, history_event)
+                if include_image
+                else None
+            )
+            if not self._preview_is_current():
+                return {}
+            description = _extract_event_description(history_event) if include_summary else None
+            return {"description": description, "image_bytes": image}
+        finally:
+            _CAMERA_PREVIEW_LEASE.reset(token)
 
     async def _async_find_history_event(self, device, event_id: int) -> dict[str, Any] | None:
         try:
@@ -2451,6 +2491,11 @@ class RingClient:
             await asyncio.gather(
                 *(resource.close_for_client() for resource in media), return_exceptions=True
             )
+        ancillary = self._ancillary_task
+        self._ancillary_task = None
+        if ancillary is not None:
+            ancillary.cancel()
+            await asyncio.gather(ancillary, return_exceptions=True)
         discovery = self._alarm_discovery_task
         self._alarm_discovery_task = None
         if discovery is not None and not discovery.done():
@@ -2662,7 +2707,7 @@ class RingClient:
                 if alarm_event_enabled(event, cfg):
                     self._alarm_event_buffer.put(event)
             removed = previous_ids - {location.location_id for location in snapshot.locations}
-            if snapshot.status in {
+            if snapshot.error_code == "discovery-unavailable" or snapshot.status in {
                 AlarmServiceStatus.ONLINE,
                 AlarmServiceStatus.DEGRADED,
                 AlarmServiceStatus.NO_SYSTEM,
@@ -2778,7 +2823,10 @@ class RingClient:
             # No worker/media enrichment and no automatic write for access events.
             self._intercoms.queue_event(event)
             return
-        GLib.idle_add(self._dispatch_event, event, generation)
+        from halo_gtk.notifications import camera_notification_target
+
+        target = camera_notification_target(event, self, generation)
+        GLib.idle_add(self._dispatch_event, event, target)
 
     def _dispatch_intercom_event(self, device, generation):
         if not _is_active_client_generation(self, generation):
@@ -2791,12 +2839,12 @@ class RingClient:
         send_intercom_notification(current, device.observations[0], generation)
         return False
 
-    def _dispatch_event(self, event, generation: int) -> bool:
-        if not _is_active_client_generation(self, generation):
+    def _dispatch_event(self, event, target) -> bool:
+        if not _is_active_client_generation(self, target.generation):
             return False
         from halo_gtk.notifications import send_ring_notification
 
-        send_ring_notification(event)
+        send_ring_notification(event, target)
         for cb in list(self._event_callbacks):
             try:
                 cb(event)
@@ -2861,10 +2909,12 @@ def is_ring_session_rejected(exc: Exception) -> bool:
     )
 
 
-def _should_clear_cached_token(exc: Exception) -> bool:
+def is_ring_grant_rejected(exc: Exception) -> bool:
+    """Only an explicit invalid_grant response invalidates the saved refresh token."""
+    from oauthlib.oauth2 import InvalidGrantError
     from ring_doorbell import AuthenticationError
 
-    return isinstance(exc, AuthenticationError)
+    return isinstance(exc, AuthenticationError) and isinstance(exc.__cause__, InvalidGrantError)
 
 
 def _extract_event_description(event: dict[str, Any] | None) -> str | None:

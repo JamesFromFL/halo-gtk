@@ -1091,3 +1091,37 @@ async def test_preflight_refreshes_old_evidence_without_sending_a_mode():
         assert transport.send_calls == []
     finally:
         await _stop(stop, task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("readback", ["replacement", "new-epoch", "original"])
+async def test_timeout_requires_mode_from_admitted_panel_and_epoch(readback):
+    service, transport, stop, task = await _start_service(
+        (_panel(),), send_behavior="silent", command_timeout=0.005, reconcile_timeout=0.05
+    )
+    location = service.snapshot.find_location("location-1")
+
+    async def inventory(asset_id, *, epoch):
+        transport.inventory_requests.append((asset_id, epoch))
+        panel = _panel("all")
+        if readback == "replacement":
+            panel = DeviceDocument("replacement", {**panel.data, "zid": "replacement"})
+        if readback == "new-epoch":
+            runtime = service._runtimes["location-1"]
+            runtime.epoch = service._store.begin_epoch("location-1")
+            await service._location_opened(runtime, transport.assets)
+        await transport.on_message(DeviceInfoDocList("asset-1", (panel,)))
+
+    transport.request_inventory = inventory
+    try:
+        result = await service.request_mode(
+            "location-1", AlarmMode.AWAY, expected_revision=location.revision
+        )
+        assert result.confirmed_mode is AlarmMode.AWAY
+        assert result.confirmed is (readback == "original")
+        assert result.code == (
+            "confirmed-after-reconcile" if result.confirmed else "confirmation-timeout"
+        )
+        assert len(transport.send_calls) == 1
+    finally:
+        await _stop(stop, task)

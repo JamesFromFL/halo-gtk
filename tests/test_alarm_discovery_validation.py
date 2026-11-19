@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from halo_gtk import ring_client
+from halo_gtk.alarm import provider
 from halo_gtk.alarm.rest import DEVICES_ENDPOINT
 from halo_gtk.ring_client import RingClient
 
@@ -30,7 +31,7 @@ def discovery(monkeypatch):
             return {"base_stations": records} if url == DEVICES_ENDPOINT else {"user_locations": []}
 
     async def reconcile(seeds):
-        reconciled.append(tuple(seed.location_id for seed in seeds))
+        reconciled.append(None if seeds is None else tuple(seed.location_id for seed in seeds))
 
     client._alarm_gateway = Gateway()
     client._alarm_service = SimpleNamespace(
@@ -47,7 +48,7 @@ async def test_invalid_identity_cannot_reconcile_empty_or_partial_inventory(disc
     client, records, _calls, reconciled = discovery
     records.extend(({"location_id": "valid"}, {"location_id": identity}))
     assert not await client._async_refresh_alarm_discovery()
-    assert reconciled == []
+    assert reconciled == [None]
     assert client._alarm_discovery_at is None
 
 
@@ -80,10 +81,11 @@ async def test_location_limit_rejects_truncation_before_reconcile(discovery, cou
     client, records, _calls, reconciled = discovery
     records.extend({"location_id": f"location-{index}"} for index in range(count))
     assert await client._async_refresh_alarm_discovery() is allowed
-    assert len(reconciled) == int(allowed)
+    assert len(reconciled) == 1
     if allowed:
         assert len(reconciled[0]) == count
     else:
+        assert reconciled == [None]
         assert client._alarm_discovery_at is None
 
 
@@ -95,7 +97,7 @@ async def test_record_limit_allows_duplicate_stations_but_not_truncated_response
     client, records, _calls, reconciled = discovery
     records.extend({"location_id": "home"} for _ in range(count))
     assert await client._async_refresh_alarm_discovery() is allowed
-    assert reconciled == ([("home",)] if allowed else [])
+    assert reconciled == ([("home",)] if allowed else [None])
 
 
 @pytest.mark.asyncio
@@ -109,15 +111,15 @@ async def test_empty_valid_discovery_is_authoritative(discovery):
 async def test_any_normalized_identity_set_mismatch_is_not_authoritative(discovery, monkeypatch):
     client, records, _calls, reconciled = discovery
     records.extend(({"location_id": "home"}, {"location_id": "other"}))
-    original = ring_client.location_seeds_from_hubs
+    original = provider.location_seeds_from_hubs
     # Simulate a future forgiving parser dropping a record for another reason.
     monkeypatch.setattr(
-        ring_client,
+        provider,
         "location_seeds_from_hubs",
         lambda *args, **kwargs: original(*args, **kwargs)[:1],
     )
     assert not await client._async_refresh_alarm_discovery()
-    assert reconciled == []
+    assert reconciled == [None]
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ import threading
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -563,3 +564,85 @@ def test_cloud_result_authority_does_not_require_local_storage(active):
     assert not active.saved_alarm_history_available("home")
     active._admit_local_history_result(page(status=AlarmHistoryStatus.PERMISSION_DENIED), 1)
     assert not active.alarm_history_result_available("home")
+
+
+@pytest.mark.asyncio
+async def test_partial_and_malformed_routine_discovery_suspend_history_until_restored(
+    active, monkeypatch
+):
+    from gi.repository import GLib
+    from ring_doorbell import Ring
+
+    from halo_gtk import config
+    from halo_gtk.alarm.protocol import DeviceInfoDocList
+    from halo_gtk.alarm.service import RingAlarmService
+    from halo_gtk.alarm.transport import AlarmTicketAsset
+    from tests.test_ring_alarm_service import _panel, _StreamingTransport, _wait_until
+
+    locations = [{"id": 1, "location_id": "home"}, {"id": 2, "location_id": "work"}]
+    payload = {"base_stations": locations}
+    ring = Ring(object())
+    ring.session = {}
+    ring.async_query = AsyncMock(side_effect=lambda *_: SimpleNamespace(json=lambda: payload))
+    rc._install_device_inventory_refresh(ring)
+    active._ring = ring
+    active._alarm_gateway = SimpleNamespace(request_json=AsyncMock(return_value={}))
+    monkeypatch.setattr(config, "load", lambda: {})
+    monkeypatch.setattr(GLib, "idle_add", lambda *_: None)
+    monkeypatch.setattr(active, "_queue_history_reconciliation", active._reconcile_local_history)
+
+    def transport(_gateway, _seed):
+        return _StreamingTransport(
+            (AlarmTicketAsset("asset-1", "base_station_v1", "online"),),
+            (DeviceInfoDocList("asset-1", (_panel(),)),),
+        )
+
+    service = RingAlarmService(
+        active._alarm_gateway,
+        None,
+        active._on_alarm_snapshot,
+        generation=1,
+        transport_factory=transport,
+        poll_interval=0.001,
+    )
+    active._alarm_service = service
+    stop = asyncio.Event()
+    task = asyncio.create_task(service.run(stop))
+    store = active._local_alarm_history
+
+    async def refresh():
+        await active._async_refresh_devices(None, -1)
+
+    try:
+        await refresh()
+        await _wait_until(lambda: service.snapshot.status is AlarmServiceStatus.ONLINE)
+        active.set_local_history_retention(7)
+        for location in ("home", "work"):
+            active._save_local_history_result(page(location), 1)
+            assert active.saved_alarm_history(location).events
+
+        for malformed in ([*locations[:1], {"id": 1}], {}, None):
+            payload["base_stations"] = malformed
+            await refresh()
+            assert service.snapshot.error_code == "discovery-unavailable"
+            assert service.snapshot.locations == ()
+            for location in ("home", "work"):
+                with pytest.raises(LocalHistoryError):
+                    active.saved_alarm_history(location)
+                assert store.load(location).events
+
+        payload["base_stations"] = locations
+        await refresh()
+        await _wait_until(lambda: service.snapshot.status is AlarmServiceStatus.ONLINE)
+        for location in ("home", "work"):
+            assert not active.saved_alarm_history_available(location)
+            active._admit_local_history_result(page(location), 1)
+            assert active.saved_alarm_history(location).events
+
+        payload["base_stations"] = []
+        await refresh()
+        assert service.snapshot.status is AlarmServiceStatus.NO_SYSTEM
+        assert not store.load("home").events and not store.load("work").events
+    finally:
+        stop.set()
+        await task

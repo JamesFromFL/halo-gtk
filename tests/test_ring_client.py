@@ -1,11 +1,14 @@
 """Tests for Ring client helpers."""
 
 import asyncio
+import json
 import threading
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import ring_doorbell
+from oauthlib.oauth2 import InvalidGrantError
 from ring_doorbell import AuthenticationError, Requires2FAError
 
 from halo_gtk import ring_client
@@ -13,18 +16,26 @@ from halo_gtk.ring_client import RingClient, _extract_event_description, is_ring
 from tests.privacy_helpers import grant
 
 
+class _AncillaryUpdates:
+    async def async_update_dings(self):
+        pass
+
+    async def async_update_groups(self):
+        pass
+
+
 class _FakeDevices:
     def __init__(self, devices):
         self.all_devices = devices
 
 
-class _FakeRing:
+class _FakeRing(_AncillaryUpdates):
     def __init__(self, devices):
         self._devices = devices
         self.updated = False
         self.auth = None
 
-    async def async_update_data(self):
+    async def async_update_devices(self):
         self.updated = True
 
     def devices(self):
@@ -168,7 +179,7 @@ def test_init_client_from_cache_clears_token_on_authentication_error(monkeypatch
 
     class FakeRingClient:
         def authenticate_from_token(self, _token):
-            raise AuthenticationError("expired")
+            raise AuthenticationError("expired") from InvalidGrantError()
 
         def stop(self):
             nonlocal stopped
@@ -188,6 +199,65 @@ def test_init_client_from_cache_clears_token_on_authentication_error(monkeypatch
     assert ring_client.init_client_from_cache() is None
     assert cleared is True
     assert stopped is True
+
+
+@pytest.mark.parametrize(
+    ("reason", "rejected"),
+    [
+        ("invalid_grant", True),
+        ("temporarily_unavailable", False),
+        ("server_error", False),
+        ("invalid_client", False),
+        ("unrecognized_reason", False),
+    ],
+)
+def test_oauth_refresh_reason_controls_restore_and_manual_refresh(monkeypatch, reason, rejected):
+    from halo_gtk import settings_page
+
+    response = MagicMock()
+    response.text = AsyncMock(return_value=json.dumps({"error": reason}))
+    http = SimpleNamespace(request=AsyncMock(return_value=response))
+    auth = ring_doorbell.Auth(
+        "fixture", {"refresh_token": "fixture"}, hardware_id="fixture", http_client_session=http
+    )
+
+    def refresh(*_args):
+        asyncio.run(auth.async_refresh_tokens())
+
+    cleared, retry, manual = [], [], []
+    client = SimpleNamespace(authenticate_from_token=refresh, stop=lambda: None)
+    monkeypatch.setattr(ring_client, "_client", None)
+    monkeypatch.setattr(ring_client, "_load_token", lambda: {"refresh_token": "fixture"})
+    monkeypatch.setattr(ring_client, "_new_session_candidate", lambda: client)
+    for name in ("_clear_token", "clear_ring_account_email", "clear_ring_event_credentials"):
+        monkeypatch.setattr(ring_client, name, lambda name=name: cleared.append(name))
+
+    assert ring_client.init_client_from_cache(on_retryable_error=lambda: retry.append(True)) is None
+    assert cleared == (
+        ["_clear_token", "clear_ring_account_email", "clear_ring_event_credentials"]
+        if rejected
+        else []
+    )
+    assert retry == ([] if rejected else [True])
+
+    page = SimpleNamespace(
+        _begin_rejected_session_logout=lambda client: manual.append("sign-in"),
+        _finish_refresh_session=lambda *result: manual.append(result),
+    )
+    monkeypatch.setattr(settings_page.GLib, "idle_add", lambda callback, *args: callback(*args))
+    client.refresh_session_token = refresh
+    settings_page.SettingsPage._refresh_session(page, client)
+    if rejected:
+        assert manual == ["sign-in"]
+    else:
+        assert len(manual) == 1
+        success, message, prompt = manual[0]
+        assert not success and not prompt and "try again" in message
+    assert http.request.await_count == 2
+
+
+def test_unwrapped_authentication_error_is_ambiguous():
+    assert not ring_client.is_ring_grant_rejected(AuthenticationError("expired"))
 
 
 def test_account_email_is_cached_after_first_lookup(monkeypatch):
@@ -313,11 +383,11 @@ async def test_explicit_auth_persists_token_after_account_validation(monkeypatch
         async def async_close(self):
             self.closed = True
 
-    class FakeRing:
+    class FakeRing(_AncillaryUpdates):
         def __init__(self, auth):
             self.auth = auth
 
-        async def async_update_data(self):
+        async def async_update_devices(self):
             nonlocal saved_during_update
             saved_during_update = list(saved_tokens)
 
@@ -358,11 +428,11 @@ async def test_explicit_auth_closes_auth_when_account_validation_fails(monkeypat
         async def async_close(self):
             self.closed = True
 
-    class FakeRing:
+    class FakeRing(_AncillaryUpdates):
         def __init__(self, auth):
             self.auth = auth
 
-        async def async_update_data(self):
+        async def async_update_devices(self):
             raise RuntimeError("account data unavailable")
 
     monkeypatch.setattr(ring_doorbell, "Auth", FakeAuth)
@@ -398,11 +468,11 @@ async def test_explicit_auth_closes_auth_when_token_persistence_fails(monkeypatc
         async def async_close(self):
             self.closed = True
 
-    class FakeRing:
+    class FakeRing(_AncillaryUpdates):
         def __init__(self, auth):
             self.auth = auth
 
-        async def async_update_data(self):
+        async def async_update_devices(self):
             pass
 
         def devices(self):
@@ -436,12 +506,12 @@ async def test_cached_auth_closes_auth_when_account_validation_fails(monkeypatch
         async def async_close(self):
             self.closed = True
 
-    class FakeRing:
+    class FakeRing(_AncillaryUpdates):
         def __init__(self, auth):
             self.auth = auth
 
-        async def async_update_data(self):
-            raise AuthenticationError("expired")
+        async def async_update_devices(self):
+            raise AuthenticationError("expired") from InvalidGrantError()
 
     monkeypatch.setattr(ring_doorbell, "Auth", FakeAuth)
     monkeypatch.setattr(ring_doorbell, "Ring", FakeRing)
@@ -642,7 +712,7 @@ def test_stale_cache_rejection_cannot_clear_newer_login(monkeypatch):
         def authenticate_from_token(self, _token):
             restore_started.set()
             assert release_restore.wait(timeout=2)
-            raise AuthenticationError("expired")
+            raise AuthenticationError("expired") from InvalidGrantError()
 
         def authenticate(self, _username, _password, _otp_code):
             pass
@@ -954,7 +1024,7 @@ async def test_installed_sdk_inventory_refresh_preserves_identity_until_membersh
     active_stream = object()
     original_device._webrtc_streams["active"] = active_stream
 
-    async def query(_url):
+    async def query(_url, *_args):
         return type("Response", (), {"json": lambda _self: inventory})()
 
     ring._async_query = query

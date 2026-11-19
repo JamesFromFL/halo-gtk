@@ -104,7 +104,9 @@ def test_newly_snoozed_queued_event_never_enriches(monkeypatch):
     monkeypatch.setattr(
         notifications, "_ring_notification_text", lambda *_: pytest.fail("Enriched muted event")
     )
-    notifications._prepare_ring_notification(SimpleNamespace(kind="motion", doorbot_id=42), {})
+    notifications._prepare_ring_notification(
+        SimpleNamespace(kind="motion", doorbot_id=42), object()
+    )
 
 
 def test_snooze_changed_after_enrichment_suppresses_main_thread_delivery(monkeypatch):
@@ -117,7 +119,12 @@ def test_snooze_changed_after_enrichment_suppresses_main_thread_delivery(monkeyp
     monkeypatch.setattr(
         notifications, "send_notification", lambda *_a, **_k: pytest.fail("Delivered muted event")
     )
-    notifications._prepare_ring_notification(SimpleNamespace(kind="motion", doorbot_id=42))
+    target = SimpleNamespace(
+        client=SimpleNamespace(camera_notification_current=lambda *_: True),
+        generation=1,
+        preview_lease=None,
+    )
+    notifications._prepare_ring_notification(SimpleNamespace(kind="motion", doorbot_id=42), target)
     cfg["notification_rules"] = {"devices": {"camera:42": {"enabled": False}}}
     assert len(callbacks) == 1 and callbacks[0]() is False
 

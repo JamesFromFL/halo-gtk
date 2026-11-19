@@ -31,6 +31,13 @@ sessions. Revocation flushes queued live media, suppresses queued microphone
 samples, clears displayed current imagery, and closes the stream. A stream can be
 started again once its required settings are verified.
 
+A desktop camera alert captures its account and preview grant when the push event
+arrives. Both the alert and its View action expire with that ownership. Halo
+withdraws affected visible alerts on sign-out, account replacement, a changed
+grant, or receipt expiry. An event received without a preview grant may still
+show a basic motion or doorbell alert. Its enrichment never starts later if Ring
+grants access. Halo rechecks the preview and summary preferences at display time.
+
 Changing Motion Detection in Halo temporarily withdraws that camera's media
 grant. Inventory reads are serialized with the existing setting write; only a
 read begun after completion can restore permission. If Ring accepts the write

@@ -99,6 +99,7 @@ class _PendingCommand:
     baseline_revision: int
     future: asyncio.Future[AlarmMode]
     armed: bool = False
+    reconciling: bool = False
 
 
 class _CommandConnectionLost(RuntimeError):
@@ -120,7 +121,7 @@ class RingAlarmService:
     def __init__(
         self,
         request: AlarmRestGateway,
-        locations: Iterable[AlarmLocationSeed],
+        locations: Iterable[AlarmLocationSeed] | None,
         on_snapshot: Callable[[AlarmAccountSnapshot], None],
         *,
         generation: int = 0,
@@ -188,7 +189,8 @@ class RingAlarmService:
         self._store = AlarmStateStore(
             generation=generation, clock=wall_clock, monotonic_clock=monotonic_clock
         )
-        self._seeds = _index_seeds(locations)
+        self._discovery_incomplete = locations is None
+        self._seeds = _index_seeds(locations or ())
         self._runtimes: dict[str, _LocationRuntime] = {}
         self._mode_locks: dict[str, asyncio.Lock] = {}
         self._pending: dict[str, _PendingCommand] = {}
@@ -291,20 +293,20 @@ class RingAlarmService:
         self._running = False
         self._publish(status=AlarmServiceStatus.STOPPED)
 
-    async def reconcile(self, locations: Iterable[AlarmLocationSeed]) -> None:
-        """Reconcile REST discovery without disrupting healthy sockets."""
+    async def reconcile(self, locations: Iterable[AlarmLocationSeed] | None) -> None:
+        """Suspend access on incomplete discovery, or apply authoritative membership."""
 
         if self._closed:
             return
-        updated = _index_seeds(locations)
+        self._discovery_incomplete = locations is None
+        updated = _index_seeds(locations or ())
+        retired = []
         removed = set(self._seeds) - set(updated)
         for location_id in removed:
             runtime = self._runtimes.pop(location_id, None)
             if runtime is not None:
-                await self._stop_runtime(runtime)
-            remover = getattr(self._store, "remove_location", None)
-            if callable(remover):
-                remover(location_id)
+                retired.append(runtime)
+            self._store.remove_location(location_id)
             self._fail_pending(location_id)
             self._mode_locks.pop(location_id, None)
             self._approvals.pop(location_id, None)
@@ -332,6 +334,8 @@ class RingAlarmService:
                 runtime.seed = seed
         self._reconcile_revision += 1
         self._publish()
+        if retired:
+            await asyncio.gather(*(self._stop_runtime(runtime) for runtime in retired))
 
     async def request_refresh(
         self,
@@ -1164,10 +1168,7 @@ class RingAlarmService:
                 return await self._reconcile_ambiguous_command(
                     runtime,
                     location_id,
-                    panel.asset_id,
-                    panel.zid,
-                    target,
-                    panel.revision,
+                    pending,
                 )
         finally:
             if self._pending.get(location_id) is pending:
@@ -1181,64 +1182,56 @@ class RingAlarmService:
         self,
         runtime: _LocationRuntime,
         location_id: str,
-        panel_asset_id: str,
-        panel_zid: str,
-        target: AlarmMode,
-        baseline_panel_revision: int,
+        pending: _PendingCommand,
     ) -> AlarmCommandResult:
-        if runtime.transport.connected:
+        # The original waiter already identifies the admitted panel and epoch.
+        # During readback it may also accept an explicit mode in a full list.
+        pending.reconciling = True
+        if (
+            self._runtimes.get(location_id) is runtime
+            and runtime.epoch == pending.epoch
+            and runtime.transport.connected
+            and not pending.future.done()
+        ):
             with contextlib.suppress(AlarmTransportError):
                 await runtime.transport.request_inventory(
-                    panel_asset_id,
-                    epoch=runtime.epoch,
+                    pending.panel_asset_id, epoch=pending.epoch
                 )
-        if self._reconcile_timeout:
-            await self._wait_for_panel_revision(
-                location_id,
-                panel_asset_id,
-                panel_zid,
-                baseline_panel_revision,
-                self._reconcile_timeout,
-            )
+            if self._reconcile_timeout and not pending.future.done():
+                with contextlib.suppress(TimeoutError, _CommandConnectionLost):
+                    await asyncio.wait_for(
+                        asyncio.shield(pending.future), timeout=self._reconcile_timeout
+                    )
         current = self.snapshot.find_location(location_id)
         current_mode = current.mode if current is not None else AlarmMode.UNKNOWN
-        if current_mode is target:
+        panel = current.security_panel if current is not None else None
+        if (
+            pending.future.done()
+            and not pending.future.cancelled()
+            and pending.future.exception() is None
+            and self._runtimes.get(location_id) is runtime
+            and runtime.transport.connected
+            and runtime.epoch == pending.epoch
+            and panel is not None
+            and panel.asset_id == pending.panel_asset_id
+            and panel.zid == pending.panel_zid
+            and not panel.stale
+            and current_mode is pending.target
+        ):
             return self._command_result(
                 AlarmCommandStatus.CONFIRMED,
                 location_id,
-                target,
-                confirmed_mode=target,
+                pending.target,
+                confirmed_mode=current_mode,
                 code="confirmed-after-reconcile",
             )
         return self._command_result(
             AlarmCommandStatus.TIMEOUT_UNKNOWN,
             location_id,
-            target,
+            pending.target,
             confirmed_mode=current_mode,
             code="confirmation-timeout",
         )
-
-    async def _wait_for_panel_revision(
-        self,
-        location_id: str,
-        panel_asset_id: str,
-        panel_zid: str,
-        baseline_revision: int,
-        timeout: float,
-    ) -> None:
-        deadline = asyncio.get_running_loop().time() + timeout
-        while not self._should_stop():
-            event = self._change_event
-            location = self.snapshot.find_location(location_id)
-            panel_asset = location.find_asset(panel_asset_id) if location is not None else None
-            panel = panel_asset.find_device(panel_zid) if panel_asset is not None else None
-            if panel is None or panel.revision > baseline_revision:
-                return
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                return
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(event.wait(), timeout=remaining)
 
     def _confirm_pending(
         self,
@@ -1251,7 +1244,10 @@ class RingAlarmService:
             or pending.future.done()
             or not pending.armed
             or pending.epoch != runtime.epoch
-            or not isinstance(message, DeviceInfoDocUpdate)
+            or not (
+                isinstance(message, DeviceInfoDocUpdate)
+                or (pending.reconciling and isinstance(message, DeviceInfoDocList))
+            )
             or message.asset_id != pending.panel_asset_id
         ):
             return
@@ -1260,6 +1256,15 @@ class RingAlarmService:
             location is None
             or location.epoch != pending.epoch
             or location.revision <= pending.baseline_revision
+        ):
+            return
+        panel = location.security_panel
+        if (
+            panel is None
+            or panel.stale
+            or panel.asset_id != pending.panel_asset_id
+            or panel.zid != pending.panel_zid
+            or location.mode is not pending.target
         ):
             return
         expected_raw = {
@@ -1396,6 +1401,8 @@ class RingAlarmService:
     def _derive_status(self) -> AlarmServiceStatus:
         if self._closed:
             return AlarmServiceStatus.STOPPED
+        if self._discovery_incomplete:
+            return AlarmServiceStatus.DISCOVERING
         if not self._seeds:
             return AlarmServiceStatus.NO_SYSTEM
         phases = {runtime.phase for runtime in self._runtimes.values()}
@@ -1424,6 +1431,8 @@ class RingAlarmService:
         return AlarmServiceStatus.OFFLINE
 
     def _derive_error_code(self) -> str | None:
+        if self._discovery_incomplete:
+            return "discovery-unavailable"
         if any(runtime.phase == "authentication-required" for runtime in self._runtimes.values()):
             return "authentication-required"
         return None

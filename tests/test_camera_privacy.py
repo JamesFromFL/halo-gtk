@@ -148,18 +148,21 @@ async def test_cached_inventory_read_does_not_qualify_or_extend_privacy(monkeypa
     device = camera()
     client = RingClient()
     client._ring = SimpleNamespace(
-        async_update_data=AsyncMock(), devices=lambda: SimpleNamespace(all_devices=[device])
+        async_update_devices=AsyncMock(),
+        async_update_dings=AsyncMock(),
+        async_update_groups=AsyncMock(),
+        devices=lambda: SimpleNamespace(all_devices=[device]),
     )
     client._last_device_update_at = privacy_time()
     await client._async_refresh_devices(None, 60)
     assert client.camera_privacy.view(device).reason == "unknown"
-    client._ring.async_update_data.assert_not_awaited()
+    client._ring.async_update_devices.assert_not_awaited()
     await client._async_refresh_devices(None, -1)
     assert client.camera_privacy.allowed(device, "live")
     stamp = client.camera_privacy._received_at
     await client._async_refresh_devices(None, 60)
     assert client.camera_privacy._received_at == stamp
-    client._ring.async_update_data.assert_awaited_once()
+    client._ring.async_update_devices.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -172,7 +175,7 @@ async def test_failed_inventory_update_cannot_publish_partially_changed_settings
         device._attrs["settings"]["live_view_disabled"] = False
         raise RuntimeError("partial SDK update")
 
-    client._ring = SimpleNamespace(async_update_data=failed_update)
+    client._ring = SimpleNamespace(async_update_devices=failed_update)
     with pytest.raises(RuntimeError, match="partial SDK"):
         await client._async_refresh_devices(None, -1)
     assert not client.camera_privacy.allowed(device, "live")
@@ -193,7 +196,13 @@ async def test_unknown_privacy_starts_no_camera_or_enrichment_requests(method):
     elif method == "latest":
         assert await client._async_last_event_frame_for_device(device) is None
     else:
-        assert await client._async_event_notification_context(1, 2, object()) == {}
+        lease = client.camera_privacy.acquire(device, "preview")
+        assert (
+            await client._async_event_notification_context(
+                object(), lease, include_image=True, include_summary=True
+            )
+            == {}
+        )
     client._ring.async_query.assert_not_awaited()
     device.async_history.assert_not_awaited()
     device.async_recording_url.assert_not_awaited()
@@ -426,7 +435,8 @@ async def test_motion_setting_withdraws_until_a_get_started_after_completion():
     entered, release = asyncio.Event(), asyncio.Event()
     order = []
 
-    async def invoke():
+    async def invoke(value):
+        assert value is False
         order.append("write-start")
         assert not client.camera_privacy.allowed(device, "preview")
         entered.set()
@@ -439,15 +449,19 @@ async def test_motion_setting_withdraws_until_a_get_started_after_completion():
 
     client._ring = SimpleNamespace(
         devices=lambda: SimpleNamespace(all_devices=[device]),
-        async_update_data=get,
+        async_update_devices=get,
+        async_update_dings=AsyncMock(),
+        async_update_groups=AsyncMock(),
     )
-    write = asyncio.create_task(client._async_camera_privacy_setting(device, invoke))
+    device.async_set_motion_detection = invoke
+    write = asyncio.create_task(client._async_camera_privacy_setting(device, False))
     await asyncio.wait_for(entered.wait(), 1)
     refresh = asyncio.create_task(client._async_refresh_devices(None, -1))
     await asyncio.sleep(0)
     assert order == ["write-start"]
     release.set()
-    await asyncio.gather(write, refresh)
+    observed, _ = await asyncio.gather(write, refresh)
+    assert observed is False
     assert order == ["write-start", "write-end", "get", "get"]
     assert not client.camera_privacy.valid(old)
     assert client.camera_privacy.view(device).reason == "motion_disabled"
@@ -460,8 +474,9 @@ async def test_failed_motion_setting_retires_prewrite_grant_without_claiming_sav
     grant(client, device)
     client._ring = SimpleNamespace(devices=lambda: SimpleNamespace(all_devices=[device]))
     invoke = AsyncMock(side_effect=RuntimeError("fixture write failed"))
+    device.async_set_motion_detection = invoke
     with pytest.raises(RuntimeError, match="write failed"):
-        await client._async_camera_privacy_setting(device, invoke)
+        await client._async_camera_privacy_setting(device, False)
     assert client.camera_privacy.view(device).reason == "unknown"
     assert not client.camera_privacy._pending
 
@@ -473,15 +488,53 @@ async def test_accepted_motion_write_with_failed_readback_is_explicitly_uncertai
     get = AsyncMock(side_effect=RuntimeError("fixture readback failure"))
     client._ring = SimpleNamespace(
         devices=lambda: SimpleNamespace(all_devices=[device]),
-        async_update_data=get,
+        async_update_devices=get,
+        async_update_dings=AsyncMock(),
+        async_update_groups=AsyncMock(),
     )
-    write = AsyncMock()
+    device.async_set_motion_detection = AsyncMock()
     with pytest.raises(camera_privacy.CameraPrivacyReadbackError) as raised:
-        await client._async_camera_privacy_setting(device, write)
+        await client._async_camera_privacy_setting(device, False)
     assert raised.value.accepted is True
-    write.assert_awaited_once()
+    device.async_set_motion_detection.assert_awaited_once_with(False)
     get.assert_awaited_once()
     assert client.camera_privacy.view(device).reason == "unknown"
+
+
+@pytest.mark.parametrize("reported", [True, False, None, 1])
+async def test_motion_setting_only_reports_exact_post_write_observation(reported):
+    client, device = RingClient(), camera()
+    grant(client, device)
+    device.async_set_motion_detection = AsyncMock()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def readback():
+        entered.set()
+        await release.wait()
+        settings = device._attrs["settings"]
+        if reported is None:
+            settings.pop("motion_detection_enabled")
+        else:
+            settings["motion_detection_enabled"] = reported
+
+    client._ring = SimpleNamespace(
+        devices=lambda: SimpleNamespace(all_devices=[device]), async_update_devices=readback
+    )
+    write = asyncio.create_task(client._async_camera_privacy_setting(device, False))
+    await asyncio.wait_for(entered.wait(), 1)
+    assert not write.done()
+    assert client.camera_privacy.view(device).motion_allowed is None
+    assert not client.camera_privacy.allowed(device, "preview")
+    release.set()
+    if type(reported) is bool:
+        assert (await write) is reported
+    else:
+        with pytest.raises(camera_privacy.CameraPrivacyReadbackError):
+            await write
+    device.async_set_motion_detection.assert_awaited_once_with(False)
+    assert client.camera_privacy.view(device).motion_allowed is (
+        reported if type(reported) is bool else None
+    )
 
 
 def test_non_camera_inventory_rows_cannot_collide_with_camera_privacy_ids():
@@ -560,3 +613,68 @@ def test_focused_controls_keep_video_available_and_disable_unqualified_audio(mon
     }
     FocusedLivePage._set_controls_sensitive(page, False)
     assert states["play"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cached", [True, False])
+async def test_sign_in_and_receipts_are_independent_of_dings_and_groups(monkeypatch, cached):
+    import ring_doorbell
+
+    from halo_gtk import ring_client
+
+    device = camera()
+    now = [100.0]
+    monkeypatch.setattr(ring_client, "privacy_time", lambda: now[0])
+    client = RingClient(token_updater=lambda _: None)
+    client.camera_privacy = CameraPrivacy(clock=lambda: now[0])
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class FakeRing:
+        def __init__(self, auth):
+            self.auth = auth
+
+        async def async_update_devices(self):
+            pass
+
+        async def async_update_groups(self):
+            entered.set()
+            await release.wait()
+            raise RuntimeError("unavailable")
+
+        async def async_update_dings(self):
+            raise RuntimeError("unavailable")
+
+        def devices(self):
+            return SimpleNamespace(all_devices=[device])
+
+    auth = SimpleNamespace(
+        async_fetch_token=AsyncMock(return_value={}),
+        get_hardware_id=lambda: "fixture",
+        async_close=AsyncMock(),
+    )
+    monkeypatch.setattr(ring_doorbell, "Auth", lambda *_: auth)
+    monkeypatch.setattr(ring_doorbell, "Ring", FakeRing)
+    if cached:
+        await asyncio.wait_for(client._async_authenticate_from_token({}), 1)
+    else:
+        await asyncio.wait_for(client._async_authenticate("user", "fixture", None), 1)
+    await asyncio.wait_for(entered.wait(), 1)
+    assert client.is_authenticated
+    lease = client.camera_privacy.acquire(device, "preview")
+    assert lease is not None
+    # A newer GET can revoke the old grant while the groups request is pending.
+    now[0] += 10
+    del device._attrs["settings"]["live_view_disabled"]
+    await client._async_refresh_devices(None, -1)
+    assert client.camera_privacy.view(device).live_allowed is None
+    assert not client.camera_privacy.valid(lease)
+    device._attrs["settings"]["live_view_disabled"] = True
+    now[0] += 5
+    await client._async_refresh_devices(None, -1)
+    assert client.camera_privacy.view(device).live_allowed is False
+    stamp = client.camera_privacy._received_at
+    release.set()
+    now[0] += 100
+    await client._ancillary_task
+    assert client.camera_privacy._received_at == stamp == 115
+    await client._async_close()

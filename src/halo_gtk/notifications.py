@@ -9,11 +9,16 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from math import isfinite
+from typing import TYPE_CHECKING
 
 from halo_gtk import config as _config
 from halo_gtk import device_names, notification_rules
 from halo_gtk.alarm.events import AlarmEvent
+from halo_gtk.camera_privacy import PrivacyLease, PrivacyWatch
 from halo_gtk.ring_events import normalized_event_kind
+
+if TYPE_CHECKING:
+    from halo_gtk.ring_client import RingClient
 
 _log = logging.getLogger(__name__)
 
@@ -30,7 +35,10 @@ _alarm_notifications: list = []
 
 
 @dataclass(frozen=True)
-class _NotificationTarget:
+class CameraNotificationTarget:
+    client: RingClient
+    generation: int
+    preview_lease: PrivacyLease | None
     device_id: int | None
     event_id: int | None
     expires_at: float
@@ -43,6 +51,48 @@ class AlarmNotificationTarget:
     asset_id: str | None = None
     zid: str | None = None
     expires_at: float = 0.0
+
+
+class _CameraNotifications:
+    """Track visible camera alerts while their account and Ring grants are current."""
+
+    def __init__(self):
+        self.visible = []
+        self.watch = None
+
+    def add(self, notification, target):
+        if self.watch is None:
+            self.watch = PrivacyWatch(self.withdraw_retired)
+        self.visible.append((notification, target))
+        if len(self.visible) > 128:
+            self.close(self.visible[0][0])
+
+    def remove(self, notification):
+        self.visible[:] = [entry for entry in self.visible if entry[0] is not notification]
+        if not self.visible and self.watch is not None:
+            self.watch.close()
+            self.watch = None
+
+    def close(self, notification):
+        with suppress(Exception):
+            notification.close()
+        _drop_notification(notification)
+
+    def withdraw_retired(self):
+        for notification, target in tuple(self.visible):
+            if not target.client.camera_notification_current(
+                target.generation, target.preview_lease
+            ):
+                self.close(notification)
+
+
+_camera_notifications = _CameraNotifications()
+
+
+def withdraw_camera_notifications() -> None:
+    """Close visible camera alerts on the GTK thread before its main loop exits."""
+    for notification, _target in tuple(_camera_notifications.visible):
+        _camera_notifications.close(notification)
 
 
 def _ensure_notify() -> bool:
@@ -71,13 +121,13 @@ def send_notification(
     *,
     image_bytes: bytes | None = None,
     image_pixbuf=None,
-    target: _NotificationTarget | AlarmNotificationTarget | None = None,
+    target: CameraNotificationTarget | AlarmNotificationTarget | None = None,
     urgency: str = "normal",
 ) -> None:
     """Show a desktop notification via libnotify."""
     if not _ensure_notify():
-        if isinstance(target, AlarmNotificationTarget):
-            _log.info("Alarm notification unavailable")
+        if target is not None:
+            _log.info("Desktop notification unavailable")
         else:
             _log.info("Notification (no libnotify): %s — %s", summary, body)
         return
@@ -104,7 +154,9 @@ def send_notification(
 
     notif.connect("closed", _on_notification_closed)
     _active_notifications.append(notif)
-    if isinstance(target, AlarmNotificationTarget):
+    if isinstance(target, CameraNotificationTarget):
+        _camera_notifications.add(notif, target)
+    elif isinstance(target, AlarmNotificationTarget):
         _alarm_notifications.append((notif, target))
         if len(_alarm_notifications) > 128:
             old, _old_target = _alarm_notifications[0]
@@ -139,6 +191,7 @@ def _on_notification_closed(notification, *_) -> None:
 
 
 def _drop_notification(notification) -> None:
+    _camera_notifications.remove(notification)
     with suppress(ValueError):
         _active_notifications.remove(notification)
     _alarm_notifications[:] = [item for item in _alarm_notifications if item[0] is not notification]
@@ -215,12 +268,17 @@ def send_alarm_notification(event: AlarmEvent) -> None:
     )
 
 
-def _on_view_action(notification, action: str, target: _NotificationTarget) -> None:
-    _drop_notification(notification)
+def _on_view_action(
+    notification, action: str, target: CameraNotificationTarget | AlarmNotificationTarget
+) -> None:
+    if isinstance(target, CameraNotificationTarget):
+        _camera_notifications.close(notification)
+    else:
+        _drop_notification(notification)
     _open_notification_target(target)
 
 
-def _open_notification_target(target: _NotificationTarget) -> None:
+def _open_notification_target(target: CameraNotificationTarget | AlarmNotificationTarget) -> None:
     try:
         import gi
 
@@ -232,11 +290,18 @@ def _open_notification_target(target: _NotificationTarget) -> None:
         _log.debug("Failed to open notification target: %s", exc)
 
 
-def _open_notification_target_on_main(target: _NotificationTarget) -> bool:
+def _open_notification_target_on_main(
+    target: CameraNotificationTarget | AlarmNotificationTarget,
+) -> bool:
     import gi
 
     gi.require_version("Gtk", "4.0")
     from gi.repository import Gtk
+
+    if isinstance(
+        target, CameraNotificationTarget
+    ) and not target.client.camera_notification_current(target.generation, target.preview_lease):
+        return False
 
     app = Gtk.Application.get_default()
     if app is None:
@@ -267,17 +332,19 @@ def _open_notification_target_on_main(target: _NotificationTarget) -> bool:
             )
         return False
 
-    if (
-        time.time() < target.expires_at
-        and hasattr(win, "open_camera_live")
-        and win.open_camera_live(target.device_id)
-    ):
-        return False
+    def navigate():
+        if (
+            time.time() < target.expires_at
+            and hasattr(win, "open_camera_live")
+            and win.open_camera_live(target.device_id)
+        ):
+            return
+        if target.event_id is not None and hasattr(win, "open_history_event"):
+            win.open_history_event(target.device_id, target.event_id)
+        elif hasattr(win, "open_camera_live"):
+            win.open_camera_live(target.device_id)
 
-    if target.event_id is not None and hasattr(win, "open_history_event"):
-        win.open_history_event(target.device_id, target.event_id)
-    elif hasattr(win, "open_camera_live"):
-        win.open_camera_live(target.device_id)
+    target.client.apply_camera_notification(target.generation, target.preview_lease, navigate)
 
     return False
 
@@ -296,7 +363,7 @@ def _event_device_name(event) -> str:
     return device_names.display_name_for_id(getattr(event, "doorbot_id", None), fallback)
 
 
-def send_ring_notification(event) -> None:
+def send_ring_notification(event, target: CameraNotificationTarget) -> None:
     """Translate a ring-doorbell event into a desktop notification."""
     cfg = _config.load()
     kind = _event_kind(event)
@@ -307,7 +374,7 @@ def send_ring_notification(event) -> None:
         return
     if not _ring_event_enabled(event, cfg):
         return
-    _enqueue_notification(event, cfg)
+    _enqueue_notification(event, target)
 
 
 def _ring_event_enabled(event, cfg: dict) -> bool:
@@ -321,7 +388,7 @@ def _ring_event_enabled(event, cfg: dict) -> bool:
     )
 
 
-def _enqueue_notification(event, cfg: dict) -> None:
+def _enqueue_notification(event, target: CameraNotificationTarget) -> None:
     """Hand the event to the bounded notification worker pool (lazy-started)."""
     global _notify_queue
     with _notify_lock:
@@ -336,19 +403,19 @@ def _enqueue_notification(event, cfg: dict) -> None:
                 ).start()
         work_queue = _notify_queue
     try:
-        work_queue.put_nowait((event, cfg))
+        work_queue.put_nowait((event, target))
     except queue.Full:
         # Never run Ring enrichment on the FCM/asyncio caller thread. A
         # saturated worker queue still gets a basic notification immediately.
         _log.warning("Notification queue full; showing one event without enrichment")
-        _prepare_ring_notification(event, cfg, allow_enrichment=False)
+        _prepare_ring_notification(event, target, allow_enrichment=False)
 
 
 def _notification_worker(work_queue: queue.Queue) -> None:
     while True:
-        event, cfg = work_queue.get()
+        event, target = work_queue.get()
         try:
-            _prepare_ring_notification(event, cfg)
+            _prepare_ring_notification(event, target)
         except Exception as exc:
             _log.debug("Notification worker error: %s", exc)
         finally:
@@ -357,7 +424,7 @@ def _notification_worker(work_queue: queue.Queue) -> None:
 
 def _prepare_ring_notification(
     event,
-    cfg: dict | None = None,
+    target: CameraNotificationTarget,
     *,
     allow_enrichment: bool = True,
 ) -> None:
@@ -369,31 +436,23 @@ def _prepare_ring_notification(
     if not _ring_event_enabled(event, cfg):
         return
 
+    client, lease = target.client, target.preview_lease
+    if not client.camera_notification_current(target.generation, lease):
+        return
     context = {}
-    should_enrich = allow_enrichment and bool(
-        cfg.get("notification_summaries", True) or cfg.get("notification_preview_images", True)
-    )
-    if should_enrich:
+    summaries = cfg.get("notification_summaries", True)
+    previews = cfg.get("notification_preview_images", True)
+    if allow_enrichment and lease is not None and (summaries or previews):
         try:
-            from halo_gtk.ring_client import get_client
-
-            client = get_client()
-            if client is not None and client.is_authenticated:
-                context = client.get_event_notification_context(event)
+            context = client.get_event_notification_context(
+                event, lease, include_image=previews, include_summary=summaries
+            )
         except Exception as exc:
             _log.debug("Failed to enrich Ring notification: %s", exc)
 
-    if not cfg.get("notification_summaries", True):
-        context.pop("description", None)
-
-    summary, body, icon = _ring_notification_text(event, context, cfg)
-    target = _notification_target(event)
-    image_bytes = (
-        context.get("image_bytes") if cfg.get("notification_preview_images", True) else None
-    )
-    # Decode the preview here, on the worker thread, so showing the notification
-    # never blocks the GTK main loop on image decoding.
-    image_pixbuf = _pixbuf_from_bytes(image_bytes) if image_bytes else None
+    # Decode off the GTK thread; the original grant is checked again at handoff.
+    image = context.pop("image_bytes", None)
+    image_pixbuf = _pixbuf_from_bytes(image) if image else None
     urgency = _notification_urgency(kind)
 
     try:
@@ -403,15 +462,24 @@ def _prepare_ring_notification(
         from gi.repository import GLib
 
         def deliver():
-            if _ring_event_enabled(event, _config.load()):
-                send_notification(
+            current_cfg = _config.load()
+            if not _ring_event_enabled(event, current_cfg):
+                return False
+            text_context = context if current_cfg.get("notification_summaries", True) else {}
+            summary, body, icon = _ring_notification_text(event, text_context, current_cfg)
+            preview = image_pixbuf if current_cfg.get("notification_preview_images", True) else None
+            client.apply_camera_notification(
+                target.generation,
+                lease,
+                lambda: send_notification(
                     summary,
                     body,
                     icon,
-                    image_pixbuf=image_pixbuf,
+                    image_pixbuf=preview,
                     target=target,
                     urgency=urgency,
-                )
+                ),
+            )
             return False
 
         GLib.idle_add(deliver)
@@ -493,23 +561,25 @@ def _notification_urgency(kind: str | None) -> str:
     return "critical" if _is_alarm_kind(kind) else "normal"
 
 
-def _notification_target(event) -> _NotificationTarget | None:
+def camera_notification_target(
+    event, client: RingClient, generation: int
+) -> CameraNotificationTarget:
+    """Capture ownership before the event leaves its Ring listener thread."""
     device_id = getattr(event, "doorbot_id", None)
     event_id = getattr(event, "id", None)
-    if device_id is None:
-        return None
     try:
-        device_id_int = int(device_id)
-        event_id_int = int(event_id) if event_id is not None else None
+        device_id = int(device_id)
+        event_id = int(event_id) if event_id is not None else None
         started_at = float(getattr(event, "now", 0) or 0)
-        expires_in = float(getattr(event, "expires_in", 0) or 0)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    expires_at = started_at + expires_in
-    if not isfinite(expires_at):
-        return None
-    return _NotificationTarget(
-        device_id=device_id_int,
-        event_id=event_id_int,
-        expires_at=expires_at,
+        expires_at = started_at + float(getattr(event, "expires_in", 0) or 0)
+        if not isfinite(expires_at):
+            raise ValueError("Non-finite event expiry")
+    except (ValueError, TypeError, OverflowError):
+        # Malformed events still get account-scoped, actionless basic alerts.
+        device_id, event_id, expires_at = None, None, 0.0
+    lease = (
+        client.camera_privacy.acquire_for_id(device_id, "preview")
+        if device_id is not None
+        else None
     )
+    return CameraNotificationTarget(client, generation, lease, device_id, event_id, expires_at)

@@ -122,13 +122,27 @@ class RingApplication(Adw.Application):
         if existing_client is not None and existing_client.is_authenticated:
             restored = True
         else:
-            client = init_client_from_cache()
+            client = init_client_from_cache(
+                on_retryable_error=lambda: GLib.idle_add(self._show_restore_error)
+            )
             # Don't spin up the FCM listener if the user quit mid-restore;
             # do_shutdown stops the cached client it set.
             if client is not None and not self._quitting and start_client(client):
                 restored = True
         if not self._quitting:
             GLib.idle_add(self._finish_session_restore, restored)
+
+    def _show_restore_error(self) -> bool:
+        from halo_gtk.ring_client import get_client
+
+        win = self.get_main_window()
+        if not self._quitting and get_client() is None and win is not None and win.get_visible():
+            win.show_toast(
+                "Could not restore your Ring session. Your saved sign-in was kept.",
+                button_label="Retry",
+                callback=self._start_session_restore,
+            )
+        return GLib.SOURCE_REMOVE
 
     def _finish_session_restore(self, restored: bool) -> bool:
         if restored and not self._quitting:
@@ -171,10 +185,12 @@ class RingApplication(Adw.Application):
         return bool(_config.load().get("background_service", False))
 
     def do_shutdown(self) -> None:
+        from halo_gtk.notifications import withdraw_camera_notifications
         from halo_gtk.ring_client import shutdown_client  # avoid circular at top
         from halo_gtk.save_jobs import shutdown as shutdown_saves
 
         self._quitting = True
+        withdraw_camera_notifications()
         if not shutdown_saves():
             _log.warning("Save worker exceeded the shutdown cleanup allowance")
         win = self.get_main_window()

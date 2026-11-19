@@ -8,6 +8,7 @@ import json
 import logging
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from ring_doorbell import Auth, AuthenticationError
@@ -260,20 +261,20 @@ async def test_alarm_location_discovery_keeps_only_bounded_names():
     client = RingClient()
     client._ring = SimpleNamespace(
         auth=FakeAuth(),
-        devices_data={
-            "base_stations": {
-                "one": {
+        _halo_alarm_hubs={
+            "base_stations": [
+                {
                     "location_id": "home",
                     "location_name": "Fallback Home",
                     "asset_id": "asset-home",
                     "description": "not authoritative",
                 },
-                "two": {
+                {
                     "location_id": "work",
                     "location_name": "Fallback Work",
                     "asset_id": "asset-work",
                 },
-            }
+            ]
         },
     )
 
@@ -310,7 +311,7 @@ async def test_alarm_location_discovery_falls_back_without_logging_response_deta
     client = RingClient()
     client._ring = SimpleNamespace(
         auth=FakeAuth(),
-        devices_data={
+        _halo_alarm_hubs={
             "base_stations": [
                 {
                     "location_id": "home",
@@ -692,8 +693,10 @@ async def test_manual_session_refresh_reconciles_alarm_discovery(monkeypatch):
             return SimpleNamespace(all_devices=[])
 
         @staticmethod
-        async def async_update_data():
+        async def async_update_devices():
             calls.append("refresh-ring")
+
+        async_update_groups = async_update_dings = staticmethod(AsyncMock())
 
     class FakeService:
         @staticmethod
@@ -720,8 +723,10 @@ async def test_device_data_refresh_reconciles_alarm_discovery(monkeypatch):
 
     class FakeRing:
         @staticmethod
-        async def async_update_data():
+        async def async_update_devices():
             calls.append("refresh-ring")
+
+        async_update_groups = async_update_dings = staticmethod(AsyncMock())
 
         @staticmethod
         def devices():

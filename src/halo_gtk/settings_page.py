@@ -24,7 +24,12 @@ from halo_gtk import (  # noqa: E402
     privacy,
 )
 from halo_gtk import config as _config  # noqa: E402
-from halo_gtk.ring_client import get_account_email, get_client, logout_client  # noqa: E402
+from halo_gtk.ring_client import (  # noqa: E402
+    get_account_email,
+    get_client,
+    is_ring_grant_rejected,
+    logout_client,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -1250,12 +1255,10 @@ class SettingsPage(Gtk.Box):
         threading.Thread(target=self._refresh_session, args=(client,), daemon=True).start()
 
     def _refresh_session(self, client) -> None:
-        from ring_doorbell import AuthenticationError
-
         try:
             client.refresh_session_token()
         except Exception as exc:
-            if isinstance(exc, AuthenticationError):
+            if is_ring_grant_rejected(exc):
                 GLib.idle_add(
                     self._begin_rejected_session_logout,
                     client,

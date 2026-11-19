@@ -57,7 +57,7 @@ async def test_actual_discovery_includes_beams_only_and_only_then_supplies_owner
         {"base_stations": [], "beams_bridges": [{}] * 1025},
     ],
 )
-async def test_failed_discovery_revokes_bridge_authority_without_removing_inventory(
+async def test_failed_discovery_revokes_bridge_authority_and_suspends_membership(
     monkeypatch, payload
 ):
     client = active_client(monkeypatch)
@@ -75,7 +75,7 @@ async def test_failed_discovery_revokes_bridge_authority_without_removing_invent
         reconcile=reconcile, beams=SimpleNamespace(update_owners=owners.append)
     )
     assert not await client._async_refresh_alarm_discovery()
-    assert owners == [None] and not reconciled
+    assert owners == [None] and reconciled == [None]
 
 
 async def test_beams_reserves_shared_lighting_before_preflight_and_releases_after_result(

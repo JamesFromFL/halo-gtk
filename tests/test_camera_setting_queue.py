@@ -269,7 +269,7 @@ def test_accepted_motion_write_with_failed_readback_is_not_reported_as_write_fai
     client.futures[0].set_exception(CameraPrivacyReadbackError("private transport detail"))
     wait_for(lambda: key not in module._setting_queues)
     assert len(outcomes) == 1 and outcomes[0][1] is True
-    assert "accepted" in outcomes[0][0] and "Media stays hidden" in outcomes[0][0]
+    assert "accepted" in outcomes[0][0] and "Previews stay hidden" in outcomes[0][0]
     assert "private transport" not in outcomes[0][0]
 
 
@@ -277,6 +277,10 @@ def test_stopped_client_is_rejected_even_if_pointer_still_matches(monkeypatch):
     client = SimpleNamespace(_published_generation=4, _stopped=False)
     window = module.CameraSettingsWindow.__new__(module.CameraSettingsWindow)
     window.device = SimpleNamespace(id=1, family="doorbots")
+    window._generation = 4
+    window._owner = client
+    window._device_id, window._family = window.device.id, window.device.family
+    client.get_device_by_id = lambda _id: window.device
     window._setting_serial = 0
     window._closed = False
     window._set_status = lambda _text: None
@@ -285,7 +289,9 @@ def test_stopped_client_is_rejected_even_if_pointer_still_matches(monkeypatch):
     monkeypatch.setattr(
         module._SettingQueue, "enqueue", lambda _key, _client, req: captured.append(req)
     )
-    window._apply_setting("Volume", lambda: None, lambda: None, setting_key="volume")
+    window._apply_setting(
+        "Volume", lambda _device: None, lambda _device: None, setting_key="volume"
+    )
     assert captured[0].current()
     client._stopped = True
     assert not captured[0].current()

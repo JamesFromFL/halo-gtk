@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+from oauthlib.oauth2 import InvalidGrantError
 from ring_doorbell import AuthenticationError
 
 from halo_gtk import settings_page
@@ -64,7 +65,7 @@ def test_rejected_refresh_stops_runtime_before_expected_client_logout(monkeypatc
     class RejectedClient:
         def refresh_session_token(self):
             order.append("refresh")
-            raise AuthenticationError("expired")
+            raise AuthenticationError("expired") from InvalidGrantError()
 
     client = RejectedClient()
     page = SettingsPage.__new__(SettingsPage)

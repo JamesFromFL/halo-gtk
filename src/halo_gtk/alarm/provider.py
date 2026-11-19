@@ -250,6 +250,38 @@ def location_seeds_from_hubs(raw_base_stations, raw_beams_bridges, *, raw_locati
     return tuple(combined[key] for key in sorted(combined))
 
 
+def validated_alarm_seeds(devices, locations=None) -> tuple[AlarmLocationSeed, ...] | None:
+    """Return None when a hub response cannot establish complete membership."""
+    if not isinstance(devices, Mapping) or (
+        "base_stations" not in devices and "beams_bridges" not in devices
+    ):
+        return None
+    stations = devices.get("base_stations", [])
+    bridges = devices.get("beams_bridges", [])
+    if (
+        not isinstance(stations, list)
+        or not isinstance(bridges, list)
+        or len(stations) + len(bridges) > _MAX_DISCOVERY_RECORDS
+    ):
+        return None
+    location_ids = set()
+    for station in stations + bridges:
+        if not isinstance(station, Mapping):
+            return None
+        identity = _first_text(station, "location_id", "locationId", limit=_MAX_IDENTIFIER_LENGTH)
+        if identity is None:
+            return None
+        location_ids.add(identity)
+        if len(location_ids) > _MAX_LOCATIONS:
+            return None
+    seeds = location_seeds_from_hubs(stations, bridges, raw_locations=locations)
+    # Forgiving normalization must never turn partial discovery
+    # into authoritative removal of other locations.
+    if {seed.location_id for seed in seeds} != location_ids:
+        return None
+    return seeds
+
+
 def _location_names(
     raw_locations: Mapping[object, object] | Iterable[object] | None,
 ) -> dict[str, str]:

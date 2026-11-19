@@ -86,8 +86,8 @@ def test_old_fcm_alarm_prefix_cannot_render_critical_or_duplicate(monkeypatch):
     monkeypatch.setattr(notifications, "send_notification", lambda *a, **k: calls.append(a))
     for kind in ("alarm_mode_none", "alarm_mode_some", "alarm_silenced", "alarm_new_unknown"):
         value = SimpleNamespace(kind=kind)
-        notifications.send_ring_notification(value)
-        notifications._prepare_ring_notification(value)
+        notifications.send_ring_notification(value, object())
+        notifications._prepare_ring_notification(value, object())
     assert calls == []
 
 

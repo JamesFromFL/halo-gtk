@@ -2,8 +2,12 @@
 
 import queue
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
-from halo_gtk import notifications
+import pytest
+
+from halo_gtk import notifications, ring_client
+from halo_gtk.camera_privacy import CameraPrivacy, ring_privacy_receipt
 
 DEFAULT_CFG = {
     "show_notifications": True,
@@ -19,6 +23,27 @@ DEFAULT_CFG = {
 }
 
 
+@pytest.fixture
+def camera_event(monkeypatch):
+    device = SimpleNamespace(
+        id=12,
+        _attrs={"settings": {"live_view_disabled": False, "motion_detection_enabled": True}},
+    )
+    client = ring_client.RingClient()
+    client._ring = SimpleNamespace(devices=lambda: SimpleNamespace(all_devices=[device]))
+    client._authenticated = True
+    client._published_generation = 7
+    monkeypatch.setattr(ring_client, "_client", client)
+    monkeypatch.setattr(ring_client, "_active_client_generation", 7)
+    clock = [50.0]
+    client.camera_privacy = CameraPrivacy(clock=lambda: clock[0])
+    client.camera_privacy.observe(ring_privacy_receipt([device], clock[0]))
+    event = SimpleNamespace(
+        kind="motion", device_name="Garage", doorbot_id=12, id=34, now=100, expires_in=30
+    )
+    return client, device, event, clock
+
+
 def test_send_ring_notification_respects_disabled_setting(monkeypatch):
     started = []
     monkeypatch.setattr(
@@ -32,7 +57,9 @@ def test_send_ring_notification_respects_disabled_setting(monkeypatch):
         lambda *args, **kwargs: SimpleNamespace(start=lambda: started.append(True)),
     )
 
-    notifications.send_ring_notification(SimpleNamespace(kind="motion", device_name="Driveway"))
+    notifications.send_ring_notification(
+        SimpleNamespace(kind="motion", device_name="Driveway"), object()
+    )
 
     assert started == []
 
@@ -47,7 +74,9 @@ def test_send_ring_notification_respects_disabled_event_type(monkeypatch):
         lambda *args, **kwargs: SimpleNamespace(start=lambda: started.append(True)),
     )
 
-    notifications.send_ring_notification(SimpleNamespace(kind="motion", device_name="Driveway"))
+    notifications.send_ring_notification(
+        SimpleNamespace(kind="motion", device_name="Driveway"), object()
+    )
 
     assert started == []
 
@@ -135,57 +164,267 @@ def test_event_type_enabled_maps_supported_kinds():
     assert notifications._event_type_enabled("alarm_state", cfg) is False
 
 
-def test_send_ring_notification_enqueues_when_enabled(monkeypatch):
+def test_send_ring_notification_enqueues_when_enabled(monkeypatch, camera_event):
+    client, _, event, _ = camera_event
+    target = notifications.camera_notification_target(event, client, 7)
     captured = []
     monkeypatch.setattr(notifications._config, "load", lambda: DEFAULT_CFG)
-    monkeypatch.setattr(
-        notifications, "_enqueue_notification", lambda event, cfg: captured.append(event)
-    )
+    monkeypatch.setattr(notifications, "_enqueue_notification", lambda *args: captured.append(args))
 
-    notifications.send_ring_notification(SimpleNamespace(kind="motion", device_name="Driveway"))
+    notifications.send_ring_notification(event, target)
 
-    assert len(captured) == 1
+    assert captured == [(event, target)]
 
 
-def test_full_notification_queue_uses_basic_path_without_blocking(monkeypatch):
+def test_full_notification_queue_uses_basic_path_without_blocking(monkeypatch, camera_event):
+    client, _, event, _ = camera_event
+    target = notifications.camera_notification_target(event, client, 7)
     work_queue = queue.Queue(maxsize=1)
-    work_queue.put((object(), DEFAULT_CFG))
+    work_queue.put((event, target))
     calls = []
     monkeypatch.setattr(notifications, "_notify_queue", work_queue)
     monkeypatch.setattr(
         notifications,
         "_prepare_ring_notification",
-        lambda event, cfg, *, allow_enrichment=True: calls.append((event, cfg, allow_enrichment)),
+        lambda event, target, *, allow_enrichment=True: calls.append(
+            (event, target, allow_enrichment)
+        ),
     )
-    event = SimpleNamespace(kind="motion", device_name="Driveway")
 
-    notifications._enqueue_notification(event, DEFAULT_CFG)
+    notifications._enqueue_notification(event, target)
 
-    assert calls == [(event, DEFAULT_CFG, False)]
+    assert calls == [(event, target, False)]
     assert work_queue.qsize() == 1
 
 
-def test_notification_target_handles_bad_metadata():
-    # Non-numeric ids must not crash the worker — they yield no target.
-    assert (
-        notifications._notification_target(
-            SimpleNamespace(doorbot_id="not-an-int", id=1, now=0, expires_in=0)
-        )
-        is None
-    )
-    assert notifications._notification_target(SimpleNamespace(doorbot_id=None)) is None
-    assert notifications._notification_target(SimpleNamespace(doorbot_id=float("inf"))) is None
-    assert (
-        notifications._notification_target(
-            SimpleNamespace(doorbot_id=12, now=float("nan"), expires_in=30)
-        )
-        is None
-    )
+@pytest.mark.parametrize(
+    "meta",
+    [
+        {"doorbot_id": "bad"},
+        {"doorbot_id": None},
+        {"doorbot_id": float("inf")},
+        {"doorbot_id": 12, "now": float("nan")},
+    ],
+)
+def test_bad_metadata_yields_account_bound_actionless_alert(camera_event, meta):
+    client, _, _, _ = camera_event
+    target = notifications.camera_notification_target(SimpleNamespace(**meta), client, 7)
+    assert target.client is client and target.generation == 7
+    assert target.device_id is None and target.preview_lease is None
 
-    target = notifications._notification_target(
-        SimpleNamespace(doorbot_id=12, id=34, now=100.0, expires_in=30.0)
+
+def test_notification_target_captures_original_grant(camera_event):
+    client, device, event, _ = camera_event
+    target = notifications.camera_notification_target(event, client, 7)
+    assert target.client is client and target.preview_lease.device is device
+    assert client.camera_privacy.valid(target.preview_lease)
+    assert target.device_id == 12 and target.event_id == 34 and target.expires_at == 130
+
+
+def replace_account(monkeypatch, client):
+    replacement = ring_client.RingClient()
+    replacement._ring = client._ring  # Deliberately reuse camera and event identifiers.
+    replacement._authenticated = True
+    replacement._published_generation = 8
+    monkeypatch.setattr(ring_client, "_client", replacement)
+    monkeypatch.setattr(ring_client, "_active_client_generation", 8)
+    monkeypatch.setattr(
+        replacement, "get_event_notification_context", Mock(side_effect=AssertionError)
     )
-    assert target is not None
-    assert target.device_id == 12
-    assert target.event_id == 34
-    assert target.expires_at == 130.0
+    return replacement
+
+
+@pytest.mark.parametrize("retirement", ["logout", "replacement", "privacy", "expiry"])
+@pytest.mark.parametrize("stage", ["worker", "delivery"])
+def test_retirement_blocks_queued_camera_notification(monkeypatch, camera_event, retirement, stage):
+    from gi.repository import GLib
+
+    client, device, event, clock = camera_event
+    pending = []
+    enriched = Mock(return_value={"description": "household detail", "image_bytes": b"private"})
+    delivered = Mock()
+    monkeypatch.setattr(client, "get_event_notification_context", enriched)
+    monkeypatch.setattr(notifications, "send_notification", delivered)
+    monkeypatch.setattr(notifications, "_pixbuf_from_bytes", lambda _: object())
+    monkeypatch.setattr(notifications._config, "load", lambda: DEFAULT_CFG)
+    monkeypatch.setattr(GLib, "idle_add", pending.append)
+    target = notifications.camera_notification_target(event, client, 7)
+    if stage == "delivery":
+        notifications._prepare_ring_notification(event, target)
+        enriched.assert_called_once()
+
+    if retirement == "logout":
+        monkeypatch.setattr(ring_client, "_client", None)
+    elif retirement == "replacement":
+        replacement = replace_account(monkeypatch, client)
+    elif retirement == "privacy":
+        client.camera_privacy.begin_change(device)
+    else:
+        clock[0] += 121
+    if stage == "worker":
+        notifications._prepare_ring_notification(event, target)
+        enriched.assert_not_called()
+    for callback in pending:
+        assert callback() is False
+    delivered.assert_not_called()
+    if retirement == "replacement":
+        replacement.get_event_notification_context.assert_not_called()
+
+
+@pytest.mark.parametrize("previews,summaries", [(True, False), (False, True), (False, False)])
+def test_display_reapplies_current_image_summary_and_custom_preferences(
+    monkeypatch, camera_event, previews, summaries
+):
+    from gi.repository import GLib
+
+    client, _, event, _ = camera_event
+    target = notifications.camera_notification_target(event, client, 7)
+    cfg = {
+        **DEFAULT_CFG,
+        "custom_notification_messages": True,
+        "custom_motion_message": "old message",
+    }
+    monkeypatch.setattr(notifications._config, "load", lambda: cfg)
+    monkeypatch.setattr(
+        client,
+        "get_event_notification_context",
+        lambda *_args, **_kwargs: {"description": "household detail", "image_bytes": b"private"},
+    )
+    monkeypatch.setattr(notifications, "_pixbuf_from_bytes", lambda _: "decoded")
+    delivered, pending = Mock(), []
+    monkeypatch.setattr(notifications, "send_notification", delivered)
+    monkeypatch.setattr(GLib, "idle_add", pending.append)
+    notifications._prepare_ring_notification(event, target)
+    cfg.update(
+        notification_summaries=summaries,
+        notification_preview_images=previews,
+        custom_notification_messages=False,
+    )
+    assert pending.pop()() is False
+    assert delivered.call_args.args[1] == ("household detail" if summaries else "")
+    assert delivered.call_args.kwargs["image_pixbuf"] == ("decoded" if previews else None)
+
+
+def test_denial_and_restore_before_gtk_dispatch_never_enriches_old_event(monkeypatch, camera_event):
+    from gi.repository import GLib
+
+    client, device, event, clock = camera_event
+    pending, queued = [], []
+    monkeypatch.setattr(GLib, "idle_add", lambda callback, *args: pending.append((callback, args)))
+    monkeypatch.setattr(notifications, "_enqueue_notification", lambda *args: queued.append(args))
+    monkeypatch.setattr(notifications._config, "load", lambda: DEFAULT_CFG)
+    enriched = Mock()
+    monkeypatch.setattr(client, "get_event_notification_context", enriched)
+    client._on_ring_event(event)
+    token = client.camera_privacy.begin_change(device)
+    client.camera_privacy.end_change(token)
+    client.camera_privacy.observe(ring_privacy_receipt([device], clock[0]))
+    dispatch, args = pending.pop()
+    dispatch(*args)
+    notifications._prepare_ring_notification(*queued.pop())
+    assert pending == []
+    enriched.assert_not_called()
+
+
+@pytest.mark.parametrize("retirement", ["privacy", "expiry", "replacement", "logout"])
+def test_visible_camera_notification_withdrawn_and_queued_action_inert(
+    monkeypatch, camera_event, retirement
+):
+    import gi
+
+    gi.require_version("Gtk", "4.0")
+    from gi.repository import GLib, Gtk
+
+    client, device, event, clock = camera_event
+    target = notifications.camera_notification_target(event, client, 7)
+    pending, ticks = [], []
+    monkeypatch.setattr(
+        GLib, "idle_add", lambda callback, *args: pending.append((callback, args)) or 1
+    )
+    monkeypatch.setattr(
+        GLib, "timeout_add_seconds", lambda seconds, callback: ticks.append(callback) or 99
+    )
+    monkeypatch.setattr(GLib, "source_remove", lambda _: None)
+    app = Mock()
+    monkeypatch.setattr(Gtk.Application, "get_default", lambda: app)
+    shown = Mock()
+    notifications._active_notifications.append(shown)
+    notifications._camera_notifications.add(shown, target)
+    notifications._open_notification_target(target)
+    try:
+        if retirement == "privacy":
+            client.camera_privacy.begin_change(device)
+        elif retirement == "expiry":
+            clock[0] += 121
+        elif retirement == "replacement":
+            replace_account(monkeypatch, client)
+            client.camera_privacy.invalidate()
+        else:
+            monkeypatch.setattr(ring_client, "_client", None)
+            client.camera_privacy.invalidate()
+        if retirement == "expiry":
+            ticks[0]()
+        for callback, args in pending:
+            callback(*args)
+        shown.close.assert_called_once()
+        assert not notifications._camera_notifications.visible
+        assert notifications._camera_notifications.watch is None
+        assert shown not in notifications._active_notifications
+        app.activate.assert_not_called()
+    finally:
+        notifications._drop_notification(shown)
+
+
+@pytest.mark.asyncio
+async def test_enrichment_respects_grant_across_history_wait_and_preferences(
+    monkeypatch, camera_event
+):
+    client, device, event, clock = camera_event
+    target = notifications.camera_notification_target(event, client, 7)
+    get_image = AsyncMock(return_value=b"preview")
+    monkeypatch.setattr(client, "_async_event_preview_bytes", get_image)
+
+    async def get_history(_device, _id):
+        return {"id": 34, "description": "private text"}
+
+    monkeypatch.setattr(client, "_async_find_history_event", get_history)
+    assert await client._async_event_notification_context(
+        event, target.preview_lease, include_image=False, include_summary=True
+    ) == {"description": "private text", "image_bytes": None}
+    get_image.assert_not_called()
+
+    async def revoke_then_restore(_device, _id):
+        token = client.camera_privacy.begin_change(device)
+        client.camera_privacy.end_change(token)
+        client.camera_privacy.observe(ring_privacy_receipt([device], clock[0]))
+        return {"id": 34, "description": "private text"}
+
+    monkeypatch.setattr(client, "_async_find_history_event", revoke_then_restore)
+    assert (
+        await client._async_event_notification_context(
+            event, target.preview_lease, include_image=True, include_summary=True
+        )
+        == {}
+    )
+    get_image.assert_not_called()
+
+
+def test_actionless_basic_alert_registered_and_withdrawn_on_shutdown(monkeypatch, camera_event):
+    import gi
+
+    gi.require_version("Notify", "0.7")
+    from gi.repository import GLib, Notify
+
+    client, _, _, _ = camera_event
+    target = notifications.camera_notification_target(SimpleNamespace(), client, 7)
+    broker_notification = Mock()
+    monkeypatch.setattr(GLib, "timeout_add_seconds", lambda *_: 99)
+    monkeypatch.setattr(GLib, "source_remove", lambda _: None)
+    monkeypatch.setattr(notifications, "_ensure_notify", lambda: True)
+    monkeypatch.setattr(Notify.Notification, "new", lambda *_: broker_notification)
+    notifications.send_notification("basic", target=target)
+    broker_notification.show.assert_called_once()
+    broker_notification.add_action.assert_not_called()
+    notifications.withdraw_camera_notifications()
+    broker_notification.close.assert_called_once()
+    assert not notifications._camera_notifications.visible

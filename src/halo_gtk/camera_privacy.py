@@ -90,6 +90,7 @@ class CameraPrivacyView:
     preview_allowed: bool | None = None
     audio_allowed: bool | None = None
     reason: str = "unknown"
+    motion_allowed: bool | None = None
 
     @property
     def message(self) -> str:
@@ -223,7 +224,7 @@ class CameraPrivacy:
                 if audio is None
                 else "allowed"
             )
-            return CameraPrivacyView(live, preview, audio, reason)
+            return CameraPrivacyView(live, preview, audio, reason, motion)
 
     def allowed(self, device, purpose: str) -> bool:
         view = self.view(device)
@@ -240,6 +241,12 @@ class CameraPrivacy:
             if not self.allowed(device, purpose):
                 return None
             return PrivacyLease(self, device, purpose, self._revisions[_camera_id(device)])
+
+    def acquire_for_id(self, device_id: int, purpose: str) -> PrivacyLease | None:
+        """Bind a push event's ID to the camera in the current Ring receipt."""
+        with self._lock:
+            row = self._rows.get(str(device_id))
+            return self.acquire(row.device, purpose) if row is not None else None
 
     def valid(self, lease: PrivacyLease | None) -> bool:
         with self._lock:

@@ -3,6 +3,7 @@ import concurrent.futures
 import threading
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -193,8 +194,7 @@ async def test_malformed_discovery_is_not_authoritative_removal(monkeypatch):
         reconcile=reconcile, beams=SimpleNamespace(update_owners=lambda _records: None)
     )
     assert not await client._async_refresh_alarm_discovery()
-    assert not reconciled
-    assert client.get_alarm_snapshot().find_location("home") is not None
+    assert reconciled == [None]
 
 
 @pytest.mark.asyncio
@@ -234,7 +234,7 @@ async def test_discovery_failure_cancels_sibling_request(monkeypatch):
 
     client._alarm_gateway = Gateway()
     client._alarm_service = SimpleNamespace(
-        reconcile=lambda *_: None, beams=SimpleNamespace(update_owners=lambda _records: None)
+        reconcile=AsyncMock(), beams=SimpleNamespace(update_owners=lambda _records: None)
     )
     assert not await client._async_refresh_alarm_discovery()
     assert cleaned.is_set()
