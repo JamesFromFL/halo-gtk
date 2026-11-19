@@ -273,7 +273,22 @@ from 100% to 250%. Available light and siren controls depend on the device's
 reported capabilities. Listening and talkback also require current Ring audio
 permission. The wall and focused view reuse compatible sessions where possible.
 
+Hold the microphone button to talk and release it to stop. With the button
+focused, hold Space to talk. Moving focus away ends transmission. Mute and
+unmute to retry if the local audio output disconnects. Video continues while
+the sound device is unavailable.
+
+With layout editing enabled, focus a camera tile and use the arrow keys to
+move it in the wall. In a zoomed video, focus the picture and use the arrow
+keys to pan. When switching cameras at the stream limit, the next camera
+waits for the previous connection to close.
+
 ### Recordings and local media
+
+When one camera's history is unavailable, Activity keeps the other cameras'
+events. Select **Retry Unavailable Camera History** to fetch the missing camera
+from its last successful position. A recording playback error also offers
+**Retry** so Halo can request the recording again.
 
 Activity provides recording playback with previous/next navigation, scrubbing,
 volume, fullscreen, and screenshots. Favorites, sharing, downloads, and deletion
