@@ -568,8 +568,8 @@ class LiveStreamView(Gtk.Box):
 
     def get_current_frame_png(self, viewport=None) -> bytes | None:
         """Return the most recently decoded video frame as PNG bytes, or None."""
-        arr = self._last_frame_rgb
         resources = self._resources
+        arr = self._last_frame_rgb
         if arr is None or resources is None or not self._privacy_current(resources):
             return None
         try:
@@ -591,7 +591,9 @@ class LiveStreamView(Gtk.Box):
                     img = img.crop(box).resize(img.size, Image.Resampling.LANCZOS)
             buf = io.BytesIO()
             img.save(buf, format="PNG")
-            return buf.getvalue() if self._privacy_current(resources) else None
+            if self._is_current_resources(resources) and self._privacy_current(resources):
+                return buf.getvalue()
+            return None
         except Exception as exc:
             _log.debug("Screenshot encode failed: %s", exc)
             return None

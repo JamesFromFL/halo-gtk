@@ -2383,7 +2383,7 @@ class RingClient:
             # An old wrapper or account can still be closing with the same API
             # ID. Suppress its camera wake, but never reuse its displayed frame.
             if session.device is device:
-                frame = session.get_current_frame_png()
+                frame = await asyncio.to_thread(session.get_current_frame_png)
                 if frame is not None and self._preview_is_current():
                     return frame
             return await self._async_cached_snapshot_bytes(device.id, device_name=device.name)

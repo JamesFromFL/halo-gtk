@@ -678,3 +678,32 @@ async def test_sign_in_and_receipts_are_independent_of_dings_and_groups(monkeypa
     await client._ancillary_task
     assert client.camera_privacy._received_at == stamp == 115
     await client._async_close()
+
+
+@pytest.mark.asyncio
+async def test_live_preview_encoding_yields_ring_worker_and_rechecks_grant(monkeypatch):
+    import threading
+
+    from halo_gtk import live_sessions
+
+    client, device = RingClient(), camera()
+    grant(client, device)
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = threading.Event()
+
+    def encode():
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(2)
+        return b"old frame"
+
+    session = SimpleNamespace(device=device, get_current_frame_png=encode)
+    monkeypatch.setattr(live_sessions, "active_session_for_device", lambda _: session)
+    task = asyncio.create_task(client._async_snapshot_bytes(device))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        device._attrs["settings"]["motion_detection_enabled"] = False
+        observe(client.camera_privacy, device)
+    finally:
+        release.set()
+    assert await task is None
