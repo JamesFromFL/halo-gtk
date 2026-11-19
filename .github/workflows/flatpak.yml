@@ -37,7 +37,7 @@ jobs:
       - name: Install builder and GNOME 50
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y flatpak flatpak-builder dbus-daemon
+          sudo apt-get install --no-install-recommends -y flatpak flatpak-builder dbus-daemon elfutils
           flatpak --user remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
           flatpak --user install --noninteractive --no-related flathub org.gnome.Sdk//50 org.gnome.Platform//50
       - name: Build and export locked package
