@@ -625,10 +625,16 @@ class FocusedLivePage(Gtk.Box):
                     png = session.get_current_frame_png(viewport)
                     if png and camera_privacy.lease_is_current(lease):
                         dest = media_paths.snapshot_dir(camera_name)
-                        media_paths.write_unique_bytes(
-                            dest, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"), ".png", png
+                        saved = media_paths.write_unique_bytes(
+                            dest,
+                            datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
+                            ".png",
+                            png,
+                            publish=lambda commit: camera_privacy.lease_is_current(lease)
+                            and lease.policy.apply(lease, commit),
                         )
-                        message, folder = "Screenshot saved", dest
+                        if saved is not None:
+                            message, folder = "Screenshot saved", dest
             except OSError:
                 message = "Could not save screenshot. Check free space and folder permissions."
             finally:

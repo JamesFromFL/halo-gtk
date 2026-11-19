@@ -86,3 +86,11 @@ def test_write_unique_bytes_removes_partial_file_on_failure(monkeypatch, tmp_pat
         media_paths.write_unique_bytes(tmp_path, "snapshot", ".png", b"png")
 
     assert list(tmp_path.iterdir()) == []
+
+
+def test_completed_screenshot_is_discarded_if_publication_grant_was_revoked(tmp_path):
+    published = media_paths.write_unique_bytes(
+        tmp_path, "snapshot", ".png", b"private", publish=lambda _: False
+    )
+    assert published is None
+    assert list(tmp_path.iterdir()) == []

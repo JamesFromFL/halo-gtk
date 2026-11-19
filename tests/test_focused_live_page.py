@@ -59,9 +59,10 @@ def test_screenshot_distinguishes_save_and_folder_failures(monkeypatch, tmp_path
 
     messages = []
 
-    def write(*_args):
+    def write(*_args, **_kwargs):
         if failure == "write":
             raise OSError("disk full")
+        return tmp_path / "saved.png"
 
     def folder(*_args):
         if failure == "folder":
@@ -168,3 +169,30 @@ def test_siren_confirmation_stays_bound_to_the_shown_camera_and_client(monkeypat
     FocusedLivePage._on_siren_confirmed(page, None, "activate", camera, client, 4)
 
     assert sent == [((30,), {"client": client})]
+
+
+def test_revocation_during_screenshot_write_discards_private_staging(monkeypatch, tmp_path):
+    from halo_gtk import focused_live_page
+
+    device = SimpleNamespace(id=19)
+    lease = grant_current(monkeypatch, device)
+
+    def revoke(file, payload):
+        file.write(payload)
+        lease.policy.invalidate()
+
+    monkeypatch.setattr(focused_live_page.media_paths, "snapshot_dir", lambda _: tmp_path)
+    monkeypatch.setattr(focused_live_page.media_paths, "_write_all", revoke)
+    monkeypatch.setattr(
+        focused_live_page.threading, "Thread", lambda *, target, **_: SimpleNamespace(start=target)
+    )
+    monkeypatch.setattr(focused_live_page.GLib, "idle_add", lambda fn, *args: fn(*args))
+    page = SimpleNamespace(
+        _zoom=1.0,
+        _screenshot_pending=False,
+        _view_generation=1,
+        _device=device,
+        _session=SimpleNamespace(get_current_frame_png=lambda _: b"private"),
+    )
+    FocusedLivePage._on_screenshot(page)
+    assert list(tmp_path.iterdir()) == [] and not page._screenshot_pending

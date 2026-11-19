@@ -14,6 +14,8 @@ import aiohttp
 import requests
 from yarl import URL
 
+from halo_gtk.atomic_io import install_unique
+
 DOWNLOAD_TIMEOUT = (10, 30)
 DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
@@ -125,7 +127,7 @@ async def async_download_https(
             os.replace(temporary, destination)
             installed = destination
         else:
-            installed = _install_unique(temporary, destination)
+            installed = install_unique(temporary, destination)
         temporary = None
         return installed
     finally:
@@ -235,7 +237,7 @@ def _write_response_atomically(
             os.replace(tmp_path, destination)
             installed_path = destination
         else:
-            installed_path = _install_unique(tmp_path, destination)
+            installed_path = install_unique(tmp_path, destination)
         tmp_path = None
         return installed_path
     except BaseException:
@@ -243,29 +245,3 @@ def _write_response_atomically(
             with contextlib.suppress(OSError):
                 tmp_path.unlink()
         raise
-
-
-def _install_unique(source: Path, destination: Path) -> Path:
-    for index in range(1, 1_000_000):
-        candidate = _numbered_path(destination, index)
-        try:
-            descriptor = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            continue
-        try:
-            os.close(descriptor)
-            os.replace(source, candidate)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.close(descriptor)
-            with contextlib.suppress(OSError):
-                candidate.unlink()
-            raise
-        return candidate
-    raise OSError("Could not allocate a unique download filename")
-
-
-def _numbered_path(path: Path, index: int) -> Path:
-    if index == 1:
-        return path
-    return path.with_name(f"{path.stem}_{index}{path.suffix}")

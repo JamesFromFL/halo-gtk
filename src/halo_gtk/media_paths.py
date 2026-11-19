@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import contextlib
 import os
 import re
+import tempfile
 from pathlib import Path
 
 import gi
@@ -14,6 +14,7 @@ gi.require_version("GioUnix", "2.0")
 from gi.repository import Gio, GioUnix  # noqa: E402
 
 from halo_gtk import config as _config  # noqa: E402
+from halo_gtk.atomic_io import install_unique  # noqa: E402
 
 DEFAULT_SNAPSHOT_DIR = Path.home() / "Pictures" / "halo-gtk"
 DEFAULT_VIDEO_DIR = Path.home() / "Videos" / "halo-gtk"
@@ -47,28 +48,36 @@ def should_open_after_save() -> bool:
     return bool(_config.load().get("open_folder_after_save", False))
 
 
-def write_unique_bytes(directory: Path, stem: str, suffix: str, payload: bytes) -> Path:
-    """Write *payload* to a new file without replacing an existing save."""
+def write_unique_bytes(
+    directory: Path, stem: str, suffix: str, payload: bytes, *, publish=None
+) -> Path | None:
+    """Stage privately and publish the finished file while its optional grant is current."""
     directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
     _validate_filename_parts(stem, suffix)
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / f"{stem}{suffix}"
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=directory, prefix=".halo-", suffix=".part", delete=False
+        ) as file:
+            temp = Path(file.name)
+            _write_all(file, payload)
+            file.flush()
+            os.fsync(file.fileno())
+        if publish is None:
+            return install_unique(temp, destination)
+        installed = None
 
-    for index in range(1, 1_000_000):
-        path = directory / _numbered_filename(stem, suffix, index)
-        try:
-            with path.open("xb") as handle:
-                _write_all(handle, payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-        except FileExistsError:
-            continue
-        except BaseException:
-            with contextlib.suppress(OSError):
-                path.unlink()
-            raise
-        return path
+        def commit():
+            nonlocal installed
+            installed = install_unique(temp, destination)
 
-    raise OSError("Could not allocate a unique media filename")
+        publish(commit)
+        return installed
+    finally:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
 
 
 def open_folder(path: Path) -> None:
@@ -105,10 +114,6 @@ def _validate_filename_parts(stem: str, suffix: str) -> None:
         raise ValueError("Media filename stem must be a non-empty basename")
     if not suffix.startswith(".") or Path(suffix).name != suffix:
         raise ValueError("Media filename suffix must be a file extension")
-
-
-def _numbered_filename(stem: str, suffix: str, index: int) -> str:
-    return f"{stem}{suffix}" if index == 1 else f"{stem}_{index}{suffix}"
 
 
 def _write_all(handle, payload: bytes) -> None:
