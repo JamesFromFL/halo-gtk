@@ -774,6 +774,8 @@ class HistoryPage(Gtk.Box):
         self._history_seen_keys: set[tuple[int | None, int]] = set()
         self._history_older_than_by_device: dict[int, int] = {}
         self._history_exhausted_device_ids: set[int] = set()
+        self._history_failed_device_ids: set[int] = set()
+        self._history_client = None
         self._history_loading = False
         self._history_exhausted = False
         self._history_request_generation = 0
@@ -1177,6 +1179,7 @@ class HistoryPage(Gtk.Box):
         """Load event history.  Optionally pre-select *filter_device_id*."""
         self._save_ui_generation = getattr(self, "_save_ui_generation", 0) + 1
         client = get_client()
+        self._history_client = client
         if client is None or not client.is_authenticated:
             self._show_signed_out_state()
             return
@@ -1243,7 +1246,11 @@ class HistoryPage(Gtk.Box):
     # Data fetching
     # ------------------------------------------------------------------
 
-    def _start_history_fetch(self, *, append: bool) -> None:
+    def _start_history_fetch(self, *, append: bool, retry_failed: bool = False) -> None:
+        client = self._history_client
+        if client is None or client is not get_client():
+            self.refresh()
+            return
         if getattr(self, "_alarm_history_active", False):
             self._alarm_history.refresh()
             return
@@ -1257,14 +1264,16 @@ class HistoryPage(Gtk.Box):
 
         device_ids = self._selected_history_device_ids()
         if append:
-            candidate_ids = (
-                device_ids
-                if device_ids is not None
-                else {int(device.id) for device in self._devices}
+            candidates = (
+                self._history_failed_device_ids
+                if retry_failed
+                else self._history_older_than_by_device.keys()
             )
-            device_ids = set(candidate_ids) - set(self._history_exhausted_device_ids)
+            device_ids = set(candidates) if device_ids is None else device_ids & candidates
+            device_ids -= self._history_exhausted_device_ids
+            if not retry_failed:
+                device_ids -= self._history_failed_device_ids
             if not device_ids:
-                GLib.idle_add(self._finish_history_exhausted, generation)
                 return
 
         self._history_loading = True
@@ -1273,6 +1282,7 @@ class HistoryPage(Gtk.Box):
         threading.Thread(
             target=self._fetch_history,
             kwargs={
+                "client": client,
                 "append": append,
                 "generation": generation,
                 "device_ids": device_ids,
@@ -1285,79 +1295,63 @@ class HistoryPage(Gtk.Box):
     def _fetch_history(
         self,
         *,
+        client,
         append: bool,
         generation: int,
         device_ids: set[int] | None,
         backend_kind: str | None,
         older_than: dict[int, int] | None,
     ) -> None:
-        client = get_client()
-        if client is None:
-            GLib.idle_add(self._show_fetch_error, "Not signed in", generation)
+        if client is None or client is not get_client():
             return
         try:
-            devices, events = client.event_history(
+            page = client.event_history_page(
                 limit=_HISTORY_PAGE_LIMIT,
                 kind=backend_kind,
                 older_than=older_than,
                 device_ids=device_ids,
                 enforce_limit=backend_kind is not None,
             )
-            events.sort(key=_event_sort_key, reverse=True)
-            GLib.idle_add(
-                self._populate_events,
-                devices,
-                events,
-                append,
-                device_ids,
-                generation,
-            )
+            GLib.idle_add(self._populate_events, page, append, generation, client)
         except Exception as exc:
-            GLib.idle_add(self._show_fetch_error, str(exc), generation)
+            GLib.idle_add(self._show_fetch_error, str(exc), generation, client)
 
-    def _populate_events(
-        self,
-        devices: list,
-        events: list,
-        append: bool,
-        requested_device_ids: set[int] | None,
-        generation: int,
-    ) -> bool:
-        if generation != self._history_request_generation or getattr(
-            self, "_alarm_history_active", False
+    def _populate_events(self, page, append: bool, generation: int, client) -> bool:
+        if (
+            client is not get_client()
+            or generation != self._history_request_generation
+            or getattr(self, "_alarm_history_active", False)
         ):
             return GLib.SOURCE_REMOVE
+        devices, events = page.devices, page.events
         self._history_loading = False
         if not append:
             self._events = []
             self._history_seen_keys.clear()
             self._history_older_than_by_device.clear()
             self._history_exhausted_device_ids.clear()
+            self._history_failed_device_ids.clear()
             self._history_exhausted = False
 
         new_events = []
-        seen_this_batch: set[int] = set()
         for event in events:
             device = event.get("_device")
             device_id = int(device.id) if device is not None else None
             event_id = event.get("id")
             if event_id is None:
                 continue
-            if device_id is not None:
-                seen_this_batch.add(device_id)
             key = (device_id, int(event_id))
             if key in self._history_seen_keys:
                 continue
             self._history_seen_keys.add(key)
             new_events.append(event)
-            if device_id is not None:
-                self._history_older_than_by_device[device_id] = int(event_id)
-
-        if requested_device_ids is not None:
-            self._history_exhausted_device_ids.update(requested_device_ids - seen_this_batch)
-
-        if (append and not new_events) or not events:
-            self._history_exhausted = True
+        self._history_older_than_by_device.update(page.cursors)
+        self._history_exhausted_device_ids.update(page.exhausted)
+        self._history_failed_device_ids.difference_update(page.cursors, page.exhausted)
+        self._history_failed_device_ids.update(page.failed)
+        self._history_exhausted = not self._history_failed_device_ids and not (
+            self._history_older_than_by_device.keys() - self._history_exhausted_device_ids
+        )
 
         self._events.extend(new_events)
         self._events.sort(key=_event_sort_key, reverse=True)
@@ -1387,21 +1381,16 @@ class HistoryPage(Gtk.Box):
         self._fill_event_rows()
         return GLib.SOURCE_REMOVE
 
-    def _finish_history_exhausted(self, generation: int | None = None) -> bool:
-        if generation is not None and generation != self._history_request_generation:
-            return GLib.SOURCE_REMOVE
-        self._history_loading = False
-        self._history_exhausted = True
-        self._fill_event_rows()
-        return GLib.SOURCE_REMOVE
-
     def _fill_event_rows(self) -> None:
         if getattr(self, "_alarm_history_active", False):
             return
         self._clear_event_list()
         visible_events = self._visible_events()
         if not visible_events:
-            if self._active_filter_keys:
+            if self._history_failed_device_ids:
+                self._list_placeholder.set_title("Some camera history is unavailable")
+                self._list_placeholder.set_description("Retry to load events from those cameras.")
+            elif self._active_filter_keys:
                 self._list_placeholder.set_title("No matching events")
                 self._list_placeholder.set_description("No events match the current filters.")
             else:
@@ -1535,19 +1524,30 @@ class HistoryPage(Gtk.Box):
 
     def _make_load_older_row(self) -> Gtk.ListBoxRow:
         row = Gtk.ListBoxRow(activatable=False, selectable=False)
-        button = Gtk.Button(
-            label="Load Older Events",
-            halign=Gtk.Align.CENTER,
-            margin_top=10,
-            margin_bottom=10,
+        actions = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER, margin_top=10, margin_bottom=10)
+        available = (
+            self._history_older_than_by_device.keys()
+            - self._history_exhausted_device_ids
+            - self._history_failed_device_ids
         )
-        button.set_sensitive(not self._history_loading)
-        button.connect("clicked", self._on_load_older_clicked)
-        row.set_child(button)
+        if available:
+            button = Gtk.Button(label="Load Older Events")
+            button.connect("clicked", self._on_load_older_clicked)
+            actions.append(button)
+        if self._history_failed_device_ids:
+            retry = Gtk.Button(label="Retry Unavailable Camera History")
+            retry.connect(
+                "clicked", lambda *_: self._start_history_fetch(append=True, retry_failed=True)
+            )
+            actions.append(retry)
+        actions.set_sensitive(not self._history_loading)
+        row.set_child(actions)
         return row
 
-    def _show_fetch_error(self, message: str, generation: int | None = None) -> bool:
-        if generation is not None and generation != self._history_request_generation:
+    def _show_fetch_error(self, message: str, generation: int | None = None, client=None) -> bool:
+        if (client is not None and client is not get_client()) or (
+            generation is not None and generation != self._history_request_generation
+        ):
             return GLib.SOURCE_REMOVE
         self._history_loading = False
         self._list_placeholder.set_title("Failed to load events")
@@ -2222,6 +2222,7 @@ class HistoryPage(Gtk.Box):
         self._history_seen_keys.clear()
         self._history_older_than_by_device.clear()
         self._history_exhausted_device_ids.clear()
+        self._history_failed_device_ids.clear()
         self._history_exhausted = False
 
     def _on_load_older_clicked(self, *_args) -> None:

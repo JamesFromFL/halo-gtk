@@ -44,7 +44,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from contextvars import ContextVar
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from functools import partial, wraps
 from typing import Any
 
@@ -107,7 +107,11 @@ _session_generation = 0
 _active_client_generation = 0
 _account_email_cache: str | None = None
 _account_email_loaded = False
-_account_email_lock = threading.Lock()
+# Queue account credential operations in one order; GTK session readers never
+# need to wait for Secret Service. Logout enqueues its clear under _session_lock.
+_credential_worker = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="halo-credentials"
+)
 
 _APP_USER_AGENT = "android:com.ringapp"
 _DEFAULT_CALL_TIMEOUT = 90
@@ -188,10 +192,20 @@ def _bounded_preview(method):
 # the client being recreated on re-login.
 LISTENER_CONNECTING = "connecting"
 LISTENER_CONNECTED = "connected"
+LISTENER_DEGRADED = "degraded"
 LISTENER_OFFLINE = "offline"
 
 _listener_state = LISTENER_OFFLINE
 _connection_callbacks: list = []
+
+
+@dataclass
+class CameraHistoryPage:
+    devices: list
+    events: list[dict[str, Any]] = field(default_factory=list)
+    cursors: dict[int, int] = field(default_factory=dict)
+    exhausted: set[int] = field(default_factory=set)
+    failed: set[int] = field(default_factory=set)
 
 
 class SessionSupersededError(RuntimeError):
@@ -327,33 +341,50 @@ def _new_session_candidate() -> RingClient:
     return client
 
 
+def _persist_token(client: RingClient, token: dict) -> None:
+    profile = getattr(client, "_history_profile", None)
+    if valid_history_profile(profile):
+        save_ring_token(token, history_profile=profile)
+    else:
+        _save_token(token)
+
+
 def _save_token_for_client(client: RingClient, generation: int, token: dict) -> None:
-    with _session_lock:
-        if generation != _session_generation and _client is not client:
+    def persist():
+        if not _is_active_client_generation(client, generation):
             raise SessionSupersededError("Ring session was superseded")
-        profile = getattr(client, "_history_profile", None)
-        if valid_history_profile(profile):
-            save_ring_token(token, history_profile=profile)
-        else:
-            _save_token(token)
+        _persist_token(client, token)
+
+    _credential_worker.submit(persist).result()
 
 
 def _publish_session_candidate(
-    client: RingClient,
-    generation: int,
+    client: RingClient, generation: int
+) -> tuple[bool, RingClient | None]:
+    return _credential_worker.submit(_persist_and_publish_candidate, client, generation).result()
+
+
+def _persist_and_publish_candidate(
+    client: RingClient, generation: int
 ) -> tuple[bool, RingClient | None]:
     global _active_client_generation, _client
-    with _alarm_command_lock, _session_lock:
+    with _session_lock:
         if generation != _session_generation:
             return False, None
+        previous_generation = _active_client_generation
 
-        bind_history = getattr(client, "_bind_history_account", None)
-        if callable(bind_history):
-            bind_history()
-        activate_persistence = getattr(client, "_activate_auth_token_persistence", None)
-        if callable(activate_persistence):
-            activate_persistence(lambda token: _save_token_for_client(client, generation, token))
+    bind_history = getattr(client, "_bind_history_account", None)
+    if callable(bind_history):
+        bind_history()
+    activate_persistence = getattr(client, "_activate_auth_token_persistence", None)
+    if callable(activate_persistence):
+        activate_persistence(lambda token: _save_token_for_client(client, generation, token))
 
+    with _alarm_command_lock, _session_lock:
+        # The worker admits candidate commits in order. A newer pending login
+        # can follow this commit; an intervening logout or shutdown retires it.
+        if _active_client_generation != previous_generation:
+            return False, None
         previous = _client
         _active_client_generation = generation
         client._published_generation = generation
@@ -391,38 +422,51 @@ def _stop_client_quietly(client: RingClient | None) -> None:
         _log.debug("Failed to stop discarded Ring client: %s", exc)
 
 
+def _clear_account_credentials() -> None:
+    first_error = None
+    for clear_secret in (_clear_token, clear_ring_account_email, clear_ring_event_credentials):
+        try:
+            clear_secret()
+        except Exception as exc:
+            first_error = first_error or exc
+    if first_error is not None:
+        raise first_error
+
+
 def _clear_rejected_cache_if_current(generation: int) -> None:
     global _account_email_cache, _account_email_loaded
     with _session_lock:
         active = _client
         if generation != _session_generation or (active is not None and active.is_authenticated):
             return
-
-        for clear_secret in (
-            _clear_token,
-            clear_ring_account_email,
-            clear_ring_event_credentials,
-        ):
-            try:
-                clear_secret()
-            except Exception as exc:
-                _log.debug("Failed to clear rejected Ring credentials: %s", exc)
-        with _account_email_lock:
-            _account_email_cache = None
-            _account_email_loaded = True
+        _account_email_cache = None
+        _account_email_loaded = True
+        cleared = _credential_worker.submit(_clear_account_credentials)
+    try:
+        cleared.result()
+    except Exception as exc:
+        _log.warning("Could not remove rejected credentials (%s)", type(exc).__name__)
 
 
 def get_account_email() -> str | None:
-    """Return the signed-in Ring account email saved for display, if any."""
-    global _account_email_cache, _account_email_loaded
-    if _account_email_loaded:
-        return _account_email_cache
-
-    with _account_email_lock:
+    """Return the signed-in email; an uncached request runs on the credential worker."""
+    with _session_lock:
         if _account_email_loaded:
             return _account_email_cache
-        _account_email_cache = load_ring_account_email()
-        _account_email_loaded = True
+        generation = _active_client_generation
+    return _credential_worker.submit(_load_account_email, generation).result()
+
+
+def _load_account_email(generation) -> str | None:
+    global _account_email_cache, _account_email_loaded
+    with _session_lock:
+        if _account_email_loaded or generation != _active_client_generation:
+            return _account_email_cache
+    email = load_ring_account_email()
+    with _session_lock:
+        if not _account_email_loaded and generation == _active_client_generation:
+            _account_email_cache = email
+            _account_email_loaded = True
         return _account_email_cache
 
 
@@ -505,7 +549,6 @@ def logout_client(*, expected_client: RingClient | None = None) -> bool:
     """Clear local Ring authentication state and stop the active client."""
     global _active_client_generation, _client, _session_generation
     global _account_email_cache, _account_email_loaded
-    clear_error = None
     with _alarm_command_lock, _session_lock:
         if expected_client is not None and _client is not expected_client:
             return False
@@ -527,23 +570,13 @@ def logout_client(*, expected_client: RingClient | None = None) -> bool:
                 if feature is not None:
                     feature.invalidate(generation)
 
-        for clear_secret in (
-            _clear_token,
-            clear_ring_account_email,
-            clear_ring_event_credentials,
-        ):
-            try:
-                clear_secret()
-            except Exception as exc:
-                clear_error = clear_error or exc
-        with _account_email_lock:
-            _account_email_cache = None
-            _account_email_loaded = True
+        _account_email_cache = None
+        _account_email_loaded = True
+        cleared = _credential_worker.submit(_clear_account_credentials)
 
     _set_listener_state(LISTENER_OFFLINE, generation=generation)
     _stop_client_quietly(client)
-    if clear_error is not None:
-        raise clear_error
+    cleared.result()
     return True
 
 
@@ -615,7 +648,7 @@ def init_client_from_cache(
     generation = _begin_session_operation()
     client = None
     try:
-        token = _load_token()
+        token = _credential_worker.submit(_load_token).result()
         if token is None:
             return None
         client = _new_session_candidate()
@@ -955,7 +988,7 @@ class RingClient:
         if not self._authenticated or self._ring is None:
             raise RuntimeError("Cannot publish an unauthenticated Ring client")
         if self._pending_auth_token is not None:
-            token_updater(self._pending_auth_token)
+            _persist_token(self, self._pending_auth_token)
             self._pending_auth_token = None
         self._token_updater = token_updater
         self._ring.auth.token_updater = token_updater
@@ -1068,7 +1101,7 @@ class RingClient:
         self._history_profile = profile if valid_history_profile(profile) else None
 
     def _bind_history_account(self):
-        # Called under the session publication fence after fresh authentication.
+        # The credential worker binds the freshly authenticated candidate.
         # An email cached for a different login is never an ownership credential.
         username, self._history_username = self._history_username, None
         if username is not None:
@@ -2138,9 +2171,27 @@ class RingClient:
         device_ids: set[int] | None = None,
         enforce_limit: bool = False,
     ) -> tuple[list, list[dict[str, Any]]]:
-        """Return all devices and merged Ring history events with device references."""
+        """Return devices and merged events for callers that do not paginate."""
+        page = self.event_history_page(
+            limit,
+            kind=kind,
+            older_than=older_than,
+            device_ids=device_ids,
+            enforce_limit=enforce_limit,
+        )
+        return page.devices, page.events
+
+    def event_history_page(
+        self,
+        limit: int = 50,
+        *,
+        kind: str | None = None,
+        older_than: int | dict[int, int] | None = None,
+        device_ids: set[int] | None = None,
+        enforce_limit: bool = False,
+    ) -> CameraHistoryPage:
         if self._ring is None:
-            return [], []
+            return CameraHistoryPage([])
         return self._run(
             self._async_event_history(
                 limit,
@@ -2159,31 +2210,34 @@ class RingClient:
         older_than: int | dict[int, int] | None = None,
         device_ids: set[int] | None = None,
         enforce_limit: bool = False,
-    ) -> tuple[list, list[dict[str, Any]]]:
-        devices = self.all_devices
-        events: list[dict[str, Any]] = []
-        for device in devices:
-            if device_ids is not None and int(device.id) not in device_ids:
+    ) -> CameraHistoryPage:
+        page = CameraHistoryPage(self.all_devices)
+        if device_ids is not None:
+            page.exhausted.update(device_ids - {int(device.id) for device in page.devices})
+        for device in page.devices:
+            device_id = int(device.id)
+            if device_ids is not None and device_id not in device_ids:
                 continue
+            cursor = older_than.get(device_id) if isinstance(older_than, dict) else older_than
+            kwargs = {"limit": limit, "enforce_limit": enforce_limit}
+            if kind:
+                kwargs["kind"] = kind
+            if cursor:
+                kwargs["older_than"] = cursor
             try:
-                older_event_id = (
-                    older_than.get(int(device.id)) if isinstance(older_than, dict) else older_than
-                )
-                kwargs: dict[str, Any] = {
-                    "limit": limit,
-                    "enforce_limit": enforce_limit,
-                }
-                if kind:
-                    kwargs["kind"] = kind
-                if older_event_id:
-                    kwargs["older_than"] = older_event_id
                 history = await device.async_history(**kwargs)
-                for event in history:
-                    event["_device"] = device
-                events.extend(history)
+                rows = [dict(event, _device=device) for event in history]
+                oldest = min((int(event["id"]) for event in rows), default=None)
             except Exception as exc:
-                _log.debug("History fetch failed for %s: %s", device.name, exc)
-        return devices, events
+                page.failed.add(device_id)
+                _log.debug("Camera history fetch failed (%s)", type(exc).__name__)
+                continue
+            page.events.extend(rows)
+            if oldest is None or (cursor is not None and oldest >= cursor):
+                page.exhausted.add(device_id)
+            else:
+                page.cursors[device_id] = oldest
+        return page
 
     def recording_url(self, device, event_id: int) -> str | None:
         """Return a playable recording URL for a Ring history event."""
@@ -2581,7 +2635,7 @@ class RingClient:
         config.connection_retry_count = 1_000_000
         config.abort_on_sequential_error_count = None
 
-        self._load_owned_event_credentials()
+        await asyncio.wrap_future(_credential_worker.submit(self._load_owned_event_credentials))
         backoff = _LISTENER_RECONNECT_MIN
         while not self._stop_event.is_set():
             generation, listener_revision, credentials = self._event_listener_context()
@@ -2595,7 +2649,9 @@ class RingClient:
                 ),
                 config=config,
             )
-            listener.add_notification_callback(self._on_ring_event)
+            listener.add_notification_callback(
+                partial(self._on_listener_event, generation, listener_revision)
+            )
             self._set_owned_listener_state(LISTENER_CONNECTING)
             started = False
             try:
@@ -2606,15 +2662,7 @@ class RingClient:
                 if started:
                     backoff = _LISTENER_RECONNECT_MIN
                     _log.info("FCM event listener started")
-                while started and not self._stop_event.is_set():
-                    await self._sleep_or_stop(_LISTENER_MONITOR_INTERVAL)
-                    if self._stop_event.is_set():
-                        break
-                    state = self._derive_listener_state(listener)
-                    if state == LISTENER_OFFLINE:
-                        _log.warning("FCM listener stopped; reconnecting")
-                        break
-                    self._set_owned_listener_state(state)
+                    await self._monitor_push_listener(listener)
             finally:
                 self._retire_event_listener_revision(listener_revision)
                 with contextlib.suppress(Exception):
@@ -2629,20 +2677,66 @@ class RingClient:
 
         self._set_owned_listener_state(LISTENER_OFFLINE)
 
-    def _load_owned_event_credentials(self) -> None:
-        with _session_lock:
-            if self._event_credentials_loaded or not _is_active_client_generation(
-                self,
-                self._published_generation,
+    def _on_listener_event(self, generation, revision, event) -> None:
+        if self._event_listener_revision == revision and _is_active_client_generation(
+            self, generation
+        ):
+            self._on_ring_event(event)
+
+    async def _monitor_push_listener(self, listener) -> None:
+        # The pinned SDK starts a one-shot renewal. Take ownership before it
+        # issues a competing check-in; keep the existing receiver and callbacks.
+        sdk_refresh = listener.session_refresh_task
+        if sdk_refresh is not None:
+            sdk_refresh.cancel()
+            await asyncio.gather(sdk_refresh, return_exceptions=True)
+            listener.session_refresh_task = None
+
+        renew_at = privacy_time() + listener.SESSION_REFRESH_INTERVAL
+        retry = _LISTENER_RECONNECT_MIN
+        while not self._stop_event.is_set():
+            state = self._derive_listener_state(listener)
+            if state == LISTENER_OFFLINE:
+                self._set_owned_listener_state(state)
+                break
+            self._set_owned_listener_state(state)
+            if privacy_time() >= renew_at or (
+                listener.subscribed is not True and retry == _LISTENER_RECONNECT_MIN
             ):
+                self._set_owned_listener_state(LISTENER_DEGRADED)
+                listener.subscribed = False
+                try:
+                    async with asyncio.timeout(30):
+                        await self._ring.async_create_session()
+                        await listener.add_subscription_to_ring(listener.fcm_token)
+                except Exception as exc:
+                    _log.warning("Ring push subscription renewal failed (%s)", type(exc).__name__)
+                    listener.subscribed = False
+                if listener.subscribed is True:
+                    renew_at = privacy_time() + listener.SESSION_REFRESH_INTERVAL
+                    retry = _LISTENER_RECONNECT_MIN
+                else:
+                    renew_at = privacy_time() + retry
+                    retry = min(retry * 2, _LISTENER_RECONNECT_MAX)
+                self._set_owned_listener_state(self._derive_listener_state(listener))
+            await self._sleep_or_stop(_LISTENER_MONITOR_INTERVAL)
+
+    def _load_owned_event_credentials(self) -> None:
+        generation = self._published_generation
+        with _session_lock:
+            if self._event_credentials_loaded or not _is_active_client_generation(self, generation):
                 return
-            try:
-                credentials = load_ring_event_credentials()
-            except Exception:
-                credentials = None
-                _log.warning("Stored FCM credentials could not be loaded; registering again")
-            self._event_credentials = credentials
-            self._event_credentials_loaded = True
+        try:
+            credentials = load_ring_event_credentials()
+        except Exception:
+            credentials = None
+            _log.warning("Stored FCM credentials could not be loaded; registering again")
+        with _session_lock:
+            if not self._event_credentials_loaded and _is_active_client_generation(
+                self, generation
+            ):
+                self._event_credentials = credentials
+                self._event_credentials_loaded = True
 
     def _event_listener_context(
         self,
@@ -2673,7 +2767,7 @@ class RingClient:
         *,
         generation: int | None,
         listener_revision: int,
-    ) -> None:
+    ) -> concurrent.futures.Future | None:
         try:
             validated = validate_ring_event_credentials(credentials)
         except Exception:
@@ -2690,12 +2784,21 @@ class RingClient:
             # secret service is temporarily unavailable.
             self._event_credentials = validated
             self._event_credentials_loaded = True
-            try:
-                save_ring_event_credentials(validated)
-            except Exception:
-                _log.warning(
-                    "Updated FCM credentials could not be saved; retaining them for this session"
-                )
+            return _credential_worker.submit(self._persist_event_credentials, generation, validated)
+
+    def _persist_event_credentials(self, generation, credentials) -> None:
+        with _session_lock:
+            if (
+                not _is_active_client_generation(self, generation)
+                or self._event_credentials is not credentials
+            ):
+                return
+        try:
+            save_ring_event_credentials(credentials)
+        except Exception:
+            _log.warning(
+                "Updated FCM credentials could not be saved; retaining them for this session"
+            )
 
     def _set_owned_listener_state(self, state: str) -> None:
         _set_listener_state(
@@ -2715,13 +2818,11 @@ class RingClient:
         receiver = getattr(listener, "_receiver", None)
         run_state = getattr(receiver, "run_state", None)
         name = getattr(run_state, "name", None)
-        if name is None:
-            return LISTENER_CONNECTED
-        if name == "STARTED":
-            return LISTENER_CONNECTED
         if name == "STOPPED":
             return LISTENER_OFFLINE
-        return LISTENER_CONNECTING
+        if name is None or getattr(listener, "subscribed", None) is not True:
+            return LISTENER_DEGRADED
+        return LISTENER_CONNECTED if name == "STARTED" else LISTENER_CONNECTING
 
     def _on_alarm_snapshot(self, snapshot: AlarmAccountSnapshot) -> None:
         """Receive an Alarm snapshot on the asyncio thread and marshal it to GTK."""
@@ -2908,26 +3009,35 @@ def save_account_email(
     *,
     expected_client: RingClient | None = None,
 ) -> None:
+    _credential_worker.submit(_save_account_email, email, expected_client).result()
+
+
+def _save_account_email(email, expected_client) -> None:
     global _account_email_cache, _account_email_loaded
     with _session_lock:
-        if expected_client is not None and _client is not expected_client:
+        owner = _client
+        if expected_client is not None and owner is not expected_client:
             raise SessionSupersededError("Ring session was superseded before sign-in completed")
-        with _account_email_lock:
-            previous_email = (
-                _account_email_cache if _account_email_loaded else load_ring_account_email()
-            )
-
-        account_changed = bool(previous_email) and (
-            previous_email.strip().casefold() != email.strip().casefold()
-        )
+        previous_email = _account_email_cache
+        loaded = _account_email_loaded
+        generation = _active_client_generation
+    if not loaded:
+        previous_email = load_ring_account_email()
+    account_changed = bool(previous_email) and (
+        previous_email.strip().casefold() != email.strip().casefold()
+    )
+    with _session_lock:
+        if owner is not _client or generation != _active_client_generation:
+            raise SessionSupersededError("Ring session was superseded before sign-in completed")
         if account_changed:
-            owner = expected_client or _client
-            discard_credentials = getattr(owner, "_discard_event_credentials", None)
-            if callable(discard_credentials):
-                discard_credentials()
-            clear_ring_event_credentials()
-        save_ring_account_email(email)
-        with _account_email_lock:
+            discard = getattr(owner, "_discard_event_credentials", None)
+            if callable(discard):
+                discard()
+    if account_changed:
+        clear_ring_event_credentials()
+    save_ring_account_email(email)
+    with _session_lock:
+        if _client is owner and generation == _active_client_generation:
             _account_email_cache = email
             _account_email_loaded = True
 

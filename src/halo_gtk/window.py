@@ -25,6 +25,7 @@ from halo_gtk.live_sessions import get_live_session_manager  # noqa: E402
 from halo_gtk.ring_client import (  # noqa: E402
     LISTENER_CONNECTED,
     LISTENER_CONNECTING,
+    LISTENER_DEGRADED,
     add_connection_state_callback,
     get_client,
     listener_state,
@@ -615,6 +616,8 @@ class RingWindow(Adw.ApplicationWindow):
             return
         if state == LISTENER_CONNECTING:
             self._events_banner.set_title("Reconnecting to Ring events…")
+        elif state == LISTENER_DEGRADED:
+            self._events_banner.set_title("Ring push delivery is unconfirmed")
         else:
             self._events_banner.set_title("Live Ring events are offline")
         self._events_banner.set_revealed(True)

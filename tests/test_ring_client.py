@@ -283,15 +283,17 @@ def test_derive_listener_state_maps_fcm_run_state():
 
     def listener_with(run_state_name):
         run_state = SimpleNamespace(name=run_state_name) if run_state_name is not None else None
-        return SimpleNamespace(_receiver=SimpleNamespace(run_state=run_state))
+        return SimpleNamespace(_receiver=SimpleNamespace(run_state=run_state), subscribed=True)
 
     derive = RingClient._derive_listener_state
     assert derive(listener_with("STARTED")) == ring_client.LISTENER_CONNECTED
     assert derive(listener_with("STOPPED")) == ring_client.LISTENER_OFFLINE
     assert derive(listener_with("RESETTING")) == ring_client.LISTENER_CONNECTING
-    # Can't introspect the receiver — assume alive after a successful start.
-    assert derive(listener_with(None)) == ring_client.LISTENER_CONNECTED
-    assert derive(SimpleNamespace(_receiver=None)) == ring_client.LISTENER_CONNECTED
+    assert derive(listener_with(None)) == ring_client.LISTENER_DEGRADED
+    assert derive(SimpleNamespace(_receiver=None)) == ring_client.LISTENER_DEGRADED
+    listener = listener_with("STARTED")
+    listener.subscribed = False
+    assert derive(listener) == ring_client.LISTENER_DEGRADED
 
 
 def test_connection_state_callbacks_register_and_unregister():
@@ -907,7 +909,8 @@ async def test_async_event_history_attaches_device_to_events():
     device = _FakeDevice(history=[{"id": 1}, {"id": 2}])
     client._ring = _FakeRing([device])
 
-    devices, events = await client._async_event_history(limit=50)
+    page = await client._async_event_history(limit=50)
+    devices, events = page.devices, page.events
 
     assert devices == [device]
     assert [event["id"] for event in events] == [1, 2]
@@ -921,7 +924,7 @@ async def test_async_event_history_passes_backend_history_parameters():
     skipped = _FakeDevice(history=[{"id": 9}])
     client._ring = _FakeRing([included, skipped])
 
-    _devices, events = await client._async_event_history(
+    page = await client._async_event_history(
         limit=25,
         kind="motion",
         older_than={included.id: 99},
@@ -929,7 +932,7 @@ async def test_async_event_history_passes_backend_history_parameters():
         enforce_limit=True,
     )
 
-    assert [event["id"] for event in events] == [4]
+    assert [event["id"] for event in page.events] == [4]
     assert included.history_calls == [
         {
             "limit": 25,
@@ -1194,6 +1197,7 @@ async def test_listener_reuses_persisted_and_updated_credentials_on_reconnect(
 
     await client._async_listen()
 
+    ring_client._credential_worker.submit(lambda: None).result(timeout=2)
     assert loaded == [True]
     assert len(listeners) == 2
     assert listeners[0].credentials == persisted
@@ -1268,7 +1272,7 @@ def test_event_credential_save_failure_is_contained_and_reused(
         updated,
         generation=generation,
         listener_revision=listener_revision,
-    )
+    ).result(timeout=2)
 
     assert client._event_credentials == updated
     assert client._event_credentials is not updated
