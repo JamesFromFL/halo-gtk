@@ -455,6 +455,20 @@ saved media. Uninstalling desktop integration also preserves local data.
 | Saved Alarm history is unavailable | Establish an account-bound sign-in if requested, then use Ring cloud → Refresh for the location. Saved reads do not silently renew permission. |
 | Desktop alerts are missing | Check Halo's master/type switches, notification rules, background operation, and the desktop's notification policy. No alert is proof that no Ring event occurred. |
 
+The diagnostics archive identifies the installation profile and the loaded GTK,
+GStreamer, aiortc and PyAV versions. It reports the managed source revision or
+clean checkout commit when available. A modified checkout reports its base
+commit and local changes. Flatpak reports its installed deployment commit when
+available.
+
+To measure a live stream, turn on **Collect Stream Timings** in
+**Settings → Advanced → Diagnostics**, then open the stream. The export reports
+the median and 95th percentile for admission to the first video buffer and the
+interval between buffers accepted by the local video pipeline. Each metric uses
+at most 128 recent durations across all streams. Collection stays in memory for
+the current run. Turning it off, clearing debug logs, or resetting settings clears the samples. Timing
+summaries contain no device names, account details, URLs or media.
+
 For a useful bug report, include Halo's revision/version, distribution and
 installation profile, steps to reproduce, the exact visible error, and whether
 the official Ring app behaves the same way. Export logs from

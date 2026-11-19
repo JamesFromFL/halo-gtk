@@ -12,6 +12,7 @@ from gi.repository import GLib  # noqa: E402
 
 from halo_gtk import storage_paths  # noqa: E402
 from halo_gtk.app import RingApplication  # noqa: E402
+from halo_gtk.build_info import build_metadata  # noqa: E402
 from halo_gtk.log_redaction import RedactingFormatter  # noqa: E402
 
 _LOG_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
@@ -74,6 +75,7 @@ def _setup_logging() -> None:
 
 def main() -> None:
     _setup_logging()
+    build_metadata()  # Freeze the checkout identity before the application starts.
     start_background = "--background" in sys.argv
     argv = [arg for arg in sys.argv if arg != "--background"]
     # Set prgname and application name before the GApplication is created so

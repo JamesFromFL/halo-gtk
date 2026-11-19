@@ -584,6 +584,13 @@ class SettingsPage(Gtk.Box):
 
         diagnostics_group = Adw.PreferencesGroup(title="Diagnostics")
         page.add(diagnostics_group)
+        self._timing_switch = self._add_switch_row(
+            diagnostics_group,
+            "Collect Stream Timings",
+            "For this run, include anonymous video timing medians and percentiles in exports. "
+            "Turning this off discards the samples.",
+            self._on_timing_toggled,
+        )
         self._add_button_row(
             diagnostics_group,
             "Export Debug Logs",
@@ -594,7 +601,7 @@ class SettingsPage(Gtk.Box):
         self._add_button_row(
             diagnostics_group,
             "Clear Debug Logs",
-            "Clear Halo debug logs stored on this computer.",
+            "Clear Halo debug logs and any in-memory stream timings.",
             "Clear",
             self._on_clear_debug_log_clicked,
             destructive=True,
@@ -706,6 +713,7 @@ class SettingsPage(Gtk.Box):
             self._refresh_playback(cfg)
             self._refresh_directories(cfg)
             self._refresh_notifications(cfg)
+            self._set_switch_active(self._timing_switch, diagnostics.timings.enabled)
         finally:
             self._refreshing = False
 
@@ -1151,9 +1159,14 @@ class SettingsPage(Gtk.Box):
         else:
             self._set_storage_message("No cached thumbnails or previews found.")
 
+    def _on_timing_toggled(self, switch, _pspec) -> None:
+        if not self._refreshing:
+            diagnostics.timings.set_enabled(switch.get_active())
+
     def _clear_debug_log(self) -> None:
         try:
             touched = privacy.clear_debug_logs()
+            diagnostics.timings.clear()
         except Exception as exc:
             _log.warning("Failed to clear debug logs: %s", exc)
             self._set_advanced_message(f"Could not clear debug logs: {exc}")
@@ -1218,6 +1231,7 @@ class SettingsPage(Gtk.Box):
 
         try:
             _config.reset()
+            diagnostics.timings.set_enabled(False)
         except Exception as exc:
             _log.warning("Failed to reset settings: %s", exc)
             self._set_advanced_message(f"Could not reset settings: {exc}")

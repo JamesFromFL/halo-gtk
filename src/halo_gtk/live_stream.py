@@ -38,6 +38,7 @@ from halo_gtk.ring_media import (  # noqa: E402
     gst_push_succeeded,
     retain_aiortc_connect_tasks,
 )
+from halo_gtk.stream_timing import timings  # noqa: E402
 
 _log = logging.getLogger(__name__)
 
@@ -976,7 +977,12 @@ class LiveStreamView(Gtk.Box):
                     terminal_state = "failed"
                     terminal_message = "Video pipeline stopped accepting frames"
                     break
-                resources.last_frame_at = time.monotonic()
+                accepted_at = time.monotonic()
+                if timings.enabled:
+                    timings.video_buffer(
+                        resources.admitted_at, resources.last_frame_at, accepted_at
+                    )
+                resources.last_frame_at = accepted_at
                 if not resources.connected or resources.recovery_at is not None:
                     resources.recovery_at = None
                     resources.connected = True

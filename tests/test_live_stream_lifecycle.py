@@ -418,7 +418,11 @@ async def test_stream_becomes_active_only_after_first_video_buffer(monkeypatch, 
     import numpy as np
 
     import halo_gtk.live_stream as live_stream
+    from halo_gtk.stream_timing import StreamTiming
 
+    timing = StreamTiming()
+    timing.set_enabled(True)
+    monkeypatch.setattr(live_stream, "timings", timing)
     live_stream.Gst.init(None)
 
     class OneFrameTrack:
@@ -465,6 +469,7 @@ async def test_stream_becomes_active_only_after_first_video_buffer(monkeypatch, 
         "_on_connected",
         "_on_stream_terminal",
     ]
+    assert "first video buffer: 1 sample" in timing.summary()[1]
     assert resources.connected is True
     assert resources.recovery_at is None and resources.last_frame_at is not None
 
