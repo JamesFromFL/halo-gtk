@@ -11,7 +11,7 @@ gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, Gtk  # noqa: E402
 
-from halo_gtk import config, device_names  # noqa: E402
+from halo_gtk import config, device_names, notifications  # noqa: E402
 from halo_gtk import notification_rules as rules  # noqa: E402
 from halo_gtk.ring_client import get_client  # noqa: E402
 
@@ -174,6 +174,7 @@ class NotificationPreferences(Adw.PreferencesDialog):
                 "Could not save notification rules. Check available space and permissions."
             )
         else:
+            notifications.apply_camera_notification_preferences(cfg)
             self.close()
             return
         self._message.set_visible(True)

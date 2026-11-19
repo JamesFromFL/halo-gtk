@@ -428,3 +428,110 @@ def test_actionless_basic_alert_registered_and_withdrawn_on_shutdown(monkeypatch
     notifications.withdraw_camera_notifications()
     broker_notification.close.assert_called_once()
     assert not notifications._camera_notifications.visible
+
+
+@pytest.fixture
+def displayed_banners(monkeypatch, camera_event):
+    """Show four camera events and an Alarm through a fake desktop broker."""
+    import gi
+
+    gi.require_version("Notify", "0.7")
+    from gi.repository import GLib, Notify
+
+    client, _, event, _ = camera_event
+    cfg, handles = dict(DEFAULT_CFG), []
+    monkeypatch.setattr(notifications._config, "load", lambda: cfg.copy())
+    monkeypatch.setattr(notifications._config, "save", cfg.update)
+    monkeypatch.setattr(notifications, "_ensure_notify", lambda: True)
+    monkeypatch.setattr(GLib, "idle_add", lambda cb, *args: cb(*args))
+    monkeypatch.setattr(GLib, "timeout_add_seconds", lambda *_: 99)
+    monkeypatch.setattr(GLib, "source_remove", lambda _: None)
+    monkeypatch.setattr(notifications, "_pixbuf_from_bytes", lambda _: object())
+
+    def new(*_):
+        handle = Mock()
+        handles.append(handle)
+        return handle
+
+    monkeypatch.setattr(Notify.Notification, "new", new)
+    for camera, kind, context, custom in (
+        (12, "motion", {"image_bytes": b"picture"}, False),
+        (12, "ding", {"description": "Ring description"}, False),
+        (12, "motion", {"description": "Hidden by custom text"}, True),
+        (13, "motion", {}, False),
+    ):
+        event = SimpleNamespace(**{**vars(event), "doorbot_id": camera, "kind": kind})
+        cfg.update(custom_notification_messages=custom, custom_motion_message="Local message")
+        monkeypatch.setattr(client, "get_event_notification_context", Mock(return_value=context))
+        target = notifications.camera_notification_target(event, client, 7)
+        notifications._prepare_ring_notification(event, target)
+    notifications.send_notification(
+        "Alarm", target=notifications.AlarmNotificationTarget(7, "here")
+    )
+    assert len(handles) == 5
+    for handle in handles:
+        handle.show.assert_called_once()
+    try:
+        yield dict(zip(("image", "summary", "custom", "basic", "alarm"), handles, strict=True))
+    finally:
+        notifications.withdraw_camera_notifications()
+        notifications.withdraw_alarm_notifications()
+
+
+@pytest.mark.parametrize(
+    "key,withdrawn",
+    [
+        ("notification_preview_images", {"image"}),
+        ("notification_summaries", {"summary"}),
+        ("notify_doorbell", {"summary"}),
+        ("notify_motion", {"image", "custom", "basic"}),
+        ("show_notifications", {"image", "summary", "custom", "basic"}),
+    ],
+)
+def test_settings_save_withdraws_only_affected_visible_banners(
+    monkeypatch, displayed_banners, key, withdrawn
+):
+    from halo_gtk.settings_page import Gtk, SettingsPage
+
+    page = SettingsPage.__new__(SettingsPage)
+    page._refreshing = False
+    page.refresh = Mock()
+    switch = SimpleNamespace(get_active=lambda: False)
+    if key == "show_notifications":
+        page._on_notifications_toggled(switch, None)
+    else:
+        page._save_switch_setting(switch, None, config_key=key)
+    assert {name for name, handle in displayed_banners.items() if handle.close.called} == withdrawn
+    app = Mock()
+    monkeypatch.setattr(Gtk.Application, "get_default", lambda: app)
+    for name in withdrawn:
+        target = displayed_banners[name].add_action.call_args.args[-1]
+        notifications._open_notification_target_on_main(target)
+    app.activate.assert_not_called()
+
+
+@pytest.mark.parametrize("save_succeeds", [True, False])
+def test_rule_dialog_applies_visible_camera_rule_after_save(
+    monkeypatch, displayed_banners, save_succeeds
+):
+    from halo_gtk import notification_rules
+    from halo_gtk.notification_preferences import NotificationPreferences
+
+    dialog = NotificationPreferences.__new__(NotificationPreferences)
+    dialog._original = notification_rules.normalize({})
+    on, off = (SimpleNamespace(get_active=lambda value=value: value) for value in (True, False))
+    keep = SimpleNamespace(get_selected=lambda: 0)
+    dialog._devices = [("camera:12", on, off, on, keep)]
+    dialog._reset_devices = False
+    dialog._start = SimpleNamespace(get_text=lambda: "22:00")
+    dialog._end = SimpleNamespace(get_text=lambda: "07:00")
+    dialog._quiet = off
+    dialog._snooze = keep
+    dialog._message = Mock()
+    dialog.close = Mock()
+    if not save_succeeds:
+        monkeypatch.setattr(notifications._config, "save", Mock(side_effect=OSError("full")))
+    dialog._save()
+    withdrawn = {name for name, handle in displayed_banners.items() if handle.close.called}
+    assert withdrawn == ({"image", "custom"} if save_succeeds else set())
+    assert dialog.close.called is save_succeeds

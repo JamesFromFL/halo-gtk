@@ -21,6 +21,7 @@ from halo_gtk import (  # noqa: E402
     favorites,
     live_layouts,
     media_paths,
+    notifications,
     privacy,
 )
 from halo_gtk import config as _config  # noqa: E402
@@ -963,13 +964,8 @@ class SettingsPage(Gtk.Box):
             self._refresh_main_window()
 
     def _on_notifications_toggled(self, switch: Gtk.Switch, _pspec) -> None:
-        if self._refreshing:
-            return
-        cfg = _config.load()
-        cfg["show_notifications"] = switch.get_active()
-        if not self._save_config(cfg):
-            return
-        self.refresh()
+        if self._save_bool_setting("show_notifications", switch):
+            self.refresh()
 
     def _on_custom_notification_messages_toggled(self, switch: Gtk.Switch, _pspec) -> None:
         if self._refreshing:
@@ -995,7 +991,16 @@ class SettingsPage(Gtk.Box):
             return False
         cfg = _config.load()
         cfg[config_key] = switch.get_active()
-        return self._save_config(cfg)
+        saved = self._save_config(cfg)
+        if saved and config_key in {
+            "show_notifications",
+            "notify_doorbell",
+            "notify_motion",
+            "notification_preview_images",
+            "notification_summaries",
+        }:
+            notifications.apply_camera_notification_preferences(cfg)
+        return saved
 
     def _save_config(self, cfg: dict) -> bool:
         """Persist before applying side effects; restore controls on failure."""

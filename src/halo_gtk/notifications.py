@@ -7,7 +7,7 @@ import queue
 import threading
 import time
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import isfinite
 from typing import TYPE_CHECKING
 
@@ -42,6 +42,17 @@ class CameraNotificationTarget:
     device_id: int | None
     event_id: int | None
     expires_at: float
+    kind: str | None
+    rule_key: str | None
+    has_preview: bool = False
+    has_summary: bool = False
+
+    def allowed_by_preferences(self, cfg: dict) -> bool:
+        return (
+            _camera_event_enabled(self.kind, self.rule_key, cfg)
+            and (not self.has_preview or cfg.get("notification_preview_images", True))
+            and (not self.has_summary or cfg.get("notification_summaries", True))
+        )
 
 
 @dataclass(frozen=True)
@@ -87,6 +98,13 @@ class _CameraNotifications:
 
 
 _camera_notifications = _CameraNotifications()
+
+
+def apply_camera_notification_preferences(cfg: dict) -> None:
+    """Withdraw only visible camera banners whose event or displayed content is now disabled."""
+    for notification, target in tuple(_camera_notifications.visible):
+        if not target.allowed_by_preferences(cfg):
+            _camera_notifications.close(notification)
 
 
 def withdraw_camera_notifications() -> None:
@@ -298,9 +316,10 @@ def _open_notification_target_on_main(
     gi.require_version("Gtk", "4.0")
     from gi.repository import Gtk
 
-    if isinstance(
-        target, CameraNotificationTarget
-    ) and not target.client.camera_notification_current(target.generation, target.preview_lease):
+    if isinstance(target, CameraNotificationTarget) and (
+        not target.client.camera_notification_current(target.generation, target.preview_lease)
+        or not target.allowed_by_preferences(_config.load())
+    ):
         return False
 
     app = Gtk.Application.get_default()
@@ -378,13 +397,15 @@ def send_ring_notification(event, target: CameraNotificationTarget) -> None:
 
 
 def _ring_event_enabled(event, cfg: dict) -> bool:
-    kind = _event_kind(event)
+    key = notification_rules.device_key("camera", getattr(event, "doorbot_id", None))
+    return _camera_event_enabled(_event_kind(event), key, cfg)
+
+
+def _camera_event_enabled(kind: str | None, key: str | None, cfg: dict) -> bool:
     return (
         _notifications_enabled(cfg)
         and _event_type_enabled(kind, cfg)
-        and notification_rules.allowed(
-            cfg, notification_rules.device_key("camera", getattr(event, "doorbot_id", None)), kind
-        )
+        and notification_rules.allowed(cfg, key, kind)
     )
 
 
@@ -468,6 +489,10 @@ def _prepare_ring_notification(
             text_context = context if current_cfg.get("notification_summaries", True) else {}
             summary, body, icon = _ring_notification_text(event, text_context, current_cfg)
             preview = image_pixbuf if current_cfg.get("notification_preview_images", True) else None
+            has_summary = bool(text_context.get("description")) and not _custom_notification_body(
+                kind, current_cfg
+            )
+            shown_target = replace(target, has_preview=preview is not None, has_summary=has_summary)
             client.apply_camera_notification(
                 target.generation,
                 lease,
@@ -476,7 +501,7 @@ def _prepare_ring_notification(
                     body,
                     icon,
                     image_pixbuf=preview,
-                    target=target,
+                    target=shown_target,
                     urgency=urgency,
                 ),
             )
@@ -496,30 +521,30 @@ def _ring_notification_text(
     cfg = cfg or _config.load()
     kind = _event_kind(event)
     device_name = _event_device_name(event)
-    description = context.get("description")
+    body = _custom_notification_body(kind, cfg) or context.get("description")
 
     if kind == "ding":
         return (
             f"Doorbell: {device_name}",
-            _notification_body(kind, description or "", cfg),
+            body or "",
             "audio-input-microphone-symbolic",
         )
     if kind == "motion":
         return (
             f"Motion detected: {device_name}",
-            _notification_body(kind, description or "", cfg),
+            body or "",
             "camera-video-symbolic",
         )
     if _is_alarm_kind(kind):
         return (
             f"Alarm alert: {device_name}",
-            _notification_body(kind, description or str(kind), cfg),
+            body or str(kind),
             "security-high-symbolic",
         )
 
     return (
         f"Ring alert: {device_name}",
-        _notification_body(kind, description or str(kind), cfg),
+        body or str(kind),
         "security-high-symbolic",
     )
 
@@ -542,9 +567,9 @@ def _event_type_enabled(kind: str | None, cfg: dict) -> bool:
     return True
 
 
-def _notification_body(kind: str | None, default_body: str, cfg: dict) -> str:
+def _custom_notification_body(kind: str | None, cfg: dict) -> str:
     if not cfg.get("custom_notification_messages", False):
-        return default_body
+        return ""
 
     if kind == "ding":
         custom = cfg.get("custom_doorbell_message", "")
@@ -554,7 +579,7 @@ def _notification_body(kind: str | None, default_body: str, cfg: dict) -> str:
         custom = cfg.get("custom_alarm_message", "")
     else:
         custom = ""
-    return str(custom).strip() or default_body
+    return str(custom).strip()
 
 
 def _notification_urgency(kind: str | None) -> str:
@@ -566,6 +591,7 @@ def camera_notification_target(
 ) -> CameraNotificationTarget:
     """Capture ownership before the event leaves its Ring listener thread."""
     device_id = getattr(event, "doorbot_id", None)
+    rule_key = notification_rules.device_key("camera", device_id)
     event_id = getattr(event, "id", None)
     try:
         device_id = int(device_id)
@@ -582,4 +608,6 @@ def camera_notification_target(
         if device_id is not None
         else None
     )
-    return CameraNotificationTarget(client, generation, lease, device_id, event_id, expires_at)
+    return CameraNotificationTarget(
+        client, generation, lease, device_id, event_id, expires_at, _event_kind(event), rule_key
+    )

@@ -630,8 +630,10 @@ class FocusedLivePage(Gtk.Box):
                             datetime.now().strftime("%Y-%m-%d_%H-%M-%S"),
                             ".png",
                             png,
-                            publish=lambda commit: camera_privacy.lease_is_current(lease)
-                            and lease.policy.apply(lease, commit),
+                            publish=lambda commit: (
+                                camera_privacy.lease_is_current(lease)
+                                and lease.policy.apply(lease, commit)
+                            ),
                         )
                         if saved is not None:
                             message, folder = "Screenshot saved", dest
