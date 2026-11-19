@@ -1,0 +1,51 @@
+name: Flatpak qualification
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - '.github/workflows/flatpak.yml'
+      - 'packaging/flatpak/**'
+      - 'scripts/ci_flatpak_smoke.sh'
+      - 'scripts/flatpak_dependencies.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'data/**'
+  pull_request:
+    paths:
+      - '.github/workflows/flatpak.yml'
+      - 'packaging/flatpak/**'
+      - 'scripts/ci_flatpak_smoke.sh'
+      - 'scripts/flatpak_dependencies.py'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'data/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build-install-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Select disposable installation
+        run: echo "FLATPAK_USER_DIR=$RUNNER_TEMP/halo-flatpak-installation" >> "$GITHUB_ENV"
+      - name: Install builder and GNOME 50
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y flatpak flatpak-builder dbus-daemon
+          flatpak --user remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak --user install --noninteractive --no-related flathub org.gnome.Sdk//50 org.gnome.Platform//50
+      - name: Build and export locked package
+        run: |
+          flatpak-builder --user --arch=x86_64 --repo="$RUNNER_TEMP/halo-repo" \
+            "$RUNNER_TEMP/halo-build" packaging/flatpak/io.github.JamesFromFL.HaloGtk.json
+      - name: Install and launch exported application
+        run: |
+          flatpak --user remote-add --no-gpg-verify halo "$RUNNER_TEMP/halo-repo"
+          flatpak --user install --noninteractive --no-related halo io.github.JamesFromFL.HaloGtk
+          dbus-run-session -- bash scripts/ci_flatpak_smoke.sh

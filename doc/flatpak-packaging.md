@@ -58,6 +58,22 @@ sources. Python 3.13 and x86_64 are checked explicitly at build time. The build
 includes app distribution metadata and installs all locked dependencies under
 `/app`, even when the SDK happens to contain another copy.
 
+## Packaging CI
+
+The Flatpak qualification workflow builds on changes to the manifests, dependency
+generator, lock, package metadata, desktop assets, smoke script, or workflow.
+It also runs for version tags and manual dispatches. Each run installs the GNOME
+50 SDK and Platform in a temporary installation, builds the package, exports a
+local repository, installs from it, and runs `scripts/ci_flatpak_smoke.sh`.
+
+The installed smoke opens Halo on a private GTK Broadway display, imports the
+packaged Python modules, checks the GSettings schema and GStreamer factories,
+checks that diagnostics report the installed Flatpak deployment commit, and
+renders a generated 160 × 90 frame through `gtk4paintablesink`. It disables
+the app’s network, session bus, host display, host filesystems, and audio access.
+The missing session bus exercises Halo’s symbolic logo fallback and signed-out
+startup.
+
 ## Runtime evidence
 
 The installed GNOME 50 runtime commit
@@ -66,13 +82,18 @@ reports Python 3.13.16, glibc 2.42, GTK 4.22, libadwaita 1.9 and GStreamer 1.26.
 Factory discovery found gtk4paintablesink, playbin, appsrc/appsink,
 PulseAudio source/sink, H.264/AAC decoders and Opus decoder.
 
-The completed build was installed only in the task-local installation and run
+The initial build was installed only in the task-local installation and run
 against **Platform**, not the build SDK. All 93 application modules imported,
 version metadata reported 0.1.0, the schema was available, and all 43 selected
 Python distributions (runtime plus build tools) were verified under `/app`.
 The packaged command also passed its `--help` smoke check.
 
-The expanded runtime suite passed 198 checks: generated H.264/AAC playback
+A November 18 rebuild of the audit fixes used the cached SDK and locked
+dependencies, with downloads disabled. The installed smoke passed on Platform
+with 96 modules imported. Halo’s diagnostic deployment commit matched the
+installation’s commit. The normal user Flatpak installation was untouched.
+
+The earlier expanded runtime suite passed 198 checks: generated H.264/AAC playback
 through the actual GTK paintable, pause/resume, frame capture, end of stream and
 cleanup; synthetic WebRTC media/renewal/talkback; narrow/wide native layouts;
 qualified device controls; Intercom lifecycle; and local-history account/storage
